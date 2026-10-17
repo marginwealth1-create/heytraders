@@ -23,9 +23,9 @@ export const revalidate = 0;
 const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/+$/, "");
 
 const PLATFORM_DEFAULT = {
-  name: "MarginWealth Admin",
-  short_name: "MP Admin",
-  description: "Super-admin control panel for the MarginWealth platform.",
+  name: "Hey Traders Admin",
+  short_name: "Hey Traders",
+  description: "Super-admin control panel for the Hey Traders platform.",
   start_url: "/dashboard",
   scope: "/",
   // Standalone gives the installed app its own window without browser
@@ -43,9 +43,9 @@ const PLATFORM_DEFAULT = {
   // 192/512 raster declaration to pass the install criteria. Declaring
   // the SVG at those sizes is valid and gets rasterised by the OS.
   icons: [
-    { src: "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" },
-    { src: "/icon.svg", sizes: "192x192", type: "image/svg+xml", purpose: "any maskable" },
-    { src: "/icon.svg", sizes: "512x512", type: "image/svg+xml", purpose: "any maskable" },
+    { src: "/logo.png", sizes: "any", type: "image/png", purpose: "any" },
+    { src: "/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any maskable" },
+    { src: "/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any maskable" },
   ],
 };
 

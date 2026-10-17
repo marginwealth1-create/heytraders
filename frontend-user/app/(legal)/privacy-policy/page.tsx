@@ -4,7 +4,7 @@ import { MpPageHero, MpProse, MpSection } from "@/components/marketing/mp-ui";
 export const metadata: Metadata = {
   title: "Privacy Policy",
   description:
-    "How MarginWealth collects, uses, protects and shares your personal and financial information across its trading and investing services.",
+    "How Hey Traders collects, uses, protects and shares your personal and financial information across its trading and investing services.",
   alternates: { canonical: "/privacy" },
 };
 
@@ -13,7 +13,7 @@ const LAST_UPDATED = "24 June 2026";
 const SECTIONS: { title: string; body: string }[] = [
   {
     title: "1. Introduction",
-    body: "MarginWealth (“MarginWealth”, “we”, “us” or “our”) is committed to protecting your privacy. This Privacy Policy explains what information we collect when you use our website, mobile apps and trading services, how we use and safeguard it, and the choices you have. By using MarginWealth you agree to the practices described here.",
+    body: "Hey Traders (“Hey Traders”, “we”, “us” or “our”) is committed to protecting your privacy. This Privacy Policy explains what information we collect when you use our website, mobile apps and trading services, how we use and safeguard it, and the choices you have. By using Hey Traders you agree to the practices described here.",
   },
   {
     title: "2. Information we collect",
@@ -29,7 +29,7 @@ const SECTIONS: { title: string; body: string }[] = [
   },
   {
     title: "5. How we share information",
-    body: "We do NOT sell your personal data. We share it only when necessary: with regulators, exchanges, depositories and law-enforcement when required by law; with payment partners and banks to process your deposits and withdrawals; and with trusted service providers (e.g. cloud hosting, KYC/identity, analytics and communication vendors) who act on our instructions under confidentiality obligations. If MarginWealth is involved in a merger or acquisition, data may transfer to the successor entity under this policy.",
+    body: "We do NOT sell your personal data. We share it only when necessary: with regulators, exchanges, depositories and law-enforcement when required by law; with payment partners and banks to process your deposits and withdrawals; and with trusted service providers (e.g. cloud hosting, KYC/identity, analytics and communication vendors) who act on our instructions under confidentiality obligations. If Hey Traders is involved in a merger or acquisition, data may transfer to the successor entity under this policy.",
   },
   {
     title: "6. Cookies & tracking",
@@ -53,7 +53,7 @@ const SECTIONS: { title: string; body: string }[] = [
   },
   {
     title: "11. Children",
-    body: "MarginWealth is intended for users who are 18 years or older. We do not knowingly collect personal information from minors. If you believe a minor has provided us data, please contact us and we will delete it.",
+    body: "Hey Traders is intended for users who are 18 years or older. We do not knowingly collect personal information from minors. If you believe a minor has provided us data, please contact us and we will delete it.",
   },
   {
     title: "12. Changes to this policy",
@@ -67,7 +67,7 @@ export default function PrivacyPage() {
       <MpPageHero
         eyebrow="Legal"
         title="Privacy Policy"
-        lead="Your trust matters. This policy explains how MarginWealth collects, uses, protects and shares your personal and financial information."
+        lead="Your trust matters. This policy explains how Hey Traders collects, uses, protects and shares your personal and financial information."
       />
       <MpSection>
         <div className="flex flex-col gap-8">
@@ -97,16 +97,16 @@ export default function PrivacyPage() {
               <span>
                 Email:{" "}
                 <a
-                  href="mailto:privacy@marginwealth.live"
+                  href="mailto:privacy@heytraders.live"
                   className="font-medium text-mp-accent hover:underline"
                 >
-                  privacy@marginwealth.live
+                  privacy@heytraders.live
                 </a>
               </span>
               <span className="text-mp-text-mut">
                 Support:{" "}
                 <a href="/contact" className="text-mp-accent hover:underline">
-                  marginwealth.live/contact
+                  heytraders.live/contact
                 </a>
               </span>
             </div>

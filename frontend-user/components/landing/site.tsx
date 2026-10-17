@@ -20,7 +20,7 @@ export function SiteHeader() {
   return (
     <header className="sticky top-0 z-50 border-b border-slate-200/70 bg-white/85 backdrop-blur-md">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">
-        <Link href="/" aria-label="MarginWealth home" className="rounded-md">
+        <Link href="/" aria-label="Hey Traders home" className="rounded-md">
           <Wordmark markClassName="size-7" textClassName="text-xl" className="text-slate-900" />
         </Link>
 
@@ -110,8 +110,8 @@ export function SiteFooter() {
             <p className="mt-4 max-w-xs text-sm leading-relaxed text-slate-500">
               One account for Indian and global markets — equity, F&amp;O, commodities, forex, crypto and US stocks.
             </p>
-            <a href="mailto:support@marginwealth.live" className="mt-4 inline-block text-sm font-semibold text-brand-600 hover:text-brand-700">
-              support@marginwealth.live
+            <a href="mailto:support@heytraders.live" className="mt-4 inline-block text-sm font-semibold text-brand-600 hover:text-brand-700">
+              support@heytraders.live
             </a>
           </div>
           {FOOTER_COLS.map((col) => (
@@ -139,7 +139,7 @@ export function SiteFooter() {
           results. Make sure you understand the risks involved and seek independent advice if necessary.
         </p>
         <div className="mt-8 flex flex-col gap-2 border-t border-slate-200 pt-6 text-xs text-slate-500 sm:flex-row sm:justify-between">
-          <p>© {new Date().getFullYear()} MarginWealth. All rights reserved.</p>
+          <p>© {new Date().getFullYear()} Hey Traders. All rights reserved.</p>
           <p>Built for Indian traders.</p>
         </div>
       </div>

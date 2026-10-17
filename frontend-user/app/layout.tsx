@@ -43,6 +43,8 @@ const plexMono = IBM_Plex_Mono({
 
 // Hosts that are the platform itself (not a tenant's branded domain).
 const PLATFORM_METADATA_HOSTS = new Set([
+  "heytraders.live",
+  "www.heytraders.live",
   "marginwealth.live",
   "www.marginwealth.live",
   "localhost",
@@ -53,8 +55,8 @@ const PLATFORM_METADATA_HOSTS = new Set([
  * Resolve the brand for the REQUEST host, server-side. This is what makes
  * link-preview cards (WhatsApp / Telegram / Slack — crawlers that read the
  * SSR <head> and never run our client JS) show the TENANT's own name + logo
- * instead of the super-admin "MarginWealth" default. On the platform host it
- * returns the MarginWealth defaults; on a branded domain it fetches the
+ * instead of the super-admin "Hey Traders" default. On the platform host it
+ * returns the Hey Traders defaults; on a branded domain it fetches the
  * admin's brand_name + logo from the backend.
  */
 async function resolveHostBrand(): Promise<{
@@ -67,7 +69,7 @@ async function resolveHostBrand(): Promise<{
     PLATFORM_METADATA_HOSTS.has(host) ||
     /\.(vercel|netlify|fly)\.(app|dev)$/.test(host);
   if (platform || !host) {
-    return { platform: true, name: "MarginWealth", logo: null };
+    return { platform: true, name: "Hey Traders", logo: null };
   }
   try {
     const res = await fetch(
@@ -91,12 +93,12 @@ async function resolveHostBrand(): Promise<{
 
 export async function generateMetadata(): Promise<Metadata> {
   const { platform, name, logo } = await resolveHostBrand();
-  const displayName = name || (platform ? "MarginWealth" : "Trading Platform");
+  const displayName = name || (platform ? "Hey Traders" : "Trading Platform");
   const title = platform
-    ? "MarginWealth — Indian Trading Platform"
+    ? "Hey Traders — Indian Trading Platform"
     : `${displayName} — Trading Platform`;
   const description = platform
-    ? "Trade Indian stocks, F&O, commodities, currencies, and crypto with MarginWealth — fast, transparent, dark-themed."
+    ? "Trade Indian stocks, F&O, commodities, currencies, and crypto with Hey Traders — fast, transparent, dark-themed."
     : `Trade Indian stocks, F&O, commodities, currencies, and crypto with ${displayName} — fast, transparent, dark-themed.`;
   // OG/favicon image: the tenant's uploaded logo on a branded domain, else the
   // platform febicon. Absolute URL required so crawlers can fetch it.

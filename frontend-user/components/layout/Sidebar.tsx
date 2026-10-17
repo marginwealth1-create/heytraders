@@ -44,7 +44,7 @@ export function Sidebar() {
   const { data: support } = useSupportContacts();
   const waUrl = buildWhatsappUrl(
     support?.whatsapp,
-    "Hi, I need help with my MarginWealth account",
+    "Hi, I need help with my Hey Traders account",
   );
   const hasAnySupport = !!waUrl;
 

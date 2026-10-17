@@ -40,7 +40,7 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("message", (event) => {
   const data = event.data || {};
   if (data.type !== "notify") return;
-  const title = String(data.title || "MarginWealth");
+  const title = String(data.title || "Hey Traders");
   const body = String(data.body || "");
   const tag = data.tag || undefined;
   const url = data.url || "/";
@@ -60,7 +60,7 @@ self.addEventListener("message", (event) => {
 // via VAPID. This is the path that wakes the SW even when the PWA
 // has been force-stopped and the phone is locked.
 self.addEventListener("push", (event) => {
-  let payload = { title: "MarginWealth", body: "", url: "/", tag: undefined };
+  let payload = { title: "Hey Traders", body: "", url: "/", tag: undefined };
   try {
     if (event.data) payload = { ...payload, ...event.data.json() };
   } catch {

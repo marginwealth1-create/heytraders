@@ -74,7 +74,7 @@ function AuthLayoutInner({ children }: { children: React.ReactNode }) {
   // On a tenant's branded domain the super-admin "MarginWealth" name/logo must
   // never appear. Use it only on the confirmed platform host; elsewhere fall
   // back to empty / a neutral glyph until the tenant brand resolves.
-  const platformName = showPlatformDefault ? "MarginWealth" : "";
+  const platformName = showPlatformDefault ? "Hey Traders" : "";
   // Tenant logo uploaded by admin / super-admin via /settings/branding.
   // Mirrors BrandLogo.tsx: paths are server-relative, so prefix API_URL.
   // Falls back to the default brand glyph when no logo is configured.

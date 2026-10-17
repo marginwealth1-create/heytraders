@@ -57,7 +57,7 @@ export function BrandLogo({ href = "/dashboard", size = "md", iconOnly = false, 
           // host. On a tenant's branded domain (or before the host/brand has
           // resolved) we show just the glyph, never MarginWealth.
           <span className="text-foreground">
-            Margin<span className="text-brand">Wealth</span>
+            Hey<span className="text-brand"> Traders</span>
           </span>
         ) : null
       )}

@@ -28,10 +28,10 @@ export const revalidate = 0;
 const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/+$/, "");
 
 const PLATFORM_DEFAULT = {
-  name: "MarginWealth",
-  short_name: "MarginWealth",
+  name: "Hey Traders",
+  short_name: "Hey Traders",
   description:
-    "Trade Indian stocks, F&O, commodities, currencies, and crypto with MarginWealth.",
+    "Trade Indian stocks, F&O, commodities, currencies, and crypto with Hey Traders.",
   start_url: "/dashboard",
   scope: "/",
   display: "standalone",

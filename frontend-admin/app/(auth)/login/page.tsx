@@ -51,7 +51,7 @@ export default function AdminLoginPage() {
           </div>
           <CardTitle className="text-2xl">Admin Login</CardTitle>
           <CardDescription>
-            MarginWealth control panel — sign in with your admin credentials.
+            Hey Traders control panel — sign in with your admin credentials.
           </CardDescription>
         </CardHeader>
         <CardContent>

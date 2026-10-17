@@ -19,12 +19,19 @@ import type { NextRequest } from "next/server";
 // ─────────────────────────────────────────────────────────────────────
 const HIDE = process.env.HIDE_PUBLIC_SITE === "true";
 
-const FLAGSHIP_HOSTS = new Set(["marginwealth.live", "www.marginwealth.live"]);
+const FLAGSHIP_HOSTS = new Set([
+  "heytraders.live",
+  "www.heytraders.live",
+  "marginwealth.live",
+  "www.marginwealth.live",
+]);
 
 // Platform hosts (flagship + dev/preview). Anything NOT in here is a branded
 // tenant domain (trade5x.in, marginx.in, …) — those are login portals, so their
 // bare domain opens /login instead of the marketing site.
 const PLATFORM_HOSTS = new Set([
+  "heytraders.live",
+  "www.heytraders.live",
   "marginwealth.live",
   "www.marginwealth.live",
   "localhost",

@@ -23,7 +23,7 @@ export function Wordmark({
     <span className={cn("inline-flex items-center gap-2", className)}>
       <BrandGlyph className={markClassName} />
       <span className={cn("font-display font-bold leading-none tracking-tight", textClassName)}>
-        Margin<span className="text-brand">Wealth</span>
+        Hey<span className="text-brand"> Traders</span>
       </span>
     </span>
   );

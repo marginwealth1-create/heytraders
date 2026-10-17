@@ -132,7 +132,7 @@ const CHART_LINE =
 /** Illustrative product shot — a static mock of the trading terminal. */
 function TerminalPreview() {
   return (
-    <div className="relative" aria-label="Preview of the MarginWealth trading terminal" role="img">
+    <div className="relative" aria-label="Preview of the Hey Traders trading terminal" role="img">
       <div aria-hidden className="absolute -inset-6 rounded-[2rem] bg-gradient-to-tr from-brand-500/25 via-transparent to-gold/25 blur-2xl" />
 
       <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-[#0B1020] text-white shadow-2xl shadow-brand-900/30">
@@ -142,7 +142,7 @@ function TerminalPreview() {
             <span className="size-2.5 rounded-full bg-white/20" />
             <span className="size-2.5 rounded-full bg-white/20" />
           </div>
-          <span className="text-[11px] font-medium text-white/50">MarginWealth Terminal</span>
+          <span className="text-[11px] font-medium text-white/50">Hey Traders Terminal</span>
           <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-medium text-white/60">Preview</span>
         </div>
 
@@ -411,7 +411,7 @@ const FAQS = [
   ["Can I try the platform before funding?", "Yes. Start a demo account from the login page and get ₹50,00,000 in virtual funds to practise with — no signup needed."],
   ["How do withdrawals work?", "Request a withdrawal from the Wallet section and it is sent to your registered bank account, typically within 24 hours on working days."],
   ["Is my account secure?", "Accounts are protected with encrypted connections and optional two-factor authentication, and live risk controls watch every open position."],
-  ["Can I trade on mobile?", "Yes. Install the MarginWealth app from the download page for the full experience — charts, orders, positions and funds."],
+  ["Can I trade on mobile?", "Yes. Install the Hey Traders app from the download page for the full experience — charts, orders, positions and funds."],
 ];
 
 function Faq() {
@@ -423,8 +423,8 @@ function Faq() {
           <h2 className="text-slate-900 mt-3 font-display text-4xl font-bold tracking-tight">Questions, answered.</h2>
           <p className="mt-4 text-slate-600">
             Can&apos;t find what you need? Write to{" "}
-            <a href="mailto:support@marginwealth.live" className="font-semibold text-brand-600 hover:text-brand-700">
-              support@marginwealth.live
+            <a href="mailto:support@heytraders.live" className="font-semibold text-brand-600 hover:text-brand-700">
+              support@heytraders.live
             </a>
             .
           </p>
@@ -460,7 +460,7 @@ function AppCta() {
             Your markets, in your pocket.
           </h2>
           <p className="mt-4 max-w-md text-white/65">
-            Open an account in minutes and trade from the web or the MarginWealth app.
+            Open an account in minutes and trade from the web or the Hey Traders app.
           </p>
           <div className="mt-9 flex flex-wrap gap-3">
             <Link
@@ -478,7 +478,7 @@ function AppCta() {
           </div>
         </div>
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src="/image1.png" alt="The MarginWealth app on a phone" className="h-72 w-full object-cover lg:h-full" />
+        <img src="/image1.png" alt="The Hey Traders app on a phone" className="h-72 w-full object-cover lg:h-full" />
       </div>
     </section>
   );

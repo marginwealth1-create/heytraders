@@ -4,13 +4,13 @@ import { MpPageHero, MpProse, MpSection } from "@/components/marketing/mp-ui";
 export const metadata: Metadata = {
   title: "Terms & Conditions",
   description:
-    "The terms and conditions governing the use of MarginWealth's trading and investing services across NSE, BSE & MCX.",
+    "The terms and conditions governing the use of Hey Traders's trading and investing services across NSE, BSE & MCX.",
 };
 
 const SECTIONS = [
   {
     title: "1. Acceptance of terms",
-    body: "By opening an account or using MarginWealth's website, apps and services, you agree to these Terms & Conditions. If you do not agree, please do not use the platform.",
+    body: "By opening an account or using Hey Traders's website, apps and services, you agree to these Terms & Conditions. If you do not agree, please do not use the platform.",
   },
   {
     title: "2. Eligibility",
@@ -44,7 +44,7 @@ export default function TermsPage() {
       <MpPageHero
         eyebrow="Legal"
         title="Terms & Conditions"
-        lead="Please read these terms carefully. They govern your use of MarginWealth's trading and investing services."
+        lead="Please read these terms carefully. They govern your use of Hey Traders's trading and investing services."
       />
       <MpSection>
         <div className="flex flex-col gap-8">

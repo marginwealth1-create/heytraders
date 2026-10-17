@@ -84,7 +84,7 @@ export function BrandLogo({ href = "/dashboard", size = "md", showAdminBadge = t
     <span className="truncate text-foreground">{tenantName}</span>
   ) : (
     <span className="truncate text-foreground">
-      Margin<span className="text-brand">Wealth</span>
+      Hey<span className="text-brand"> Traders</span>
     </span>
   );
 

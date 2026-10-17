@@ -77,6 +77,8 @@ const Ctx = createContext<BrandingContextValue>({
 
 const PLATFORM_HOSTS = new Set<string>(
   [
+    "heytraders.live",
+    "www.heytraders.live",
     "marginwealth.live",
     "www.marginwealth.live",
     "localhost",
