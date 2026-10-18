@@ -121,17 +121,36 @@ function AuthLayoutInner({ children }: { children: React.ReactNode }) {
   // two-up email + mobile row.
   return (
     <main className="dark relative flex min-h-screen flex-col overflow-hidden bg-[#060914] text-foreground">
+      {/* Trading-desk ambient gradients */}
       <div
         aria-hidden
-        className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_70%_50%_at_10%_0%,rgba(59,91,219,0.32),transparent_60%),radial-gradient(ellipse_50%_45%_at_95%_100%,rgba(230,184,57,0.16),transparent_60%)]"
+        className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_75%_55%_at_50%_-10%,rgba(16,185,129,0.22),transparent_65%),radial-gradient(ellipse_60%_45%_at_95%_100%,rgba(59,130,246,0.18),transparent_60%),radial-gradient(ellipse_50%_40%_at_5%_90%,rgba(245,158,11,0.12),transparent_60%)]"
       />
+      {/* Subtle market grid lines */}
       <div
         aria-hidden
-        className="pointer-events-none absolute inset-0 [background-image:linear-gradient(rgba(255,255,255,0.035)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.035)_1px,transparent_1px)] [background-size:56px_56px] [mask-image:radial-gradient(ellipse_at_center,black,transparent_75%)]"
+        className="pointer-events-none absolute inset-0 [background-image:linear-gradient(rgba(255,255,255,0.035)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.035)_1px,transparent_1px)] [background-size:48px_48px] [mask-image:radial-gradient(ellipse_at_center,black,transparent_75%)]"
       />
-      {showPlatformDefault && (
-        <BrandGlyph className="pointer-events-none absolute -bottom-24 -right-20 size-[30rem] opacity-[0.06]" />
-      )}
+
+      {/* Decorative subtle trading chart trendline in the background */}
+      <svg
+        aria-hidden
+        className="pointer-events-none absolute -bottom-10 right-0 h-80 w-full max-w-4xl text-emerald-500/10"
+        viewBox="0 0 1000 300"
+        fill="none"
+      >
+        <path
+          d="M0 240 Q 200 220 350 160 T 650 120 T 850 60 T 1000 20"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          strokeDasharray="6 6"
+        />
+        <path
+          d="M0 260 Q 250 210 450 140 T 750 90 T 1000 30"
+          stroke="currentColor"
+          strokeWidth="3"
+        />
+      </svg>
 
       <header className="relative z-10 flex items-center justify-between px-5 py-5 sm:px-10">
         {brandMark}
@@ -145,24 +164,32 @@ function AuthLayoutInner({ children }: { children: React.ReactNode }) {
       <div className="relative z-10 flex flex-1 items-center justify-center px-4 py-6">
         <div
           className={cn(
-            "w-full rounded-3xl border border-white/10 bg-[#0B1020]/75 p-6 shadow-2xl shadow-black/50 backdrop-blur-xl sm:p-9",
-            pathname === "/register" ? "max-w-md" : "max-w-[25rem]",
+            "w-full rounded-3xl border border-white/10 bg-[#0B1020]/80 p-6 shadow-2xl shadow-black/60 backdrop-blur-2xl sm:p-8",
+            pathname === "/register" ? "max-w-lg" : "max-w-[28rem]",
           )}
         >
           {children}
         </div>
       </div>
 
-      <footer className="relative z-10 flex flex-wrap items-center justify-center gap-x-5 gap-y-1 px-5 pb-6 text-xs text-muted-foreground">
-        <span className="inline-flex items-center gap-1.5">
-          <Lock className="size-3.5" /> 256-bit encrypted
-        </span>
-        <span className="inline-flex items-center gap-1.5">
-          <ShieldCheck className="size-3.5" /> 2FA available
-        </span>
-        <span>
-          &copy; {new Date().getFullYear()} {tenantName || platformName}
-        </span>
+      <footer className="relative z-10 flex flex-col items-center justify-center gap-2 px-5 pb-6 text-center text-xs text-muted-foreground">
+        <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-1">
+          <span className="inline-flex items-center gap-1.5 font-medium text-emerald-400/90">
+            <span className="size-1.5 rounded-full bg-emerald-400" /> Virtual Trading Simulation
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <Lock className="size-3.5" /> 256-bit encrypted
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <ShieldCheck className="size-3.5" /> 2FA available
+          </span>
+          <span>
+            &copy; {new Date().getFullYear()} {tenantName || platformName}
+          </span>
+        </div>
+        <p className="max-w-xl text-[11px] leading-relaxed text-muted-foreground/75">
+          Virtual Trading Application for market training and educational purposes only. No real money involved.
+        </p>
       </footer>
     </main>
   );

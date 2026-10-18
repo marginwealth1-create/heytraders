@@ -3,18 +3,18 @@
 import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useBranding } from "@/lib/branding-context";
-import { STORAGE_KEYS } from "@/lib/constants";
 import Link from "next/link";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { toast } from "sonner";
-import { ArrowRight, Check, X } from "lucide-react";
+import { ArrowRight, Check, GraduationCap, X } from "lucide-react";
 import { AuthAPI, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
+import { API_URL, STORAGE_KEYS } from "@/lib/constants";
 import { FIELD, GOLD_BTN } from "../styles";
 
 const schema = z.object({
@@ -116,6 +116,7 @@ function RegisterPageInner() {
   // alongside the backend's Origin/Referer detection — covers the case
   // where a proxy strips the Origin header.
   const { branding } = useBranding();
+  const logoSrc = branding?.logo_url ? `${API_URL}${branding.logo_url}` : "/logo.png";
   const [showPwd, setShowPwd] = useState(false);
   const [pwdFocused, setPwdFocused] = useState(false);
 
@@ -175,29 +176,50 @@ function RegisterPageInner() {
         </div>
       )}
 
-      <p className="text-xs font-semibold uppercase tracking-[0.2em] text-gold">Open account</p>
-      <h1 className="mt-2 font-display text-3xl font-bold tracking-tight">Start trading today</h1>
-      <p className="mt-2 text-sm text-muted-foreground">Free account, ready in under a minute.</p>
+      {/* Centered Brand Emblem & Register Header */}
+      <div className="flex flex-col items-center text-center">
+        <Link href="/" className="group relative mb-3.5 block transition-transform duration-200 hover:scale-105">
+          <div className="absolute -inset-2.5 rounded-full bg-gradient-to-tr from-emerald-500/40 via-teal-500/25 to-amber-500/35 blur-md opacity-85 group-hover:opacity-100 transition-opacity" />
+          <div className="relative size-20 rounded-full border-2 border-emerald-500/50 bg-[#070b16] p-1 shadow-2xl shadow-emerald-950 ring-4 ring-emerald-500/15">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={logoSrc}
+              alt={branding?.brand_name || "Hey Traders"}
+              className="size-full rounded-full object-contain"
+            />
+          </div>
+        </Link>
 
-      <form onSubmit={form.handleSubmit(onSubmit)} className="mt-7 space-y-5">
-        <div className="space-y-2">
-          <Label htmlFor="full_name">Full name</Label>
+        <div className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold tracking-wider text-emerald-400">
+          <span className="size-1.5 rounded-full bg-emerald-400 animate-pulse" />
+          <span>INSTANT SIMULATION ACCOUNT</span>
+        </div>
+
+        <h1 className="mt-3 font-display text-2xl font-bold tracking-tight text-white sm:text-3xl">
+          Start trading today
+        </h1>
+        <p className="mt-1 text-xs text-white/60">Free paper trading account, ready in under a minute</p>
+      </div>
+
+      <form onSubmit={form.handleSubmit(onSubmit)} className="mt-6 space-y-4">
+        <div className="space-y-1.5">
+          <Label htmlFor="full_name" className="text-xs font-medium text-white/80">Full name</Label>
           <Input id="full_name" placeholder="Rohan Sharma" autoComplete="name" className={FIELD} {...form.register("full_name")} />
           {form.formState.errors.full_name && (
             <p className="text-xs text-destructive">{form.formState.errors.full_name.message}</p>
           )}
         </div>
 
-        <div className="grid gap-5 sm:grid-cols-2 sm:gap-4">
-          <div className="space-y-2">
-            <Label htmlFor="email">Email</Label>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label htmlFor="email" className="text-xs font-medium text-white/80">Email</Label>
             <Input id="email" type="email" placeholder="you@example.com" autoComplete="email" className={FIELD} {...form.register("email")} />
             {form.formState.errors.email && (
               <p className="text-xs text-destructive">{form.formState.errors.email.message}</p>
             )}
           </div>
-          <div className="space-y-2">
-            <Label htmlFor="mobile">Mobile</Label>
+          <div className="space-y-1.5">
+            <Label htmlFor="mobile" className="text-xs font-medium text-white/80">Mobile</Label>
             <Input
               id="mobile"
               inputMode="numeric"
@@ -213,9 +235,9 @@ function RegisterPageInner() {
           </div>
         </div>
 
-        <div className="space-y-2">
+        <div className="space-y-1.5">
           <div className="flex items-center justify-between">
-            <Label htmlFor="password">Password</Label>
+            <Label htmlFor="password" className="text-xs font-medium text-white/80">Password</Label>
             {pwd && (
               <span className={cn("rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider", strength.chipClass)}>
                 {strength.label}
@@ -278,16 +300,41 @@ function RegisterPageInner() {
           )}
         </div>
 
-        <Button type="submit" className={GOLD_BTN} loading={form.formState.isSubmitting}>
-          Create account {!form.formState.isSubmitting && <ArrowRight />}
+        <Button type="submit" className={cn(GOLD_BTN, "mt-2 shadow-lg shadow-amber-500/15")} loading={form.formState.isSubmitting}>
+          Create account {!form.formState.isSubmitting && <ArrowRight className="size-4 ml-1" />}
         </Button>
       </form>
 
-      <p className="mt-7 text-center text-sm text-muted-foreground">
+      {/* Virtual Trading Training Disclaimer Banner */}
+      <div className="mt-5 rounded-2xl border border-emerald-500/25 bg-gradient-to-b from-emerald-950/40 via-[#0B1020]/90 to-[#070b16] p-3.5 text-left shadow-xl shadow-black/50 backdrop-blur-md">
+        <div className="flex items-start gap-3">
+          <div className="grid size-7 shrink-0 place-items-center rounded-xl bg-emerald-500/20 text-emerald-400 ring-1 ring-emerald-500/30 mt-0.5">
+            <GraduationCap className="size-4" />
+          </div>
+          <div className="min-w-0 flex-1 space-y-1">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400">
+                Educational & Training Notice
+              </span>
+              <span className="rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[9px] font-semibold text-emerald-300">
+                Zero Risk
+              </span>
+            </div>
+            <p className="text-xs font-semibold leading-snug text-white/95">
+              No real money involved. This is a Virtual Trading Application which has all features to trade.
+            </p>
+            <p className="text-[11px] leading-relaxed text-white/65">
+              This application is used for exchanging views on markets for individual students for training purpose only.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <p className="mt-5 text-center text-sm text-white/70">
         Already have an account?{" "}
         <Link
           href={refCode ? `/login?ref=${encodeURIComponent(refCode)}` : "/login"}
-          className="font-semibold text-gold hover:text-gold/80"
+          className="font-semibold text-gold hover:text-gold/80 hover:underline"
         >
           Sign in
         </Link>
