@@ -115,6 +115,7 @@ These are long-running asyncio tasks held on `app._*_task`. They must start and 
 | `pnl_sharing_scheduler` | `services/pnl_sharing_service.py` | 5 min | Auto-settles ACTIVE+AUTO P&L sharing agreements at period close (DAILY/WEEKLY/MONTHLY); MANUAL agreements unaffected. Handles both `PNL_AND_BROKERAGE` (default) and `BROKERAGE_ONLY` (`sharing_pnl=0`) agreement types. |
 | Zerodha boot | inline `_zerodha_boot` | once | Cache-warm NSE/NFO/MCX + connect WS pool |
 | Infoway start | inline | once | Forex/crypto/metals/energy feed; off unless `INFOWAY_API_KEY` set and `INFOWAY_AUTO_CONNECT=true` |
+| Binance feeds | `services/binance_service.py` | live WS | `binance` = crypto spot (`BINANCE_CRYPTO_FEED`); `binance_futures` = metals/energy from USDⓈ-M perpetuals (`BINANCE_COMMODITY_FEED`, map `COMMODITY_CONTRACTS`: USOIL→CLUSDT, UKOIL→BZUSDT). fstream's `/public` route carries only `bookTicker`, `/market` carries `aggTrade`+`ticker` — one socket per route. Charts for these come from Yahoo COMEX/NYMEX futures shifted onto the live price. |
 
 Without `risk_enforcer_loop`, the Risk Management settings on the admin page do nothing automatically.
 
