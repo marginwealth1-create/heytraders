@@ -487,6 +487,16 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             except Exception:
                 logger.exception("binance_feed_auto_start_failed")
 
+            # Binance USDⓈ-M futures feed for commodities (XAUUSD, USOIL…) —
+            # leader-only, no-op unless BINANCE_COMMODITY_FEED=true.
+            try:
+                from app.services.binance_service import binance_futures as _bfut
+
+                if _run_global and _bfut.is_enabled():
+                    await _bfut.start()
+            except Exception:
+                logger.exception("binance_futures_feed_auto_start_failed")
+
             # MetaAPI (forex / metals / indices / commodities) feed — leader-only.
             # When METAAPI_FEED=true it supplies those segments in place of
             # Infoway (Infoway stays the automatic fallback). No-op when off.
@@ -1206,11 +1216,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     except Exception:
         pass
 
-    # Stop Binance crypto feed cleanly
+    # Stop the Binance feeds (crypto spot + commodity futures) cleanly
     try:
-        from app.services.binance_service import binance
+        from app.services.binance_service import binance, binance_futures
 
         await binance.stop()
+        await binance_futures.stop()
     except Exception:
         pass
 
