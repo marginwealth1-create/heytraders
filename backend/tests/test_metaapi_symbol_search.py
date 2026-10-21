@@ -44,10 +44,28 @@ def feed():
         ("US500-F", "US500"),
         ("EURUSD.r", "EURUSD"),
         ("XAUUSD", "XAUUSD"),
+        # Exness account-type tail (measured on an Exness MT5 account: all 355
+        # symbols carry it, so nothing matched and 0 symbols subscribed)
+        ("EURUSDm", "EURUSD"),
+        ("AAPLm", "AAPL"),
+        ("US500m", "US500"),
+        ("EURUSDc", "EURUSD"),
+        ("IBM", "IBM"),        # a real capital M stays
+        ("TEAM", "TEAM"),
     ],
 )
 def test_broker_decorations_are_stripped(raw, clean):
     assert clean_broker_symbol(raw) == clean
+
+
+def test_exness_symbols_resolve():
+    f = MetaApiFeed()
+    f._index_broker_symbols(["EURUSDm", "AAPLm", "US500m", "US500_x100m", "DE30m", "USTECm"])
+    assert f._mt_symbol("EURUSD") == "EURUSDm"
+    assert f._mt_symbol("AAPL") == "AAPLm"
+    assert f._mt_symbol("SPX500") == "US500m"   # plain contract, not the x100 variant
+    assert f._mt_symbol("DE40") == "DE30m"      # Exness still calls DAX 40 "DE30"
+    assert f._mt_symbol("NAS100") == "USTECm"
 
 
 def test_our_name_resolves_to_the_brokers_spelling(feed):
