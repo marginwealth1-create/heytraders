@@ -164,8 +164,13 @@ def static_logoid(und: str) -> str | None:
         return "source/NSE"  # any other NSE index: the exchange's own mark
     if und in _COMMODITY_LOGOS:
         return _COMMODITY_LOGOS[und]
-    if len(und) == 6 and und[:3] in _CURRENCY_FLAGS and und[3:] in _CURRENCY_FLAGS:
-        return f"country/{_CURRENCY_FLAGS[und[:3]]}"
+    if und.endswith(("M", "C")) and und[:-1] in _COMMODITY_LOGOS:
+        return _COMMODITY_LOGOS[und[:-1]]
+    cur = und.split(".")[0]
+    if len(cur) == 7 and cur[-1] in ("M", "C"):
+        cur = cur[:-1]
+    if len(cur) == 6 and cur[:3] in _CURRENCY_FLAGS and cur[3:] in _CURRENCY_FLAGS:
+        return f"country/{_CURRENCY_FLAGS[cur[:3]]}"
     return None
 
 
