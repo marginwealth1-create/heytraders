@@ -82,7 +82,7 @@ npm run type-check   # tsc --noEmit
 
 ### Deploy
 
-[scripts/deploy.sh](scripts/deploy.sh) is the on-server deploy script — it diffs `HEAD` against `origin/main` and only restarts the affected piece (backend systemd unit, PM2 frontend, nginx). Force everything with `FORCE_FULL=1 bash scripts/deploy.sh`. See [deploy/README.md](deploy/README.md) for one-time EC2 setup (passwordless sudo for systemctl/nginx). The matching `.github/workflows/deploy.yml` (Actions → SSH → EC2 → `deploy.sh`) is referenced in [deploy/README.md](deploy/README.md) but is not currently checked into this tree — verify on the deployment host before assuming CI auto-deploys.
+[scripts/deploy.sh](scripts/deploy.sh) is the on-server deploy script — it diffs `HEAD` against `origin/main` and only restarts the affected piece (backend systemd unit, PM2 frontend, nginx). Force everything with `FORCE_FULL=1 bash scripts/deploy.sh`. See [deploy/README.md](deploy/README.md) for one-time EC2 setup (passwordless sudo for systemctl/nginx). [.github/workflows/ci.yml](.github/workflows/ci.yml) runs backend pytest + both frontends' `type-check` on every push; [.github/workflows/deploy.yml](.github/workflows/deploy.yml) runs only after CI passes on `main` and SSHes to EC2 → `deploy.sh`. It needs the `EC2_HOST` / `EC2_USER` / `EC2_SSH_KEY` repo secrets from [deploy/README.md](deploy/README.md).
 
 ## Architecture: things that aren't obvious from the file tree
 

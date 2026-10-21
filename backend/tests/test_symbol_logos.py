@@ -44,6 +44,9 @@ def test_tradingview_file_with_leading_comment_is_safe():
         b"",
         b"<svg>" + b" " * 200_001 + b"</svg>",
     ],
+    # Explicit ids: a 200 KB auto-id lands in PYTEST_CURRENT_TEST and breaks
+    # Windows' 32 KB env-var limit.
+    ids=["script", "onload", "javascript", "foreignObject", "html-root", "empty", "oversized"],
 )
 def test_unsafe_or_oversized_svgs_are_rejected(body):
     assert not is_safe_svg(body)
