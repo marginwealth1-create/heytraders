@@ -29,6 +29,7 @@ import { StatusPill } from "@/components/common/StatusPill";
 import { cn, formatINR, pnlColor } from "@/lib/utils";
 import { OwnerBadge } from "@/components/admin/OwnerBadge";
 import { useAdminAuthStore } from "@/stores/authStore";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 /** Bare grouped-number price — no ₹ / $ prefix on any instrument price
  *  (avg / LTP / close). `quote` accepted for call-site compatibility but
@@ -749,7 +750,16 @@ function AdminPositionsInner() {
       ),
     },
     { key: "owner", header: "Owner", render: (r: any) => <OwnerBadge row={r} me={me} /> },
-    { key: "symbol", header: "Symbol" },
+    {
+      key: "symbol",
+      header: "Symbol",
+      render: (r: any) => (
+        <span className="inline-flex items-center gap-2">
+          <SymbolAvatar symbol={r.symbol ?? ""} size={20} />
+          {r.symbol}
+        </span>
+      ),
+    },
     { key: "exchange", header: "Exch" },
     {
       key: "product_type",
@@ -2007,6 +2017,7 @@ function PositionMobileCard({
 
       {/* ── Row 2: symbol + exchange ── */}
       <div className="mt-1.5 flex items-center gap-2 px-3">
+        <SymbolAvatar symbol={r.symbol ?? ""} size={22} />
         <span className="truncate text-sm font-bold leading-tight" title={r.symbol}>
           {r.symbol}
         </span>

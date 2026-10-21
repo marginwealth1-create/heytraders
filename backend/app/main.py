@@ -22,6 +22,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 
 from app import __version__
 from app.api.v1 import branding as branding_public
+from app.api.v1 import logo as logo_public
 from app.api.v1 import webhooks as webhooks_public
 from app.api.v1.admin import router as admin_router
 from app.api.v1.user import router as user_router
@@ -486,6 +487,16 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
                     logger.info("binance_feed_auto_started")
             except Exception:
                 logger.exception("binance_feed_auto_start_failed")
+
+            # Binance USDⓈ-M futures feed for commodities (XAUUSD, USOIL…) —
+            # leader-only, no-op unless BINANCE_COMMODITY_FEED=true.
+            try:
+                from app.services.binance_service import binance_futures as _bfut
+
+                if _run_global and _bfut.is_enabled():
+                    await _bfut.start()
+            except Exception:
+                logger.exception("binance_futures_feed_auto_start_failed")
 
             # MetaAPI (forex / metals / indices / commodities) feed — leader-only.
             # When METAAPI_FEED=true it supplies those segments in place of
@@ -1206,11 +1217,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     except Exception:
         pass
 
-    # Stop Binance crypto feed cleanly
+    # Stop the Binance feeds (crypto spot + commodity futures) cleanly
     try:
-        from app.services.binance_service import binance
+        from app.services.binance_service import binance, binance_futures
 
         await binance.stop()
+        await binance_futures.stop()
     except Exception:
         pass
 
@@ -1417,6 +1429,7 @@ app.include_router(admin_router, prefix="/api/v1")
 # at the v1 root so the path is /api/v1/branding/by-code/...
 app.include_router(branding_public.router, prefix="/api/v1")
 app.include_router(webhooks_public.router, prefix="/api/v1")
+app.include_router(logo_public.router, prefix="/api/v1")
 app.include_router(ws_router)
 
 

@@ -442,6 +442,20 @@ async def _infoway_overlay(token: str, base_quote: dict[str, Any]) -> dict[str, 
                     source = "binance"
         except Exception:
             live = None
+        # COMMODITIES (metals / energy) → Binance USDⓈ-M perpetual when the
+        # commodity feed is on (XAUUSD → XAUUSDT, USOIL → CLUSDT…). Ahead of
+        # MetaAPI / Infoway, which stay the fallback.
+        if live is None:
+            try:
+                from app.services.binance_service import COMMODITY_CONTRACTS, binance_futures
+
+                if binance_futures.is_enabled():
+                    f = binance_futures.get_tick(COMMODITY_CONTRACTS.get(sym.upper()))
+                    if f and float(f.get("ltp") or 0) > 0:
+                        live = f
+                        source = "binance_futures"
+            except Exception:
+                live = None
         # FOREX / METALS / INDICES / COMMODITIES → MetaAPI when enabled. Only the
         # symbols the MT account actually streams resolve here; crypto / NSE
         # return None and fall through. Infoway stays the automatic fallback.
@@ -574,7 +588,7 @@ async def _overlay_all(
     except Exception:
         logger.exception("infoway_overlay_failed", extra={"token": token})
         after_infoway = base
-    if after_infoway.get("source") in ("infoway", "binance", "metaapi"):
+    if after_infoway.get("source") in ("infoway", "binance", "binance_futures", "metaapi"):
         return await _apply_admin_spread(token, after_infoway)
     # Per-token negative cache: a token with no live WS tick whose Kite REST
     # `/quote` snapshot just timed out is almost certainly illiquid / beyond

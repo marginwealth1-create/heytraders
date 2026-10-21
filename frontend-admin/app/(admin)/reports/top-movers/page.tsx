@@ -9,6 +9,7 @@ import { ReportsAdminAPI } from "@/lib/api";
 import { PageHeader } from "@/components/common/PageHeader";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn, formatINR } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 type SymbolRow = {
   token: string;
@@ -143,7 +144,8 @@ function SymbolCard({
           <ul className="divide-y divide-border">
             {rows.map((r) => (
               <li key={r.token} className="flex items-center justify-between py-1.5 text-sm">
-                <div className="min-w-0">
+                <SymbolAvatar symbol={r.symbol ?? ""} changePct={r.change_pct} size={24} />
+                <div className="min-w-0 flex-1 pl-2">
                   <div className="truncate font-medium">{r.symbol}</div>
                   <div className="text-[11px] text-muted-foreground">{r.exchange}</div>
                 </div>

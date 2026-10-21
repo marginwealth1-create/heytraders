@@ -7,6 +7,7 @@ import { InstrumentAPI, OptionChainAPI } from "@/lib/api";
 import { Dialog, DialogContent, DialogPortal, DialogOverlay } from "@/components/ui/dialog";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { cn, formatNumber } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 import { useMarketStream } from "@/lib/useMarketStream";
 import { usePriceFlash } from "@/lib/usePriceFlash";
 
@@ -345,11 +346,14 @@ export function OptionChainPicker({ open, onOpenChange, onPick, initialUnderlyin
                       }}
                       className="flex w-full items-center justify-between px-4 py-2.5 text-left text-sm hover:bg-muted/30"
                     >
+                      <div className="flex items-center gap-2.5">
+                      <SymbolAvatar symbol={r.symbol} size={26} />
                       <div>
                         <div className="font-medium">{r.symbol}</div>
                         <div className="text-[10px] text-muted-foreground">
                           {r.exchange} · {r.segment ?? r.instrument_type ?? ""}
                         </div>
+                      </div>
                       </div>
                       <span className="text-xs text-muted-foreground">{r.name ?? ""}</span>
                     </button>

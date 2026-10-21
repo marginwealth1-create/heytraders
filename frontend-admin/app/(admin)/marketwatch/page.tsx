@@ -20,6 +20,7 @@ import { PageHeader } from "@/components/common/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 /**
  * Admin Market Watch — per-segment instrument lists + place orders on
@@ -252,6 +253,7 @@ export default function AdminMarketWatchPage() {
                   key={tok}
                   className="flex items-center gap-3 border-b border-border/60 px-3 py-2 text-sm last:border-b-0"
                 >
+                  <SymbolAvatar symbol={s.symbol ?? ""} size={26} />
                   <div className="min-w-0 flex-1">
                     <div className="truncate font-medium">{s.symbol}</div>
                     <div className="truncate text-[11px] text-muted-foreground">
@@ -328,9 +330,14 @@ export default function AdminMarketWatchPage() {
                     className="cursor-pointer border-t border-border/60 transition-colors hover:bg-accent/30"
                   >
                     <td className="px-3 py-2.5">
-                      <div className="font-semibold">{it.symbol}</div>
-                      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                        {it.exchange}
+                      <div className="flex items-center gap-2.5">
+                        <SymbolAvatar symbol={it.symbol ?? ""} changePct={chgPct} size={28} />
+                        <div>
+                          <div className="font-semibold">{it.symbol}</div>
+                          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                            {it.exchange}
+                          </div>
+                        </div>
                       </div>
                     </td>
                     <td className="px-3 py-2.5 text-right tabular-nums text-red-500">

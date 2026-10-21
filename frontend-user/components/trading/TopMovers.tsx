@@ -8,6 +8,7 @@ import { InstrumentAPI } from "@/lib/api";
 import { useMarketStream } from "@/lib/useMarketStream";
 import { usePriceFlash } from "@/lib/usePriceFlash";
 import { cn } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 // ─────────────────────────────────────────────────────────────────────
 // Dashboard "Top movers" — ranks a curated basket of NIFTY large-caps by
@@ -213,7 +214,8 @@ function MoverRow({ row }: { row: any }) {
         href={`/terminal?token=${row.token}`}
         className="flex items-center justify-between gap-2 rounded-lg px-1 py-1.5 transition-colors hover:bg-muted/40 active:bg-muted/60"
       >
-        <div className="min-w-0">
+        <SymbolAvatar symbol={row.symbol} changePct={row.pct} size={26} />
+        <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-bold tracking-tight">{row.symbol}</div>
           <div
             className={cn(

@@ -9,6 +9,7 @@ import { useMarketStream } from "@/lib/useMarketStream";
 import { cn, formatPrice, pnlColor } from "@/lib/utils";
 import { MobileOptionChain } from "@/components/trading/MobileOptionChain";
 import { TickFlash } from "@/components/trading/TickFlash";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 interface Props {
   activeToken: string | null;
@@ -810,7 +811,9 @@ function InstrumentRow({
         isActive ? "bg-primary/10" : "hover:bg-muted/30",
       )}
     >
-      {/* Bold symbol + change% (left, stacked) */}
+      {/* Logo + bold symbol + change% (left, stacked) */}
+      <div className="flex min-w-0 items-center gap-2.5">
+      <SymbolAvatar symbol={symbol} changePct={changePct} size={32} />
       <div className="flex min-w-0 flex-col items-start leading-tight">
         <span
           className={cn(
@@ -838,6 +841,7 @@ function InstrumentRow({
             </span>
           )}
         </div>
+      </div>
       </div>
 
       {/* Bid (sell, red) on top + Ask (buy, green) below — both prices

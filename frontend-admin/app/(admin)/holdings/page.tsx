@@ -5,13 +5,23 @@ import { TradingAPI } from "@/lib/api";
 import { PageHeader } from "@/components/common/PageHeader";
 import { DataTable, type Column } from "@/components/common/DataTable";
 import { formatINR, formatPercent, pnlColor } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 export default function AdminHoldingsPage() {
   const { data, isFetching } = useQuery({ queryKey: ["admin", "holdings"], queryFn: () => TradingAPI.holdings() });
 
   const cols: Column<any>[] = [
     { key: "user_code", header: "User" },
-    { key: "symbol", header: "Symbol" },
+    {
+      key: "symbol",
+      header: "Symbol",
+      render: (r: any) => (
+        <span className="inline-flex items-center gap-2">
+          <SymbolAvatar symbol={r.symbol ?? ""} size={20} />
+          {r.symbol}
+        </span>
+      ),
+    },
     { key: "quantity", header: "Qty", align: "right" },
     { key: "avg_price", header: "Avg", align: "right", render: (r) => formatINR(r.avg_price) },
     { key: "ltp", header: "LTP", align: "right", render: (r) => formatINR(r.ltp) },

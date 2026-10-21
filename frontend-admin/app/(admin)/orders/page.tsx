@@ -13,6 +13,7 @@ import { DataTable, type Column } from "@/components/common/DataTable";
 import { Pagination } from "@/components/common/Pagination";
 import { StatusPill } from "@/components/common/StatusPill";
 import { cn } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 function fmtPrice(value: number | string | null | undefined): string {
   const n = typeof value === "string" ? Number(value) : (value ?? 0);
@@ -302,7 +303,16 @@ function OrdersTable({
           </div>
         ),
       },
-      { key: "symbol", header: "Symbol" },
+      {
+        key: "symbol",
+        header: "Symbol",
+        render: (r: any) => (
+          <span className="inline-flex items-center gap-2">
+            <SymbolAvatar symbol={r.symbol ?? ""} size={20} />
+            {r.symbol}
+          </span>
+        ),
+      },
       { key: "exchange", header: "Exch" },
       { key: "action", header: "Side", render: (r) => <StatusPill status={r.action} /> },
       { key: "order_type", header: "Type", render: (r) => <StatusPill status={r.order_type} /> },

@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Plus, X } from "lucide-react";
 import { OptionChainPicker } from "@/components/trading/OptionChainPicker";
 import { cn } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 export interface ChartTab {
   token: string;
@@ -63,6 +64,7 @@ export function ChartTabs({ tabs, active, onSelect, onClose, onAdded }: Props) {
                 : "text-muted-foreground hover:bg-muted/30 hover:text-foreground"
             )}
           >
+            <SymbolAvatar symbol={t.symbol} size={16} />
             <span className="font-medium">{t.symbol}</span>
             {onClose && (
               <span

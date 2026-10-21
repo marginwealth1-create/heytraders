@@ -10,6 +10,7 @@ import { PageHeader } from "@/components/common/PageHeader";
 import { DataTable, type Column } from "@/components/common/DataTable";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn, formatINR } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 type ExposureRow = {
   token: string;
@@ -87,8 +88,9 @@ export default function ExposurePage() {
       render: (r) => (
         <Link
           href={`/positions?q=${encodeURIComponent(r.symbol)}`}
-          className="font-medium hover:underline"
+          className="inline-flex items-center gap-2 font-medium hover:underline"
         >
+          <SymbolAvatar symbol={r.symbol ?? ""} size={20} />
           {r.symbol}
         </Link>
       ),

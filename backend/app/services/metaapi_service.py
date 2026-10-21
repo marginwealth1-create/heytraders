@@ -82,7 +82,7 @@ _VARIANT_SUFFIXES = ("-PERP", "-24", "-F", "-CASH", "CASH", "PRO", "RAW", "ECN",
 # Genuine renames, tried only when the platform name isn't offered verbatim.
 _SYMBOL_ALIASES: dict[str, tuple[str, ...]] = {
     "SPX500": ("US500", "SP500", "SPX"),
-    "DE40": ("GER40", "DAX40", "GER30"),
+    "DE40": ("GER40", "DAX40", "GER30", "DE30"),
     "UK100": ("FTSE100", "UK100"),
     "NAS100": ("USTEC", "NDX100", "TECH100"),
     "US30": ("DJ30", "WS30", "DOW30"),
@@ -98,11 +98,16 @@ _SYMBOL_ALIASES: dict[str, tuple[str, ...]] = {
 
 def clean_broker_symbol(raw: str) -> str:
     """Broker spelling → our catalogue symbol: AAPL.US-24 → AAPL, US500-F →
-    US500, EURUSD.r → EURUSD."""
-    s = (raw or "").strip().upper()
+    US500, EURUSD.r → EURUSD, EURUSDm → EURUSD."""
+    s = (raw or "").strip().split(".", 1)[0]
+    # Exness tags every symbol with its account type in lower case — EURUSDm
+    # (Standard), EURUSDc (Cent). Case is the only signal (IBM, TEAM end in a
+    # real capital M), so strip it before upper-casing.
+    if len(s) > 3 and s[-1] in "mc" and s[:-1] == s[:-1].upper():
+        s = s[:-1]
+    s = s.upper()
     if not s:
         return ""
-    s = s.split(".", 1)[0]
     changed = True
     while changed:
         changed = False
