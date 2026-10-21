@@ -7,6 +7,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { OrderAPI, SegmentSettingsAPI, WalletAPI } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { cn, formatINR } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 import { playBuyTone, playSellTone } from "@/lib/trade-audio";
 import { isInstrumentMarketOpen, marketLabel } from "@/lib/marketHours";
 
@@ -1048,7 +1049,8 @@ export function OrderPanel({ instrument, ltp, bid, ask, open, high, low, close, 
   return (
     <aside className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-card">
       <div className="border-b border-border px-3 py-2">
-        <div className="flex items-baseline gap-2">
+        <div className="flex items-center gap-2">
+          {instrument?.symbol && <SymbolAvatar symbol={instrument.symbol} size={20} />}
           <div className="text-sm font-semibold">{instrument?.symbol ?? "—"} order</div>
           {instrument?.expiry && (
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground">

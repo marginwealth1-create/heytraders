@@ -12,6 +12,7 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogT
 import { PageHeader } from "@/components/common/PageHeader";
 import { DataTable, type Column } from "@/components/common/DataTable";
 import { StatusPill } from "@/components/common/StatusPill";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 export default function AlertsPage() {
   const qc = useQueryClient();
@@ -57,7 +58,16 @@ export default function AlertsPage() {
   }
 
   const cols: Column<any>[] = [
-    { key: "symbol", header: "Symbol" },
+    {
+      key: "symbol",
+      header: "Symbol",
+      render: (r) => (
+        <span className="inline-flex items-center gap-2">
+          <SymbolAvatar symbol={r.symbol ?? ""} size={20} />
+          {r.symbol}
+        </span>
+      ),
+    },
     { key: "alert_type", header: "Type", render: (r) => <StatusPill status={r.alert_type.replace("_", " ")} /> },
     { key: "target_price", header: "Target", align: "right" },
     { key: "is_triggered", header: "Triggered", render: (r) => (r.is_triggered ? "Yes" : "No") },
@@ -105,7 +115,10 @@ export default function AlertsPage() {
                           }}
                           className="flex w-full items-center justify-between rounded px-2 py-1 text-left text-xs hover:bg-accent"
                         >
-                          <span>{r.symbol}</span>
+                          <span className="inline-flex items-center gap-2">
+                            <SymbolAvatar symbol={r.symbol} size={18} />
+                            {r.symbol}
+                          </span>
                           <span className="text-muted-foreground">{r.exchange}</span>
                         </button>
                       ))}

@@ -9,6 +9,7 @@ import { cn, formatIST, formatPrice } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 import {
   Dialog,
   DialogContent,
@@ -219,6 +220,7 @@ function OrderRow({
           >
             {buy ? "BUY" : "SELL"}
           </span>
+          <SymbolAvatar symbol={order.symbol ?? ""} size={20} />
           <span className="truncate text-sm font-semibold">{order.symbol}</span>
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">

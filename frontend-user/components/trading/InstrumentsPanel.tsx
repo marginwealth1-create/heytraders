@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { RefreshCw, Search, Star, X } from "lucide-react";
 import { InstrumentAPI, MarketwatchAPI, SegmentSettingsAPI } from "@/lib/api";
 import { cn, formatPrice } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 import { useMarketStream } from "@/lib/useMarketStream";
 import { usePriceFlash } from "@/lib/usePriceFlash";
 
@@ -698,7 +699,9 @@ export function InstrumentsPanel({ onClose }: Props) {
               // badge) just take the natural 28-px slot.
               className="grid w-full cursor-pointer grid-cols-[1fr_auto_auto] items-center gap-3 border-b border-border/40 px-3 py-2.5 text-left text-xs transition-colors hover:bg-muted/30"
             >
-              {/* Symbol + change% + expiry (left side, stacked) */}
+              {/* Logo + symbol + change% + expiry (left side, stacked) */}
+              <div className="flex min-w-0 items-center gap-2.5">
+              <SymbolAvatar symbol={q.symbol} changePct={changePct} size={28} />
               <div className="flex min-w-0 flex-col items-start leading-tight">
                 <span className="break-all font-semibold text-sm leading-snug">
                   {q.symbol}
@@ -727,6 +730,7 @@ export function InstrumentsPanel({ onClose }: Props) {
                     </span>
                   )}
                 </div>
+              </div>
               </div>
 
               {/* Bid (red, top) / Ask (green, bottom) — stacked vertically */}

@@ -25,6 +25,7 @@ import { DataTable, type Column } from "@/components/common/DataTable";
 import { StatusPill } from "@/components/common/StatusPill";
 import { TradeDetailSheet } from "@/components/trading/TradeDetailSheet";
 import { cn, formatINR, formatIST, formatPrice, pnlColor } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 // Unified blotter tabs: Position (open) / Active (per-fill) / Closed
 // (today's realised) / Cancelled (orders) / Rejected (orders). Replaces
@@ -834,7 +835,16 @@ export default function PositionsPage() {
 
   // ── Columns per tab ─────────────────────────────────────────────────
   const positionCols: Column<any>[] = [
-    { key: "symbol", header: "Symbol" },
+    {
+      key: "symbol",
+      header: "Symbol",
+      render: (r) => (
+        <span className="inline-flex items-center gap-2">
+          <SymbolAvatar symbol={r.symbol ?? ""} size={22} />
+          {r.symbol}
+        </span>
+      ),
+    },
     { key: "exchange", header: "Exch" },
     {
       key: "quantity",
@@ -969,7 +979,16 @@ export default function PositionsPage() {
   // Shared between both tabs — only the cancelled_at vs rejected reason
   // detail differs, and that's surfaced via the row data itself.
   const orderCols: Column<any>[] = [
-    { key: "symbol", header: "Symbol" },
+    {
+      key: "symbol",
+      header: "Symbol",
+      render: (r) => (
+        <span className="inline-flex items-center gap-2">
+          <SymbolAvatar symbol={r.symbol ?? ""} size={22} />
+          {r.symbol}
+        </span>
+      ),
+    },
     { key: "exchange", header: "Exch" },
     {
       key: "action",
@@ -1025,7 +1044,16 @@ export default function PositionsPage() {
   // so the user's eye doesn't have to relearn the column layout when
   // switching tabs.
   const closedCols: Column<any>[] = [
-    { key: "symbol", header: "Symbol" },
+    {
+      key: "symbol",
+      header: "Symbol",
+      render: (r) => (
+        <span className="inline-flex items-center gap-2">
+          <SymbolAvatar symbol={r.symbol ?? ""} size={22} />
+          {r.symbol}
+        </span>
+      ),
+    },
     { key: "exchange", header: "Exch" },
     {
       // For a closed row `quantity` has been zeroed by the matching engine.
@@ -1166,7 +1194,16 @@ export default function PositionsPage() {
   // open position. Adds Used Margin / Holding Margin (1.4× for MIS, same
   // for NRML), inline TP / SL edit buttons and a per-fill Exit action.
   const activeCols: Column<any>[] = [
-    { key: "symbol", header: "Symbol" },
+    {
+      key: "symbol",
+      header: "Symbol",
+      render: (r) => (
+        <span className="inline-flex items-center gap-2">
+          <SymbolAvatar symbol={r.symbol ?? ""} size={22} />
+          {r.symbol}
+        </span>
+      ),
+    },
     { key: "exchange", header: "Exch" },
     {
       key: "action",
@@ -2099,7 +2136,8 @@ function ClosedMobileCard({ row: r }: { row: any }) {
       {/* Symbol + sub-line on the left, P&L / brokerage on the right */}
       <div className="mt-2 flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
-          <div className="break-all text-[13px] font-bold leading-tight sm:text-sm">
+          <div className="flex items-center gap-2 break-all text-[13px] font-bold leading-tight sm:text-sm">
+            <SymbolAvatar symbol={r.symbol ?? ""} size={24} />
             {r.symbol}
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -2416,6 +2454,7 @@ function ActiveMobileCard({
               >
                 {side}
               </span>
+              <SymbolAvatar symbol={r.symbol ?? ""} size={24} />
               <span className="truncate text-[15px] font-bold leading-tight">
                 {r.symbol}
               </span>
@@ -2554,7 +2593,8 @@ function ActiveMobileCard({
 
         <div className="mt-2 flex items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <div className="break-all text-[13px] font-bold leading-tight sm:text-sm">
+            <div className="flex items-center gap-2 break-all text-[13px] font-bold leading-tight sm:text-sm">
+              <SymbolAvatar symbol={r.symbol ?? ""} size={24} />
               {r.symbol}
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -2847,7 +2887,8 @@ function PendingOrderCard({
 
       <div className="mt-2 flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="truncate text-base font-bold leading-tight">
+          <div className="flex items-center gap-2 truncate text-base font-bold leading-tight">
+            <SymbolAvatar symbol={o?.symbol ?? o?.instrument?.symbol ?? ""} size={24} />
             {o?.symbol ?? o?.instrument?.symbol ?? "—"}
           </div>
           <div className="mt-0.5 text-[11px] uppercase tracking-wide text-muted-foreground">

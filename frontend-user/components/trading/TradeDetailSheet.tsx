@@ -37,6 +37,7 @@ import { useMarketStream } from "@/lib/useMarketStream";
 import { getIndexLotSize } from "@/lib/indexLots";
 import { isInstrumentMarketOpen, marketLabel } from "@/lib/marketHours";
 import { cn, formatINR, formatIST, formatPercent, pnlColor } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 interface Props {
   token: string | null;
@@ -940,6 +941,7 @@ function TradeDetailSheetInner({ token, open, onClose, onSwap, initialSide, seed
           <div className="flex items-start gap-3">
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
+                {instrument?.symbol && <SymbolAvatar symbol={instrument.symbol} size={28} />}
                 <span className="truncate text-lg font-bold">
                   {instrument?.symbol ?? "—"}
                 </span>

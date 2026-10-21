@@ -22,6 +22,7 @@ import { isInstrumentMarketOpen, marketLabel } from "@/lib/marketHours";
 import { useMarketStream } from "@/lib/useMarketStream";
 import { playClosedTone } from "@/lib/trade-audio";
 import { usePriceFlash } from "@/lib/usePriceFlash";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 /**
  * Resolve the displayed lot count + total quantity for a position / trade
@@ -640,7 +641,7 @@ export function PositionsTabs({ positions, pendingOrders, history, cancelled, to
                   key={o.id}
                   cells={[
                     o.created_at ? exactTimestamp(o.created_at) : "—",
-                    o.symbol,
+                    <SymCell key="sym" symbol={o.symbol} />,
                     (o.product_type || "MIS").slice(0, 1),
                     <SideBadge key="s" side={o.action} />,
                     lots < 1 ? lots.toFixed(2) : String(lots),
@@ -699,7 +700,7 @@ export function PositionsTabs({ positions, pendingOrders, history, cancelled, to
                   key={o.id}
                   cells={[
                     o.created_at ? exactTimestamp(o.created_at) : "—",
-                    o.symbol,
+                    <SymCell key="sym" symbol={o.symbol} />,
                     (o.product_type || "MIS").slice(0, 1),
                     <SideBadge key="s" side={o.action} />,
                     lots < 1 ? lots.toFixed(2) : String(lots),
@@ -736,7 +737,7 @@ export function PositionsTabs({ positions, pendingOrders, history, cancelled, to
                   key={o.id}
                   cells={[
                     o.created_at ? exactTimestamp(o.created_at) : "—",
-                    o.symbol,
+                    <SymCell key="sym" symbol={o.symbol} />,
                     (o.product_type || "MIS").slice(0, 1),
                     <SideBadge key="s" side={o.action} />,
                     lots < 1 ? lots.toFixed(2) : String(lots),
@@ -783,6 +784,15 @@ function Body({ empty, isEmpty, rows }: { empty: string; isEmpty: boolean; rows:
     return <div className="grid h-32 place-items-center text-xs text-muted-foreground">{empty}</div>;
   }
   return <div>{rows}</div>;
+}
+
+function SymCell({ symbol }: { symbol: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <SymbolAvatar symbol={symbol} size={18} />
+      {symbol}
+    </span>
+  );
 }
 
 function Row({ cells }: { cells: React.ReactNode[] }) {
@@ -836,7 +846,7 @@ function PositionRow({
     <Row
       cells={[
         position.opened_at ? exactTimestamp(position.opened_at) : "—",
-        position.symbol,
+        <SymCell key="sym" symbol={position.symbol} />,
         (position.product_type || "MIS").slice(0, 1),
         <SideBadge key="s" side={isBuy ? "BUY" : "SELL"} />,
         lots < 1 ? lots.toFixed(2) : String(lots),
@@ -893,7 +903,7 @@ function ActiveTradeRow({
     <Row
       cells={[
         trade.executed_at ? exactTimestamp(trade.executed_at) : "—",
-        trade.symbol,
+        <SymCell key="sym" symbol={trade.symbol} />,
         (trade.product_type || "MIS").slice(0, 1),
         <SideBadge key="s" side={trade.action as "BUY" | "SELL"} />,
         lots < 1 ? lots.toFixed(2) : String(lots),

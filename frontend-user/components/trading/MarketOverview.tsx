@@ -6,20 +6,13 @@ import { useQuery } from "@tanstack/react-query";
 import {
   ArrowDownRight,
   ArrowUpRight,
-  BarChart3,
-  Banknote,
-  Building2,
   ChevronRight,
-  Landmark,
-  Laptop,
-  LineChart,
-  TrendingUp,
-  Zap,
 } from "lucide-react";
 import { InstrumentAPI } from "@/lib/api";
 import { useMarketStream } from "@/lib/useMarketStream";
 import { usePriceFlash } from "@/lib/usePriceFlash";
 import { cn } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 // ─────────────────────────────────────────────────────────────────────
 // Dashboard "Market overview" — a compact, live, color-coded snapshot of
@@ -33,19 +26,6 @@ import { cn } from "@/lib/utils";
 // Mobile-first: the dashboard renders this in place of the old stat tiles
 // on phones; desktop keeps the original tiles.
 // ─────────────────────────────────────────────────────────────────────
-
-// Rotating icon + accent palette so each row gets a distinct, calm tile —
-// matches the reference design (green / blue / violet / amber / cyan).
-const PALETTE: { bg: string; fg: string }[] = [
-  { bg: "bg-emerald-500/10", fg: "text-emerald-600 dark:text-emerald-400" },
-  { bg: "bg-blue-500/10", fg: "text-blue-600 dark:text-blue-400" },
-  { bg: "bg-violet-500/10", fg: "text-violet-600 dark:text-violet-400" },
-  { bg: "bg-amber-500/10", fg: "text-amber-600 dark:text-amber-400" },
-  { bg: "bg-cyan-500/10", fg: "text-cyan-600 dark:text-cyan-400" },
-  { bg: "bg-rose-500/10", fg: "text-rose-600 dark:text-rose-400" },
-];
-
-const ICONS = [TrendingUp, Building2, Banknote, BarChart3, Zap, Laptop, LineChart, Landmark];
 
 function fmtPrice(n: number): string {
   return n.toLocaleString("en-IN", {
@@ -203,7 +183,6 @@ export function MarketOverview({ className }: { className?: string }) {
 function MarketRow({
   item,
   quote,
-  index,
 }: {
   item: any;
   quote: any;
@@ -215,8 +194,6 @@ function MarketRow({
   const up = pct >= 0;
   const hasQuote = ltp > 0;
 
-  const { bg, fg } = PALETTE[index % PALETTE.length];
-  const Icon = ICONS[index % ICONS.length];
 
   return (
     <li>
@@ -224,10 +201,7 @@ function MarketRow({
         href={`/terminal?token=${item.token}`}
         className="flex items-center gap-3 px-4 py-3 transition-colors hover:bg-muted/40 active:bg-muted/60"
       >
-        {/* Accent icon tile */}
-        <div className={cn("grid size-10 shrink-0 place-items-center rounded-xl", bg, fg)}>
-          <Icon className="size-5" strokeWidth={2.25} />
-        </div>
+        <SymbolAvatar symbol={item.symbol ?? ""} changePct={quote?.change_pct} size={40} />
 
         {/* Symbol + name */}
         <div className="min-w-0 flex-1">

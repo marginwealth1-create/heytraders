@@ -20,6 +20,7 @@ import { MobileNews } from "@/components/trading/MobileNews";
 import { TradeDetailSheet } from "@/components/trading/TradeDetailSheet";
 import { WalletStrip } from "@/components/trading/WalletStrip";
 import { cn, formatPercent, pnlColor } from "@/lib/utils";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 const ORDER_PANEL_COLLAPSED_KEY = "setupfx.terminal.orderPanelCollapsed";
 
@@ -476,6 +477,7 @@ export default function TradingTerminalPage() {
             </Link>
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">
+                {instrument?.symbol && <SymbolAvatar symbol={instrument.symbol} changePct={quote?.change_pct} size={22} />}
                 <span className="truncate text-sm font-bold">
                   {instrument?.symbol ?? "—"}
                 </span>
@@ -535,7 +537,8 @@ export default function TradingTerminalPage() {
               on phones. lg+ keeps it for the volume + source-badge
               metadata the desktop user can scan at a glance. */}
           <div className="hidden flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-border px-3 py-2 text-xs lg:flex">
-            <div className="flex items-baseline gap-2">
+            <div className="flex items-center gap-2">
+              {instrument?.symbol && <SymbolAvatar symbol={instrument.symbol} changePct={quote?.change_pct} size={20} />}
               <span className="text-sm font-semibold text-foreground">
                 {instrument?.symbol ?? "Select an instrument"}
               </span>

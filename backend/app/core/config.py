@@ -249,6 +249,11 @@ class Settings(BaseSettings):
     # and Infoway. Map: binance_service.COMMODITY_CONTRACTS. Perpetuals carry a
     # small basis to COMEX spot (~0.05% on gold) and 8-hourly funding.
     BINANCE_COMMODITY_FEED: bool = False
+
+    # ── Instrument logos (GET /api/v1/logo/{symbol}) ─────────────────────
+    # Disk cache shared by every worker. Must NOT live under the public
+    # /uploads mount — SVGs are only safe behind the route's CSP headers.
+    SYMBOL_LOGO_DIR: str = "var/symbol-logos"
     # ── MetaAPI (MetaTrader) feed for forex / metals / indices / commodities ──
     # When True, those segments get their live price from a connected MT4/MT5
     # account via metaapi.cloud instead of Infoway (crypto stays on Binance).

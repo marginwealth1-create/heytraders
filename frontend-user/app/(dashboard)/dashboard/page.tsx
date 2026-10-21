@@ -23,6 +23,7 @@ import { cn, formatINR, formatPrice, pnlColor } from "@/lib/utils";
 import { AddFundsWizard } from "@/components/wallet/AddFundsWizard";
 import { MarketOverview } from "@/components/trading/MarketOverview";
 import { TopMovers } from "@/components/trading/TopMovers";
+import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 import { useHomeTicker } from "@/lib/useSupport";
 
 export default function DashboardPage() {
@@ -242,14 +243,7 @@ export default function DashboardPage() {
                       className="flex items-center justify-between gap-3 py-2.5 transition-colors hover:bg-muted/30"
                     >
                       <div className="flex items-center gap-3">
-                        <div
-                          className={cn(
-                            "grid size-9 place-items-center rounded-full text-xs font-bold uppercase",
-                            isUp ? "bg-buy/15 text-buy" : "bg-sell/15 text-sell"
-                          )}
-                        >
-                          {p.symbol?.slice(0, 2)}
-                        </div>
+                        <SymbolAvatar symbol={p.symbol ?? ""} changePct={isUp ? 1 : -1} size={36} />
                         <div>
                           <div className="text-sm font-medium">{p.symbol}</div>
                           <div className="text-[11px] text-muted-foreground">
@@ -299,6 +293,7 @@ export default function DashboardPage() {
                         >
                           {isBuy ? "BUY" : "SELL"}
                         </span>
+                        <SymbolAvatar symbol={o.symbol ?? ""} size={20} />
                         <span className="font-medium">{o.symbol}</span>
                         <span className="text-muted-foreground">×{o.quantity}</span>
                       </div>

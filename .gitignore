@@ -53,6 +53,8 @@ dump.rdb
 *.rdb
 backend/uploads/*
 !backend/uploads/.gitkeep
+# Instrument-logo disk cache (SYMBOL_LOGO_DIR)
+backend/var/
 
 # Celery beat runtime state (SQLite + WAL/SHM). Regenerated on every
 # beat start; checking it in causes cross-host clock collisions.
