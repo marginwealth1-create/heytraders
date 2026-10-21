@@ -867,10 +867,14 @@ class ZerodhaService:
 
             # We hold the cluster-wide lock — do the real Kite fetch.
             try:
-                # Inside the try on purpose: with no token (never connected, or
-                # expired) this raises, and outside the try that skipped the
-                # cooldown entirely, so the very next caller went round again.
-                kc, s = await self._kite_with_token()
+                # Kite Connect /instruments endpoint is completely public and does NOT
+                # require an active session token. We pass apiKey if configured (or 'public')
+                # and accessToken if available, so instruments can be fetched/searched 24/7
+                # even before the daily admin login.
+                s = await self._get_settings()
+                api_key = s.apiKey or "public"
+                access_token = s.accessToken if (s.isConnected and s.accessToken) else None
+                kc = self._kite(api_key, access_token)
                 data = await asyncio.to_thread(kc.instruments, exchange) if exchange else await asyncio.to_thread(kc.instruments)
             except Exception as e:
                 # Start the cooldown so we don't hammer Kite through the 429 window.
