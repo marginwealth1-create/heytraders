@@ -244,10 +244,11 @@ class Settings(BaseSettings):
     BINANCE_CRYPTO_SYMBOLS: str = ""
     # ── Binance USDⓈ-M futures feed for COMMODITIES (free, no API key) ───
     # When True, the metals / energy instruments (XAUUSD, XAGUSD, XPTUSD,
-    # XPDUSD, USOIL, UKOIL, NATGAS, COPPER) take their live price from the
-    # matching Binance perpetual (XAUUSDT, CLUSDT, BZUSDT…), ahead of MetaAPI
-    # and Infoway. Map: binance_service.COMMODITY_CONTRACTS. Perpetuals carry a
-    # small basis to COMEX spot (~0.05% on gold) and 8-hourly funding.
+    # XPDUSD, USOIL, UKOIL, NATGAS, COPPER) fall back to the matching Binance
+    # perpetual (XAUUSDT, CLUSDT, BZUSDT…) whenever MetaAPI isn't streaming
+    # that symbol — MetaAPI's broker SPOT price wins when it is. Map:
+    # binance_service.COMMODITY_CONTRACTS. Perpetuals carry a small basis to
+    # spot (~0.05% on gold) and 8-hourly funding.
     BINANCE_COMMODITY_FEED: bool = False
 
     # ── Instrument logos (GET /api/v1/logo/{symbol}) ─────────────────────

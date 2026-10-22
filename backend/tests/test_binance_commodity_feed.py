@@ -47,3 +47,38 @@ def test_overlay_prices_gold_from_the_perpetual(monkeypatch):
     assert q["ltp"] == 4142.97
     assert (q["bid"], q["ask"]) == (4142.97, 4142.98)
     assert q["change_pct"] == -0.32
+
+
+class _FakeMetaApi:
+    def __init__(self, ticks):
+        self.ticks = ticks
+
+    def is_enabled(self):
+        return True
+
+    def get_tick(self, sym):
+        return self.ticks.get(sym)
+
+
+def test_metaapi_spot_beats_the_perpetual_and_binance_is_the_fallback(monkeypatch):
+    from app.services import metaapi_service
+
+    perp = bs.BinanceFeed("t", (), enabled=lambda: True, symbols=lambda: ["XAUUSDT"])
+    perp._handle({"stream": "xauusdt@aggTrade", "data": {"s": "XAUUSDT", "p": "4150.10"}})
+    monkeypatch.setattr(bs, "binance_futures", perp)
+    monkeypatch.setattr(settings, "BINANCE_CRYPTO_FEED", False)
+
+    async def _sym(_token):
+        return "XAUUSD"
+
+    monkeypatch.setattr(mds, "_resolve_symbol", _sym)
+    monkeypatch.setattr(mds, "get_usd_inr_rate", lambda: 85.0)
+
+    spot = {"XAUUSD": {"ltp": 4136.50, "bid": 4136.40, "ask": 4136.60}}
+    monkeypatch.setattr(metaapi_service, "metaapi", _FakeMetaApi(spot))
+    q = asyncio.run(mds._infoway_overlay("XAUUSD", {"ltp": 0, "bid": 0, "ask": 0}))
+    assert (q["source"], q["ltp"]) == ("metaapi", 4136.50)
+
+    monkeypatch.setattr(metaapi_service, "metaapi", _FakeMetaApi({}))  # not streamed
+    q = asyncio.run(mds._infoway_overlay("XAUUSD", {"ltp": 0, "bid": 0, "ask": 0}))
+    assert (q["source"], q["ltp"]) == ("binance_futures", 4150.10)

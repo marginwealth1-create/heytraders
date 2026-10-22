@@ -442,23 +442,10 @@ async def _infoway_overlay(token: str, base_quote: dict[str, Any]) -> dict[str, 
                     source = "binance"
         except Exception:
             live = None
-        # COMMODITIES (metals / energy) → Binance USDⓈ-M perpetual when the
-        # commodity feed is on (XAUUSD → XAUUSDT, USOIL → CLUSDT…). Ahead of
-        # MetaAPI / Infoway, which stay the fallback.
-        if live is None:
-            try:
-                from app.services.binance_service import COMMODITY_CONTRACTS, binance_futures
-
-                if binance_futures.is_enabled():
-                    f = binance_futures.get_tick(COMMODITY_CONTRACTS.get(sym.upper()))
-                    if f and float(f.get("ltp") or 0) > 0:
-                        live = f
-                        source = "binance_futures"
-            except Exception:
-                live = None
         # FOREX / METALS / INDICES / COMMODITIES → MetaAPI when enabled. Only the
         # symbols the MT account actually streams resolve here; crypto / NSE
-        # return None and fall through. Infoway stays the automatic fallback.
+        # return None and fall through. For metals / energy this is the SPOT
+        # price (XAUUSDm…), so it wins over the Binance perpetual below.
         if live is None:
             try:
                 from app.services.metaapi_service import metaapi
@@ -468,6 +455,20 @@ async def _infoway_overlay(token: str, base_quote: dict[str, Any]) -> dict[str, 
                     if m and float(m.get("ltp") or 0) > 0:
                         live = m
                         source = "metaapi"
+            except Exception:
+                live = None
+        # COMMODITIES (metals / energy) fallback → Binance USDⓈ-M perpetual
+        # (XAUUSD → XAUUSDT, USOIL → CLUSDT…) for any commodity MetaAPI isn't
+        # streaming. Perps carry a basis to spot, so MetaAPI goes first.
+        if live is None:
+            try:
+                from app.services.binance_service import COMMODITY_CONTRACTS, binance_futures
+
+                if binance_futures.is_enabled():
+                    f = binance_futures.get_tick(COMMODITY_CONTRACTS.get(sym.upper()))
+                    if f and float(f.get("ltp") or 0) > 0:
+                        live = f
+                        source = "binance_futures"
             except Exception:
                 live = None
         if live is None:
