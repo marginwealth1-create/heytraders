@@ -2,7 +2,7 @@
 WhatsApp + email via the admin hierarchy.
 
 WhatsApp resolution walks UP from the calling user (CLIENT / DEALER /
-MASTER / BROKER → ADMIN → SUPER_ADMIN) following `parent_id`, returning
+MASTER / BROKER → parent BROKERs → ADMIN → SUPER_ADMIN), returning
 the FIRST non-empty `User.support_whatsapp` it finds. This lets every
 admin tier override their downstream pool's support contact without
 admin needing to "broadcast" a new number — the user app's apk
@@ -10,9 +10,9 @@ transparently picks up whichever ancestor's value is set.
 
 If nobody in the chain has a number set, falls back to the platform-
 wide `platform.support_whatsapp` PlatformSetting row (managed by the
-super-admin via the Platform Settings page). This guarantees the apk
-always has SOMETHING to show when the platform is correctly seeded —
-the original behaviour before the per-admin override was added.
+super-admin). This guarantees the apk always has SOMETHING to show when
+the platform is correctly seeded — the original behaviour before the
+per-admin override was added.
 
 Email continues to read straight from PlatformSetting — only WhatsApp
 goes through the cascade, since email branding is meant to stay
@@ -24,6 +24,8 @@ shape no longer works once cascade is in play.
 """
 
 from __future__ import annotations
+
+from collections.abc import AsyncIterator
 
 from beanie import PydanticObjectId
 from fastapi import APIRouter
@@ -59,30 +61,78 @@ def _broker_support_allowed(broker: User) -> bool:
     return level != PermissionLevel.OFF
 
 
+async def _iter_ancestor_chain(user: User) -> AsyncIterator[User]:
+    """Yields `user` followed by their admin-tier ancestors from most-specific
+    to least-specific:
+      1. `user` (self)
+      2. Immediate `assigned_broker_id` and its `assigned_broker_id` chain
+      3. Any remaining brokers in `reversed(user.broker_ancestry)` (closest first)
+      4. `assigned_admin_id` (from `user` or any visited broker)
+      5. `SUPER_ADMIN` user(s) as the top-of-tree fallback
+    """
+    seen: set[PydanticObjectId] = set()
+    discovered_admin_ids: list[PydanticObjectId] = []
+    if user.assigned_admin_id:
+        discovered_admin_ids.append(user.assigned_admin_id)
+
+    # 1. Self
+    if user.id is not None:
+        seen.add(user.id)
+    yield user
+
+    # 2. Walk immediate broker chain via assigned_broker_id (capped at 8 hops)
+    nxt_broker_id = user.assigned_broker_id
+    hops = 0
+    while nxt_broker_id is not None and nxt_broker_id not in seen and hops < 8:
+        hops += 1
+        broker_doc = await User.get(nxt_broker_id)
+        if broker_doc is None:
+            break
+        seen.add(nxt_broker_id)
+        if broker_doc.assigned_admin_id and broker_doc.assigned_admin_id not in discovered_admin_ids:
+            discovered_admin_ids.append(broker_doc.assigned_admin_id)
+        yield broker_doc
+        nxt_broker_id = broker_doc.assigned_broker_id
+
+    # 3. Walk broker_ancestry in reverse (tip-to-root) for any parent brokers not yet visited
+    for anc_id in reversed(list(user.broker_ancestry or [])):
+        if anc_id is None or anc_id in seen:
+            continue
+        anc_doc = await User.get(anc_id)
+        if anc_doc is None:
+            continue
+        seen.add(anc_id)
+        if anc_doc.assigned_admin_id and anc_doc.assigned_admin_id not in discovered_admin_ids:
+            discovered_admin_ids.append(anc_doc.assigned_admin_id)
+        yield anc_doc
+
+    # 4. Walk discovered assigned_admin_id(s)
+    for admin_id in discovered_admin_ids:
+        if admin_id in seen:
+            continue
+        admin_doc = await User.get(admin_id)
+        if admin_doc is None:
+            continue
+        seen.add(admin_id)
+        yield admin_doc
+
+    # 5. Top-level SUPER_ADMIN fallback — users with no assigned_admin_id (or
+    # whose sub-admin/broker chain left support blank) inherit the super-admin's
+    # configured value from /admin/support.
+    super_admins = await User.find(User.role == UserRole.SUPER_ADMIN).to_list()
+    for sa in super_admins:
+        if sa.id is not None and sa.id not in seen:
+            seen.add(sa.id)
+            yield sa
+
+
 async def _resolve_whatsapp_for_user(user: User) -> str:
     """Walk UP the assignment chain from `user`, returning the first
     non-empty `support_whatsapp` found. Self is checked first so an
     admin/broker hitting the apk against their own login still sees
     their own number.
-
-    Walk order at each hop (most specific first):
-      1. `assigned_broker_id` — direct broker / sub-broker
-      2. `assigned_admin_id`  — admin pool owner
-
-    `parent_id` is NOT used: CLIENT rows are created without it most of
-    the time, which left the cascade stuck at the first node and the
-    number invisible to users.  The assignment fields are what every
-    user actually carries.
-
-    Capped at 8 hops as a defensive guard against a corrupted chain.
     """
-    cur: User | None = user
-    seen: set[PydanticObjectId] = set()
-    hops = 0
-    while cur is not None and hops < 8:
-        if cur.id in seen:
-            break
-        seen.add(cur.id)
+    async for cur in _iter_ancestor_chain(user):
         val = (cur.support_whatsapp or "").strip()
         # Permission gate: a BROKER (incl. sub-broker) node's number is only
         # honoured when the admin has granted it the `support` permission.
@@ -94,11 +144,6 @@ async def _resolve_whatsapp_for_user(user: User) -> str:
         # permissions object as NOT allowed (fail-closed).
         if val and (cur.role != UserRole.BROKER or _broker_support_allowed(cur)):
             return val
-        next_id = cur.assigned_broker_id or cur.assigned_admin_id
-        if next_id is None or next_id in seen:
-            break
-        cur = await User.get(next_id)
-        hops += 1
     return ""
 
 
@@ -108,42 +153,20 @@ async def _resolve_terms_for_user(user: User) -> tuple[str, bool]:
     `(text, enabled)`. If nothing in the chain has it enabled, returns
     ``("", False)`` and the user's app skips the T&C modal entirely.
     """
-    cur: User | None = user
-    seen: set[PydanticObjectId] = set()
-    hops = 0
-    while cur is not None and hops < 8:
-        if cur.id in seen:
-            break
-        seen.add(cur.id)
+    async for cur in _iter_ancestor_chain(user):
         if bool(cur.terms_enabled) and (cur.terms_text or "").strip():
             return (cur.terms_text or "").strip(), True
-        next_id = cur.assigned_broker_id or cur.assigned_admin_id
-        if next_id is None or next_id in seen:
-            break
-        cur = await User.get(next_id)
-        hops += 1
     return "", False
 
 
 async def _resolve_ticker_for_user(user: User) -> list[str]:
     """Walk the assignment chain and return the FIRST non-empty
     `ticker_messages` list — the closest admin-tier ancestor's home-page
-    ticker. Same cascade + 8-hop cap as the WhatsApp resolver."""
-    cur: User | None = user
-    seen: set[PydanticObjectId] = set()
-    hops = 0
-    while cur is not None and hops < 8:
-        if cur.id in seen:
-            break
-        seen.add(cur.id)
+    ticker."""
+    async for cur in _iter_ancestor_chain(user):
         msgs = [m.strip() for m in (cur.ticker_messages or []) if m and m.strip()]
         if msgs:
             return msgs
-        next_id = cur.assigned_broker_id or cur.assigned_admin_id
-        if next_id is None or next_id in seen:
-            break
-        cur = await User.get(next_id)
-        hops += 1
     return []
 
 
