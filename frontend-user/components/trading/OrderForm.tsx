@@ -118,7 +118,7 @@ export function OrderForm({ instrument, ltp }: Props) {
     <div className="flex h-full flex-col rounded-lg border border-border bg-card">
       {/* Side tabs */}
       <div className="grid grid-cols-2 border-b border-border">
-        {(["BUY", "SELL"] as const).map((s) => (
+        {(["SELL", "BUY"] as const).map((s) => (
           <button
             key={s}
             type="button"

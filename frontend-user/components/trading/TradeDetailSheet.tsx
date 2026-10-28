@@ -1347,19 +1347,6 @@ function TradeDetailSheetInner({ token, open, onClose, onSwap, initialSide, seed
               lockout in case the close animation is slow. */}
           <Button
             type="button"
-            disabled={submitting !== null || circBuyBlocked}
-            onClick={() => submit("BUY")}
-            className="flex h-14 flex-col items-center justify-center gap-0 rounded-lg bg-buy text-buy-foreground hover:bg-buy/90"
-          >
-            <span className="flex items-center gap-1 text-sm font-bold">
-              <ArrowUpRight className="size-4" /> BUY
-            </span>
-            <span className="font-tabular text-xs tabular-nums opacity-90">
-              {fmtPrice(buyPrice)}
-            </span>
-          </Button>
-          <Button
-            type="button"
             disabled={submitting !== null || circSellBlocked}
             onClick={() => submit("SELL")}
             className="flex h-14 flex-col items-center justify-center gap-0 rounded-lg bg-sell text-sell-foreground hover:bg-sell/90"
@@ -1369,6 +1356,19 @@ function TradeDetailSheetInner({ token, open, onClose, onSwap, initialSide, seed
             </span>
             <span className="font-tabular text-xs tabular-nums opacity-90">
               {fmtPrice(sellPrice)}
+            </span>
+          </Button>
+          <Button
+            type="button"
+            disabled={submitting !== null || circBuyBlocked}
+            onClick={() => submit("BUY")}
+            className="flex h-14 flex-col items-center justify-center gap-0 rounded-lg bg-buy text-buy-foreground hover:bg-buy/90"
+          >
+            <span className="flex items-center gap-1 text-sm font-bold">
+              <ArrowUpRight className="size-4" /> BUY
+            </span>
+            <span className="font-tabular text-xs tabular-nums opacity-90">
+              {fmtPrice(buyPrice)}
             </span>
           </Button>
         </div>
