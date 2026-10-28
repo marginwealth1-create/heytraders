@@ -35,26 +35,26 @@ def _fake_seg(name: str, **overrides):
     "stored,expected_row",
     [
         # Canonical SegmentType enum values
-        ("NSE_FUTURE", "NSE_FUT"),
-        ("NSE_INDEX_FUTURE", "NSE_FUT"),
-        ("NSE_STOCK_OPTION_BUY", "NSE_OPT"),
-        ("NSE_INDEX_OPTION_SELL", "NSE_OPT"),
+        ("NSE_FUTURE", "NSE_STK_FUT"),
+        ("NSE_INDEX_FUTURE", "NSE_IDX_FUT"),
+        ("NSE_STOCK_OPTION_BUY", "NSE_STK_OPT"),
+        ("NSE_INDEX_OPTION_SELL", "NSE_IDX_OPT"),
         ("BSE_FUTURE", "BSE_FUT"),
         ("BSE_OPTION_BUY", "BSE_OPT"),
         ("MCX_FUTURE", "MCX_FUT"),
         ("MCX_OPTION_BUY", "MCX_OPT"),
         ("MCX_OPTION_SELL", "MCX_OPT"),
         # Legacy mirror variants — Kite exchange code + suffix
-        ("NFO_FUT", "NSE_FUT"),
-        ("NFO_OPT", "NSE_OPT"),
+        ("NFO_FUT", "NSE_STK_FUT"),
+        ("NFO_OPT", "NSE_STK_OPT"),
         ("BFO_FUT", "BSE_FUT"),
         ("BFO_OPT", "BSE_OPT"),
         # Pre-2025 mirror variants — singular OPTION/FUTURE suffix
         # (these caused the COPPER26MAY*CE Fixed/₹100 regression)
         ("MCX_OPTION", "MCX_OPT"),
         ("MCX_FUTURE", "MCX_FUT"),
-        ("NFO_OPTION", "NSE_OPT"),
-        ("NFO_FUTURE", "NSE_FUT"),
+        ("NFO_OPTION", "NSE_STK_OPT"),
+        ("NFO_FUTURE", "NSE_STK_FUT"),
         ("BFO_OPTION", "BSE_OPT"),
         ("BFO_FUTURE", "BSE_FUT"),
         # Infoway segments — instrument segment IS the admin row name

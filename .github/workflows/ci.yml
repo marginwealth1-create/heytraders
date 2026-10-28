@@ -18,14 +18,13 @@ jobs:
           cache: pip
           cache-dependency-path: backend/requirements.txt
       - run: pip install -r requirements.txt
-      # ponytail: stale tests skipped — they predate the NSE_STK_FUT rename and
-      # the wallet change (shortfalls book to settlement_outstanding; credits
-      # no longer auto-clear it). Update the tests, then drop these flags.
+      # ponytail: stale tests skipped — they predate the wallet change
+      # (shortfalls book to settlement_outstanding; credits no longer auto-clear it).
+      # Update the tests, then drop these flags.
       - run: >
           pytest -q
           --ignore=tests/test_wallet_settlement_outstanding/test_deposit_recovery.py
-          --deselect=tests/test_segment_settings_end_to_end.py::test_segment_name_map_covers_every_known_shape
-          --deselect=tests/test_pnl_sharing/test_settle_period.py::test_settle_period_fails_on_insufficient_balance
+          -k "not test_settle_period_fails_on_insufficient_balance"
 
   frontend:
     runs-on: ubuntu-latest
