@@ -7,11 +7,12 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { toast } from "sonner";
-import { ArrowRight, Loader2, Wrench, Zap } from "lucide-react";
+import { ArrowRight, GraduationCap, Loader2, Wrench, Zap } from "lucide-react";
+import { BrandGlyph } from "@/components/layout/BrandGlyph";
 import { useBranding } from "@/lib/branding-context";
 import { useAuthStore } from "@/stores/authStore";
 import { ApiError, AuthAPI, ProfileAPI, setTokens } from "@/lib/api";
-import { STORAGE_KEYS } from "@/lib/constants";
+import { API_URL, STORAGE_KEYS } from "@/lib/constants";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -44,6 +45,32 @@ function LoginSplash({ subtitle }: { subtitle: string }) {
         <p className="text-sm font-medium text-foreground">Signing you in…</p>
         <p className="text-xs text-muted-foreground">{subtitle}</p>
       </div>
+    </div>
+  );
+}
+
+function LoginHeroLogo() {
+  const { branding } = useBranding();
+  const [imgLoaded, setImgLoaded] = useState(false);
+  const logoSrc = branding?.logo_url ? `${API_URL}${branding.logo_url}` : null;
+  const alt = (branding?.brand_name ?? "").trim() || "Brand logo";
+
+  return (
+    <div className="relative mx-auto grid size-20 place-items-center overflow-hidden rounded-full border-2 border-emerald-500/40 bg-[#070B16] shadow-[0_0_32px_rgba(16,185,129,0.28)] ring-4 ring-emerald-500/10">
+      <BrandGlyph className="size-9 text-emerald-400" />
+      {logoSrc && (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={logoSrc}
+          alt={alt}
+          onLoad={() => setImgLoaded(true)}
+          onError={() => setImgLoaded(false)}
+          className={cn(
+            "absolute inset-0 size-full rounded-full bg-[#070B16] object-cover p-1 transition-opacity",
+            imgLoaded ? "opacity-100" : "opacity-0",
+          )}
+        />
+      )}
     </div>
   );
 }
@@ -197,15 +224,25 @@ function LoginPageInner() {
         </div>
       )}
 
-      <p className="text-xs font-semibold uppercase tracking-[0.2em] text-gold">Secure login</p>
-      <h1 className="mt-2 font-display text-3xl font-bold tracking-tight">Welcome back</h1>
-      <p className="mt-2 text-sm text-muted-foreground">
-        Sign in with your user ID or registered mobile number.
-      </p>
+      <div className="flex flex-col items-center text-center">
+        <LoginHeroLogo />
+        <div className="mt-4 inline-flex items-center gap-2 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-3.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-emerald-400">
+          <span className="size-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]" />
+          Virtual Trading Terminal
+        </div>
+        <h1 className="mt-3 font-display text-3xl font-bold tracking-tight text-white">
+          Welcome back
+        </h1>
+        <p className="mt-1.5 text-xs text-muted-foreground">
+          Sign in with your user ID or registered mobile number
+        </p>
+      </div>
 
-      <form onSubmit={form.handleSubmit(onSubmit)} className="mt-7 space-y-5">
-        <div className="space-y-2">
-          <Label htmlFor="identifier">User ID or mobile</Label>
+      <form onSubmit={form.handleSubmit(onSubmit)} className="mt-6 space-y-4">
+        <div className="space-y-1.5">
+          <Label htmlFor="identifier" className="text-xs text-muted-foreground">
+            User ID or mobile
+          </Label>
           <Input
             id="identifier"
             placeholder="K7M2QX or 9999900000"
@@ -218,10 +255,15 @@ function LoginPageInner() {
           )}
         </div>
 
-        <div className="space-y-2">
+        <div className="space-y-1.5">
           <div className="flex items-center justify-between">
-            <Label htmlFor="password">Password</Label>
-            <Link href="/forgot-password" className="text-xs text-muted-foreground hover:text-foreground">
+            <Label htmlFor="password" className="text-xs text-muted-foreground">
+              Password
+            </Label>
+            <Link
+              href="/forgot-password"
+              className="text-xs font-medium text-gold hover:text-gold/80"
+            >
               Forgot password?
             </Link>
           </div>
@@ -248,8 +290,10 @@ function LoginPageInner() {
         </div>
 
         {needs2fa && (
-          <div className="space-y-2">
-            <Label htmlFor="two_fa_code">2FA code</Label>
+          <div className="space-y-1.5">
+            <Label htmlFor="two_fa_code" className="text-xs text-muted-foreground">
+              2FA code
+            </Label>
             <Input
               id="two_fa_code"
               inputMode="numeric"
@@ -263,28 +307,52 @@ function LoginPageInner() {
         )}
 
         <Button type="submit" className={GOLD_BTN} loading={form.formState.isSubmitting}>
-          Sign in {!form.formState.isSubmitting && <ArrowRight />}
+          Sign in {!form.formState.isSubmitting && <ArrowRight className="size-4" />}
         </Button>
       </form>
 
-      <div className="my-6 flex items-center gap-3 text-xs text-muted-foreground">
+      <div className="my-5 flex items-center gap-3 text-[11px] text-muted-foreground">
         <span className="h-px flex-1 bg-white/10" />
-        or
+        or practice with demo
         <span className="h-px flex-1 bg-white/10" />
       </div>
 
       <Button
         type="button"
         variant="outline"
-        className="h-12 w-full rounded-xl border-white/10 bg-white/[0.03] hover:bg-white/[0.07]"
+        className="h-12 w-full rounded-xl border-emerald-500/25 bg-emerald-500/[0.04] text-xs font-semibold hover:bg-emerald-500/[0.08]"
         onClick={handleDemoLogin}
         loading={demoLoading}
       >
-        {!demoLoading && <Zap className="text-gold" />}
-        Try demo — ₹50L virtual funds
+        {!demoLoading && <Zap className="size-4 text-gold" />}
+        <span>
+          Try demo — <span className="font-bold text-emerald-400">₹50,00,000</span> virtual funds
+        </span>
       </Button>
 
-      <p className="mt-7 text-center text-sm text-muted-foreground">
+      <div className="mt-4 flex items-start gap-3 rounded-2xl border border-emerald-500/25 bg-emerald-950/20 p-4">
+        <div className="grid size-8 shrink-0 place-items-center rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">
+          <GraduationCap className="size-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400">
+              Educational &amp; Training Notice
+            </span>
+            <span className="rounded-full border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
+              Zero Risk
+            </span>
+          </div>
+          <p className="mt-1.5 text-xs font-bold leading-relaxed text-white">
+            No real money involved. This is a Virtual Trading Application which has all features to trade.
+          </p>
+          <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
+            This application is used for exchanging views on markets for individual students for training purpose only.
+          </p>
+        </div>
+      </div>
+
+      <p className="mt-5 text-center text-xs text-muted-foreground">
         New here?{" "}
         <Link
           href={urlRef ? `/register?ref=${encodeURIComponent(urlRef)}` : "/register"}
@@ -294,7 +362,7 @@ function LoginPageInner() {
         </Link>
       </p>
 
-      <div className="mt-5 flex flex-wrap items-center justify-center gap-4">
+      <div className="mt-3 flex flex-wrap items-center justify-center gap-4">
         <InstallPwaButton variant="compact" />
         <TelegramLink />
       </div>

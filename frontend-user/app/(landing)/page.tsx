@@ -84,8 +84,8 @@ function Hero() {
           </h1>
 
           <p className="mt-6 max-w-lg text-lg leading-relaxed text-slate-600">
-            Indian equity, F&amp;O, commodities, forex, crypto and US stocks — on one fast terminal with flat
-            brokerage and real-time risk controls.
+            Indian equity, F&amp;O, commodities, forex, crypto and US stocks — on one fast terminal with up to 500X
+            leverage and real-time risk controls.
           </p>
 
           <div className="mt-9 flex flex-wrap gap-3">
@@ -97,9 +97,10 @@ function Hero() {
             </Link>
           </div>
 
-          <dl className="mt-12 grid max-w-lg grid-cols-3 gap-6 border-t border-slate-200 pt-6">
+          <dl className="mt-12 grid max-w-lg grid-cols-2 gap-6 border-t border-slate-200 pt-6 sm:grid-cols-4">
             {[
-              ["₹20", "flat per order"],
+              ["500X", "intraday leverage"],
+              ["50x", "delivery leverage"],
               ["₹0", "account opening"],
               ["10 min", "to start trading"],
             ].map(([value, label]) => (
@@ -326,7 +327,7 @@ function Platform() {
 
 const PLANS = [
   { label: "Account opening", price: "₹0", note: "Free, fully digital KYC. No paperwork.", featured: false },
-  { label: "Brokerage", price: "₹20", unit: "/ order", note: "Flat on intraday and F&O — whatever the order size.", featured: true },
+  { label: "Intraday leverage", price: "500X", unit: "& 50x delivery", note: "Up to 500X intraday leverage and 50x delivery leverage across segments.", featured: true },
   { label: "Demo account", price: "₹50L", unit: "virtual", note: "Practise risk-free before you go live.", featured: false },
 ];
 
@@ -407,7 +408,7 @@ function Steps() {
 
 const FAQS = [
   ["What do I need to open an account?", "A PAN card, Aadhaar card and a bank account. The whole process is digital and usually takes under 10 minutes."],
-  ["How much brokerage do you charge?", "A flat ₹20 per order on intraday and F&O trades, whatever the order size. Statutory charges apply as per regulations."],
+  ["What leverage do you offer?", "We offer up to 500X intraday leverage and 50x delivery leverage across supported segments."],
   ["Can I try the platform before funding?", "Yes. Start a demo account from the login page and get ₹50,00,000 in virtual funds to practise with — no signup needed."],
   ["How do withdrawals work?", "Request a withdrawal from the Wallet section and it is sent to your registered bank account, typically within 24 hours on working days."],
   ["Is my account secure?", "Accounts are protected with encrypted connections and optional two-factor authentication, and live risk controls watch every open position."],

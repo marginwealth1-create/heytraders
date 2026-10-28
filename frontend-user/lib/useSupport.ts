@@ -49,17 +49,12 @@ export function useHomeTicker() {
 
 /**
  * Admin-managed WhatsApp + support email. Pulled from `/user/support`
- * — backed by `platform.support_whatsapp` + `platform.support_email`
- * PlatformSetting rows that the admin can edit on /admin/settings/platform.
+ * — backed by the user's broker/admin/super-admin hierarchy and
+ * `platform.support_whatsapp` + `platform.support_email` PlatformSetting rows.
  *
  * No hardcoded fallback — admin is the single source of truth. If
  * admin clears a value, the corresponding UI affordance disappears
- * immediately. If the backend hasn't been restarted with the new
- * route, the query errors and the section hides — the fix is "restart
- * the backend so the seed inserts default support keys", not stale
- * defaults in the JS bundle.
- *
- * Generously cached because these change at most once a quarter.
+ * immediately.
  */
 export function useSupportContacts() {
   return useQuery<SupportContacts>({
@@ -78,14 +73,20 @@ export function useSupportContacts() {
 
 /** wa.me URL builder — strips formatting from the admin-stored number
  *  (spaces, dashes, leading "+") since wa.me expects digits only.
+ *  If a 10-digit Indian mobile number is saved without a country code,
+ *  automatically prefixes "91" so wa.me opens properly.
  *  Returns null for unusable input so callers can hide the link. */
 export function buildWhatsappUrl(
   raw: string | undefined | null,
   prefill?: string,
 ): string | null {
   if (!raw) return null;
-  const digits = String(raw).replace(/[^0-9]/g, "");
+  const trimmed = String(raw).trim();
+  let digits = trimmed.replace(/[^0-9]/g, "");
   if (digits.length < 8) return null;
+  if (digits.length === 10 && !trimmed.startsWith("+")) {
+    digits = `91${digits}`;
+  }
   const text = prefill ? `?text=${encodeURIComponent(prefill)}` : "";
   return `https://wa.me/${digits}${text}`;
 }

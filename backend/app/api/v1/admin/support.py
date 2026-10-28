@@ -19,14 +19,13 @@ filter UI surfaces these rows alongside other per-user setting tweaks.
 
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.core.dependencies import CurrentAdmin
 from app.models._base import PermissionLevel
 from app.models.audit_log import AuditAction
+from app.models.platform_setting import PlatformSetting, SettingType
 from app.models.user import User, UserRole
 from app.schemas.common import APIResponse
 from app.services.audit_service import log_event
@@ -59,9 +58,16 @@ async def get_my_support(admin: CurrentAdmin):
     explains the inheritance fallback so the admin knows what the
     user actually sees today. `can_edit` tells the UI whether to enable
     the form (brokers need the `support` permission)."""
+    whatsapp = (admin.support_whatsapp or "").strip()
+    if not whatsapp and admin.role == UserRole.SUPER_ADMIN:
+        row = await PlatformSetting.find_one(
+            PlatformSetting.setting_key == "platform.support_whatsapp"
+        )
+        if row and row.setting_value:
+            whatsapp = str(row.setting_value).strip()
     return APIResponse(
         data={
-            "whatsapp": (admin.support_whatsapp or "").strip(),
+            "whatsapp": whatsapp,
             "role": admin.role.value,
             "can_edit": _support_can_edit(admin),
         }
@@ -96,14 +102,6 @@ async def set_my_support(
 
     new_value = (payload.whatsapp or "").strip()
     old_value = (admin.support_whatsapp or "").strip()
-    if new_value == old_value:
-        return APIResponse(
-            data={
-                "whatsapp": new_value,
-                "role": admin.role.value,
-                "can_edit": True,
-            }
-        )
 
     # Refuse obviously-broken numbers. The apk's `buildWhatsappUrl`
     # silently hides the button when digits.length < 8, so blocking
@@ -124,18 +122,39 @@ async def set_my_support(
     user_doc.support_whatsapp = new_value or None
     await user_doc.save()
 
-    await log_event(
-        action=AuditAction.SETTING_CHANGE,
-        entity_type="User",
-        entity_id=admin.id,
-        actor_id=admin.id,
-        target_user_id=admin.id,
-        old_values={"support_whatsapp": old_value},
-        new_values={"support_whatsapp": new_value},
-        metadata={"field": "support_whatsapp"},
-        ip_address=request.client.host if request.client else None,
-        user_agent=request.headers.get("user-agent"),
-    )
+    # Keep PlatformSetting("platform.support_whatsapp") synced when SUPER_ADMIN
+    # updates their support WhatsApp number so platform-wide fallback stays in sync.
+    if admin.role == UserRole.SUPER_ADMIN:
+        row = await PlatformSetting.find_one(
+            PlatformSetting.setting_key == "platform.support_whatsapp"
+        )
+        if row is None:
+            row = PlatformSetting(
+                setting_key="platform.support_whatsapp",
+                setting_value=new_value,
+                setting_type=SettingType.STRING,
+                description="Platform-wide support WhatsApp number",
+                category="general",
+                is_public=True,
+            )
+            await row.insert()
+        else:
+            row.setting_value = new_value
+            await row.save()
+
+    if new_value != old_value:
+        await log_event(
+            action=AuditAction.SETTING_CHANGE,
+            entity_type="User",
+            entity_id=admin.id,
+            actor_id=admin.id,
+            target_user_id=admin.id,
+            old_values={"support_whatsapp": old_value},
+            new_values={"support_whatsapp": new_value},
+            metadata={"field": "support_whatsapp"},
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
 
     return APIResponse(
         data={"whatsapp": new_value, "role": admin.role.value, "can_edit": True}
