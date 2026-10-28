@@ -376,7 +376,7 @@ async def settle_expired_position(
     from app.services import market_data_service, wallet_service
     from app.services.market_data_service import (
         get_usd_inr_rate,
-        is_usd_quoted_segment,
+        position_is_usd,
     )
 
     log = _logging.getLogger(__name__)
@@ -418,10 +418,11 @@ async def settle_expired_position(
     closed_qty = to_decimal(abs(qty_signed))
     sign = Decimal(1) if qty_signed > 0 else Decimal(-1)
     realized = (settle - avg) * closed_qty * sign
+    # Position.realized_pnl keeps the instrument's NATIVE currency (the close
+    # rate stamped below converts it); only the wallet moves in rupees.
+    realized_native = quantize_money(realized)
 
-    is_usd = is_usd_quoted_segment(pos.segment_type) or is_usd_quoted_segment(
-        pos.instrument.segment
-    )
+    is_usd = position_is_usd(pos)
     fx_rate: Decimal | None = None
     if is_usd:
         fx_rate = to_decimal(round(get_usd_inr_rate(), 4))
@@ -471,7 +472,7 @@ async def settle_expired_position(
         pos.close_reason = reason
         pos.ltp = Decimal128(str(settle))
         pos.realized_pnl = Decimal128(
-            str(quantize_money(to_decimal(pos.realized_pnl) + realized))
+            str(quantize_money(to_decimal(pos.realized_pnl) + realized_native))
         )
         pos.unrealized_pnl = Decimal128("0")
         pos.quantity = 0.0
@@ -1042,10 +1043,8 @@ async def resync_closed_position_fills(position: Position) -> int:
 
     # Mirror the admin recalc's FX basis: USD-quoted segments book P&L in
     # INR using the rate snapshotted at open (fallback to the live rate).
-    is_usd = _mds.is_usd_quoted_segment(position.segment_type) or _mds.is_usd_quoted_segment(
-        position.instrument.segment
-    )
-    fx = to_decimal(position.open_usd_inr_rate or _mds.get_usd_inr_rate()) if is_usd else Decimal(1)
+    is_usd = _mds.position_is_usd(position)
+    fx = position_fx_rate(position)  # the rate the wallet moved at (close → open → current)
 
     updated = 0
     for t in trades:
@@ -1334,6 +1333,12 @@ async def list_closed_trade_events_fifo(
             if t.pnl_inr is not None and qty > 0 and price > 0:
                 close_brk = _charge(t)
                 gross = float(str(t.pnl_inr)) + close_brk  # back out brokerage → raw gross
+                # pnl_inr is rupees; entry recovery needs the native gross.
+                _fx = getattr(t, "fx_rate", None)
+                if _fx is not None:
+                    _fx_v = float(str(_fx))
+                    if _fx_v > 0:
+                        gross /= _fx_v
                 # The closing action is the OPPOSITE of the opening side.
                 opened_side = "SELL" if is_buy else "BUY"
                 if opened_side == "BUY":
@@ -1351,6 +1356,7 @@ async def list_closed_trade_events_fifo(
                     "close_price": price,
                     "qty": qty,
                     "gross_pnl": gross,
+                    "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
                     "brokerage": close_brk,
                     # No surviving opening-fill timestamp for a reopened cycle
                     # — fall back to the close time so the row still renders.
@@ -1418,6 +1424,7 @@ async def list_closed_trade_events_fifo(
                 "close_price": price,
                 "qty": consume,
                 "gross_pnl": gross,
+                "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
                 "brokerage": brk_alloc,
                 "opened_at": front["opened_at"],
                 "closed_at": t.executed_at,
@@ -1500,10 +1507,11 @@ async def refresh_unrealized_pnl(
     back to `ltp` when the close side isn't published (illiquid / equity
     feeds with no depth).
 
-    NOTE: there is NO USD→INR conversion. `is_usd_quoted_segment` returns
-    False platform-wide (operator spec: Infoway prices are treated as INR
-    directly), so the old `× usd_inr_rate` branch was already dead and is
-    removed.
+    USD-quoted positions opened under the USD→INR rate (`position_is_usd`)
+    are multiplied by the CURRENT admin rate, so live P&L — and the risk
+    enforcer's stop-out maths — reads in the wallet's rupees, and an operator
+    edit of `fx.usd_inr_rate` moves open P&L on the next tick. Positions
+    booked before the conversion (no open stamp) stay 1:1.
 
     ── Zero-mark guard ── A missing tick / stale cache / failed fetch can
     hand us `ltp == 0`. `(0 - avg) × qty` would then equal the WHOLE
@@ -1534,8 +1542,37 @@ async def refresh_unrealized_pnl(
 
     position.ltp = Decimal128(str(mark))
     pnl = (mark - to_decimal(position.avg_price)) * qty
+    from app.services.market_data_service import get_usd_inr_rate, position_is_usd
+
+    if position_is_usd(position):
+        pnl = pnl * to_decimal(round(get_usd_inr_rate(), 4))
     position.unrealized_pnl = Decimal128(str(quantize_money(pnl)))
     return position
+
+
+def position_fx_rate(position) -> Decimal:
+    """Rupees per unit of the position's realized P&L.
+
+    close rate → open rate → current rate for a position opened under the
+    USD→INR conversion; 1 for INR instruments AND for USD positions booked
+    before the conversion existed (no open stamp — settled 1:1). The close
+    rate comes first because the engine booked the P&L at it: a reversal must
+    hand back the same rupees it took, not today's number.
+    """
+    from app.services.market_data_service import get_usd_inr_rate, position_is_usd
+
+    if not position_is_usd(position):
+        return Decimal(1)
+    for stamp in (position.close_usd_inr_rate, position.open_usd_inr_rate):
+        if stamp is not None and to_decimal(stamp) > 0:
+            return to_decimal(stamp)
+    return to_decimal(get_usd_inr_rate())
+
+
+def realized_pnl_inr(position) -> Decimal:
+    """Position.realized_pnl is stored in the instrument's NATIVE currency;
+    every wallet movement is in rupees — convert through this."""
+    return quantize_money(to_decimal(position.realized_pnl or 0) * position_fx_rate(position))
 
 
 async def list_holdings(user_id: str | PydanticObjectId) -> list[Holding]:
@@ -1572,7 +1609,7 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
         order_service,
         wallet_service,
     )
-    from app.services.market_data_service import is_usd_quoted_segment
+    from app.services.market_data_service import position_is_usd
 
     if not segment_set:
         return {"converted": 0, "force_closed": 0, "skipped": 0}
@@ -1786,10 +1823,7 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
 
         # USD-quoted instruments lock margin in INR; same conversion as
         # order_validator.validate. Skipped for fixed-per-lot (already INR).
-        if (
-            is_usd_quoted_segment(pos.segment_type)
-            or is_usd_quoted_segment(pos.instrument.segment)
-        ):
+        if position_is_usd(pos):
             if not ((s.get("margin_calc_mode") == "fixed") and ovn_fixed_per_lot > 0):
                 from app.services.market_data_service import get_usd_inr_rate
 

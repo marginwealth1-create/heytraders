@@ -194,8 +194,7 @@ def _pos(p: Position, expiry: str | None = None, carry_enabled: bool = False) ->
     realized = float(str(p.realized_pnl))
     margin = float(str(p.margin_used))
 
-    is_usd = market_data_service.is_usd_quoted_segment(p.segment_type) or \
-        market_data_service.is_usd_quoted_segment(p.instrument.segment)
+    is_usd = market_data_service.position_is_usd(p)
     current_rate = market_data_service.get_usd_inr_rate() if is_usd else 1.0
     open_rate = (
         float(str(p.open_usd_inr_rate))
@@ -228,7 +227,7 @@ def _pos(p: Position, expiry: str | None = None, carry_enabled: bool = False) ->
             if _stale_feed
             else (ltp_native - avg_native) * effective_qty * current_rate
         )
-        realized_pnl_inr = realized * open_rate
+        realized_pnl_inr = float(position_service.realized_pnl_inr(p))
         # margin_used is already stored as the wallet-currency number that
         # was actually locked at order time (validator computes it in INR via
         # block_margin), so we DON'T re-multiply by FX rate here. Otherwise
@@ -294,6 +293,7 @@ def _pos(p: Position, expiry: str | None = None, carry_enabled: bool = False) ->
         "currency_quote": "USD" if is_usd else "INR",
         "open_usd_inr_rate": f"{open_rate:.4f}" if is_usd else None,
         "current_usd_inr_rate": f"{current_rate:.4f}" if is_usd else None,
+        "fx_rate": current_rate,
         "stop_loss": str(p.stop_loss) if p.stop_loss is not None else None,
         "target": str(p.target) if p.target is not None else None,
         # Snapshot of SL/TP captured at close-time. apply_fill wipes
@@ -516,8 +516,7 @@ async def open_positions(user: CurrentUser):
                         # USD-quoted instruments — convert to INR like the
                         # validator does at order time (fixed-per-lot is
                         # already admin-entered in INR so it's skipped).
-                        if market_data_service.is_usd_quoted_segment(r.segment_type) or \
-                                market_data_service.is_usd_quoted_segment(r.instrument.segment):
+                        if market_data_service.position_is_usd(r):
                             cf = cf * market_data_service.get_usd_inr_rate()
                     holding_margin = round(cf, 2)
             except Exception:
@@ -554,7 +553,8 @@ async def closed_positions(
         qty = ev["qty"]
         entry_px = ev["entry_price"]
         close_px = ev["close_price"]
-        gross = ev["gross_pnl"]
+        fx = ev.get("fx_rate") or 1.0
+        gross = ev["gross_pnl"] * fx
         brk = ev["brokerage"]
         closed_dt = ev["closed_at"]
         opened_dt = ev["opened_at"]
@@ -580,6 +580,7 @@ async def closed_positions(
             "margin_used": "0.00",
             "charges": f"{brk:.2f}",
             "currency_quote": "USD" if is_usd else "INR",
+            "fx_rate": fx,
             "status": "CLOSED",
             "instrument_token": ev["instrument_token"],
             "opened_at": opened_dt.isoformat() if opened_dt else None,
@@ -1328,8 +1329,7 @@ async def list_active_trades(user: CurrentUser):
 
         price = float(str(t.price))
         ltp = ltp_by_token.get(t.instrument.token, 0.0)
-        is_usd = market_data_service.is_usd_quoted_segment(p.segment_type) or \
-            market_data_service.is_usd_quoted_segment(p.instrument.segment)
+        is_usd = market_data_service.position_is_usd(p)
         fx = usd_inr if is_usd else 1.0
         direction = 1 if t.action == OrderAction.BUY else -1
         avg_price = price  # individual fill's execution price (not position avg)
@@ -1429,6 +1429,7 @@ async def list_active_trades(user: CurrentUser):
                 or (str(p.target) if p.target is not None else None)
             ),
             "pnl": f"{pnl_inr:.2f}",
+            "fx_rate": fx,
             "brokerage": str(t.brokerage),
             # Per-fill margin (INR). `used_margin` = currently locked;
             # `holding_margin` = what would lock if rolled overnight.
@@ -1458,8 +1459,7 @@ async def list_active_trades(user: CurrentUser):
         qty = abs(float(p.quantity))
         price = float(str(p.avg_price))
         ltp = ltp_by_token.get(p.instrument.token, 0.0)
-        is_usd = market_data_service.is_usd_quoted_segment(p.segment_type) or \
-            market_data_service.is_usd_quoted_segment(p.instrument.segment)
+        is_usd = market_data_service.position_is_usd(p)
         fx = usd_inr if is_usd else 1.0
         direction = 1 if p.quantity > 0 else -1
         gross_pnl_inr = direction * (ltp - price) * qty * fx if ltp > 0 else 0.0
@@ -1531,6 +1531,7 @@ async def list_active_trades(user: CurrentUser):
             "stop_loss": str(p.stop_loss) if p.stop_loss is not None else None,
             "target": str(p.target) if p.target is not None else None,
             "pnl": f"{pnl_inr:.2f}",
+            "fx_rate": fx,
             "brokerage": "0",
             "used_margin": f"{used_margin_inr:.2f}",
             "margin_used": f"{used_margin_inr:.2f}",
@@ -2173,8 +2174,7 @@ async def positions_pnl_summary(user: CurrentUser):
     current_usd_inr = market_data_service.get_usd_inr_rate()
 
     def _is_usd(p: Position) -> bool:
-        return market_data_service.is_usd_quoted_segment(p.segment_type) or \
-            market_data_service.is_usd_quoted_segment(p.instrument.segment)
+        return market_data_service.position_is_usd(p)
 
     def _realised_inr(p: Position) -> float:
         raw = float(str(p.realized_pnl))

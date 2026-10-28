@@ -35,6 +35,7 @@ class Trade(TimestampMixin):
     quantity: float
     price: Money
     value: Money = Field(default_factory=_zero)  # quantity * price
+    fx_rate: Money | None = None  # USD→INR rate this closing fill's P&L was booked at; None = 1:1
 
     # The only charge users pay on this platform is the platform's own
     # brokerage. No statutory pass-through (STT / exchange / SEBI / stamp /

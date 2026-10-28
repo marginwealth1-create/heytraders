@@ -39,22 +39,15 @@ logger = logging.getLogger(__name__)
 
 
 def _is_usd(p: Position) -> bool:
-    return market_data_service.is_usd_quoted_segment(p.segment_type) or bool(
-        p.instrument
-        and market_data_service.is_usd_quoted_segment(p.instrument.segment)
-    )
+    return market_data_service.position_is_usd(p)
 
 
-def _realised_inr(p: Position, fallback_usd_inr: Decimal) -> Decimal:
-    raw = to_decimal(p.realized_pnl)
-    if not _is_usd(p):
-        return raw
-    rate = (
-        to_decimal(p.open_usd_inr_rate)
-        if p.open_usd_inr_rate is not None
-        else fallback_usd_inr
-    )
-    return raw * rate
+def _realised_inr(p: Position, fallback_usd_inr: Decimal | None = None) -> Decimal:
+    """Rupees the position's realized P&L moved — see
+    position_service.realized_pnl_inr (close → open → current)."""
+    from app.services.position_service import realized_pnl_inr
+
+    return realized_pnl_inr(p)
 
 
 async def _direct_client_ids(broker_id: PydanticObjectId) -> list[PydanticObjectId]:

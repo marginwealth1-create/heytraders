@@ -358,7 +358,7 @@ export default function TradingTerminalPage() {
       const avg = Number(p.avg_price);
       const pnl =
         Number.isFinite(avg) && Number.isFinite(qty)
-          ? (closePrice - avg) * qty
+          ? (closePrice - avg) * qty * (Number(p.fx_rate) || 1)
           : 0;
       return { ...p, ltp: closePrice, unrealized_pnl: pnl };
     });

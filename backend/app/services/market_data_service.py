@@ -854,6 +854,23 @@ _USD_SEGMENT_PREFIXES = ("CRYPTO_", "FOREX_", "CDS_")
 _INR_SEGMENT_PREFIXES = ("NSE_", "BSE_", "MCX_", "NFO_", "BFO_", "NCDEX_")
 
 
+def position_is_usd(position: Any) -> bool:
+    """Whether a POSITION's P&L / margin is converted at the USD→INR rate.
+
+    USD-quoted segment AND opened under the conversion (``open_usd_inr_rate``
+    stamped at open). Positions booked before conversion was switched on
+    carry no stamp — they were settled 1:1 and stay 1:1, open or closed, so
+    marking, reports and reversals never re-price money that already moved.
+    Orders / new positions classify by segment alone.
+    """
+    if getattr(position, "open_usd_inr_rate", None) is None:
+        return False
+    inst = getattr(position, "instrument", None)
+    return is_usd_quoted_segment(getattr(position, "segment_type", None)) or bool(
+        inst is not None and is_usd_quoted_segment(getattr(inst, "segment", None))
+    )
+
+
 def is_usd_quoted_segment(segment: str | None) -> bool:
     """Whether the segment's P&L / margin needs USD→INR conversion.
 

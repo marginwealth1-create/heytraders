@@ -712,8 +712,8 @@ export function LiveTradeStatsDialog({
       const bid = Number(tick?.bid ?? 0);
       const ask = Number(tick?.ask ?? 0);
       const closePrice = (isLong ? bid : ask) || liveLtp;
-      // FX conversion disabled platform-wide — feed prices are INR.
-      const rowPnl = (closePrice - Number(p.avg_price)) * Number(p.quantity);
+      // Row's own rate (server marks pre-conversion USD rows at 1).
+      const rowPnl = (closePrice - Number(p.avg_price)) * Number(p.quantity) * (Number(p.fx_rate) || 1);
       livePnl += rowPnl;
       return {
         ...p,

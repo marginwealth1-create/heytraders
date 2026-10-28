@@ -569,7 +569,8 @@ def _format_closed_fifo_rows(fifo_events: list[dict], user_id: str) -> list[dict
         qty = ev["qty"]
         entry_px = ev["entry_price"]
         close_px = ev["close_price"]
-        gross = ev["gross_pnl"]
+        fx = ev.get("fx_rate") or 1.0
+        gross = ev["gross_pnl"] * fx
         brk = ev["brokerage"]
         closed_dt = ev["closed_at"]
         opened_dt = ev["opened_at"]
@@ -595,6 +596,7 @@ def _format_closed_fifo_rows(fifo_events: list[dict], user_id: str) -> list[dict
                 "margin_used": "0.00",
                 "charges": f"{brk:.2f}",
                 "currency_quote": "USD" if is_usd else "INR",
+                "fx_rate": fx,
                 "status": "CLOSED",
                 "instrument_token": ev["instrument_token"],
                 "opened_at": opened_dt.isoformat() if opened_dt else None,
@@ -1115,8 +1117,7 @@ async def list_positions(
         margin = float(str(r.margin_used))
         realized = float(str(r.realized_pnl))
 
-        is_usd = market_data_service.is_usd_quoted_segment(r.segment_type) or \
-            market_data_service.is_usd_quoted_segment(r.instrument.segment)
+        is_usd = market_data_service.position_is_usd(r)
 
         # Prices stay in source currency (USD for crypto/forex, INR for the
         # rest) — that's what the live feed quotes. Only realised + unrealised
@@ -1439,15 +1440,14 @@ async def admin_edit_position(
                 abs_qty = _td(abs(p.opening_quantity or p.quantity or 0))
                 sign = _Decimal(1) if str(getattr(p, "opened_side", None) or "BUY").upper() == "BUY" else _Decimal(-1)
                 raw = (close_px - open_px) * abs_qty * sign
-                is_usd = _mds.is_usd_quoted_segment(p.segment_type) or \
-                    _mds.is_usd_quoted_segment(p.instrument.segment)
-                if is_usd:
-                    fx = _td(p.open_usd_inr_rate or _mds.get_usd_inr_rate())
-                    raw = raw * fx
-                old_realized = _td(p.realized_pnl or 0)
+                from app.services.position_service import position_fx_rate as _pfx
                 from app.utils.decimal_utils import quantize_money as _qm
+
+                # realized_pnl stays NATIVE; the wallet delta is in rupees.
+                fx = _pfx(p)
+                old_realized = _td(p.realized_pnl or 0)
                 new_realized = _qm(raw)
-                realized_delta = new_realized - old_realized
+                realized_delta = _qm((new_realized - old_realized) * fx)
                 p.realized_pnl = Decimal128(str(new_realized))
                 resync_closed_fills = True
             except Exception as e:
@@ -1460,10 +1460,16 @@ async def admin_edit_position(
             and not recalc_pnl
         ):
             try:
-                new_realized = _td(payload["realized_pnl"])
-                old_realized = _td(p.realized_pnl or 0)
-                realized_delta = new_realized - old_realized
-                p.realized_pnl = Decimal128(str(new_realized))
+                from app.services.position_service import position_fx_rate as _pfx
+                from app.utils.decimal_utils import quantize_money as _qm
+
+                # The admin enters RUPEES (the P&L column is INR); store it
+                # back in the position's native currency.
+                fx = _pfx(p)
+                new_realized_inr = _td(payload["realized_pnl"])
+                old_realized_inr = _qm(_td(p.realized_pnl or 0) * fx)
+                realized_delta = new_realized_inr - old_realized_inr
+                p.realized_pnl = Decimal128(str(_qm(new_realized_inr / fx)))
                 # Also push the correction onto the underlying fills so the
                 # user's FIFO Closed blotter matches the wallet, not just a
                 # price edit. (Was: only price edits resynced → a realized
@@ -1498,7 +1504,7 @@ async def admin_edit_position(
         from app.services import wallet_service as _ws_chk
         from app.services.market_data_service import (
             get_usd_inr_rate as _get_usd_inr_rate,
-            is_usd_quoted_segment as _is_usd_quoted_segment,
+            position_is_usd,
         )
         from app.services.netting_service import get_effective_settings
         from app.utils.decimal_utils import (
@@ -1541,7 +1547,7 @@ async def admin_edit_position(
                 leverage = _to_decimal(s.get("leverage") or 1.0) or _to_decimal(1)
                 new_margin = qty_abs * ref_price * margin_pct / leverage
             # USD-quoted segments lock in INR (skip for fixed ₹/lot mode).
-            if _is_usd_quoted_segment(p.segment_type) or _is_usd_quoted_segment(p.instrument.segment):
+            if position_is_usd(p):
                 if not ((s.get("margin_calc_mode") == "fixed") and fixed_per_lot > 0):
                     new_margin = new_margin * _to_decimal(_get_usd_inr_rate())
             new_margin = _quantize_money(new_margin)
@@ -1795,7 +1801,9 @@ async def admin_reopen_position(
     # booked amounts, reduce settlement_outstanding by that total,
     # and reverse only the (realized - booked) portion back into
     # available_balance.
-    realized = _td(p.realized_pnl or 0)
+    from app.services.position_service import realized_pnl_inr as _realized_inr_rev
+
+    realized = _realized_inr_rev(p)  # rupees — realized_pnl itself is native
     if realized != _Decimal("0"):
         from app.models.transaction import WalletTransaction, TransactionStatus
         from app.models.wallet import Wallet as _Wallet
@@ -2182,8 +2190,7 @@ async def positions_pnl_summary(
     current_usd_inr = market_data_service.get_usd_inr_rate()
 
     def _is_usd(p: Position) -> bool:
-        return market_data_service.is_usd_quoted_segment(p.segment_type) or \
-            market_data_service.is_usd_quoted_segment(p.instrument.segment)
+        return market_data_service.position_is_usd(p)
 
     def _realised_inr(p: Position) -> float:
         raw = float(str(p.realized_pnl))
@@ -2430,7 +2437,7 @@ async def positions_pnl_summary(
             # Mirror refresh_unrealized_pnl's zero-mark guard: fall back to
             # the last stored unrealised so the card never blows up.
             stored = float(str(p.unrealized_pnl))
-            total_unrealised += stored * (current_usd_inr if _is_usd(p) else 1.0)
+            total_unrealised += stored  # refresh_unrealized_pnl stores it in rupees
             continue
         avg = float(str(p.avg_price))
         raw = (ltp_f - avg) * p.quantity
@@ -2830,7 +2837,9 @@ async def delete_position(
     from app.utils.decimal_utils import to_decimal
 
     is_open = p.status == PositionStatus.OPEN and abs(float(p.quantity or 0)) > 1e-9
-    realized = to_decimal(p.realized_pnl or 0)
+    from app.services.position_service import realized_pnl_inr as _realized_inr_del
+
+    realized = _realized_inr_del(p)  # rupees — realized_pnl itself is native
     reversed_amount = _Decimal("0")
     closing_brokerage = _Decimal("0")
     booked_total = _Decimal("0")

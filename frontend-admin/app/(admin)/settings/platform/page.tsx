@@ -9,6 +9,7 @@ import {
   Check,
   CreditCard,
   FileText,
+  IndianRupee,
   KeyRound,
   Loader2,
   Mail,
@@ -79,6 +80,7 @@ export default function PlatformSettingsPage() {
         <ChangePasswordCard />
         <NotificationsCard />
         <WeeklySettlementCard />
+        <UsdInrRateCard />
         <PromoButtonCard />
         <PaymentGatewayCard />
         <CarryForwardToggleCard />
@@ -643,6 +645,91 @@ function NotificationsCard() {
  * this page — this card only exposes the on/off switch + a manual trigger.
  */
 const WEEKLY_SETTLEMENT_KEY = "weekly_settlement.enabled";
+
+// ── USD→INR rate (super-admin) ─────────────────────────────────────
+// One operator-set number: forex / crypto / COMEX / US stocks & indices are
+// margined and settled in rupees at this rate. Positions opened before the
+// conversion existed keep settling 1:1.
+const USD_INR_KEY = "fx.usd_inr_rate";
+
+function UsdInrRateCard() {
+  const admin = useAdminAuthStore((s) => s.admin);
+  const isSuperAdmin = String(admin?.role || "") === "SUPER_ADMIN";
+  const [live, setLive] = useState<number | null>(null);
+  const [value, setValue] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!isSuperAdmin) return;
+    let alive = true;
+    SettingsAPI.platformList("trading")
+      .then((rows) => {
+        const row = (rows || []).find((r: any) => r?.key === USD_INR_KEY);
+        const n = Number(row?.value);
+        if (alive && n > 0) {
+          setLive(n);
+          setValue(String(n));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [isSuperAdmin]);
+
+  if (!isSuperAdmin) return null;
+
+  async function save() {
+    const n = Number(value);
+    if (!(n > 0 && n <= 1000)) {
+      toast.error("Enter a rate between 0 and 1000");
+      return;
+    }
+    setSaving(true);
+    try {
+      await SettingsAPI.updatePlatform(USD_INR_KEY, n);
+      setLive(n);
+      toast.success(`USD→INR set to ₹${n}`, { description: "All workers re-price within 30 s." });
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to update rate");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card className="overflow-hidden">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <IndianRupee className="size-4 text-primary" /> USD → INR rate
+        </CardTitle>
+        <CardDescription>
+          Forex, crypto, COMEX and international stocks/indices are margined and
+          settled in rupees at this rate. Older positions stay 1:1.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="text-[11px] text-muted-foreground">
+          Currently live: {live != null ? `₹${live} per $1` : "—"}
+        </div>
+        <div className="flex gap-2">
+          <Input
+            type="number"
+            inputMode="decimal"
+            step="0.01"
+            min="0"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            aria-label="USD to INR rate"
+          />
+          <Button onClick={save} disabled={saving || !value}>
+            {saving ? <Loader2 className="size-4 animate-spin" /> : "Save"}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
 
 function WeeklySettlementCard() {
   const admin = useAdminAuthStore((s) => s.admin);

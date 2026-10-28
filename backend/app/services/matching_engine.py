@@ -445,6 +445,7 @@ async def execute_market_order(
     # Opening fills leave both = None.
     pnl_inr_dec: Decimal | None = None
     raw_pnl_inr_dec: Decimal | None = None
+    fill_fx: Decimal | None = None
     if is_closing and existing_pos is not None:
         cur_qty = to_decimal(existing_pos.quantity)
         avg = to_decimal(existing_pos.avg_price)
@@ -457,9 +458,11 @@ async def execute_market_order(
         closed_qty = min(abs(cur_qty), qty_dec)
         sign = Decimal(1) if cur_qty > 0 else Decimal(-1)
         raw_realized = (ltp - avg) * closed_qty * sign
-        if market_data_service.is_usd_quoted_segment(order.instrument.segment):
-            fx = to_decimal(market_data_service.get_usd_inr_rate())
-            raw_realized = raw_realized * fx
+        # Converted only for a position opened under the USD→INR rate; one
+        # booked before it (no open stamp) closes 1:1 like it opened.
+        if market_data_service.position_is_usd(existing_pos):
+            fill_fx = to_decimal(round(market_data_service.get_usd_inr_rate(), 4))
+            raw_realized = raw_realized * fill_fx
         raw_pnl_inr_dec = quantize_money(raw_realized)
         pnl_inr_dec = quantize_money(raw_realized - to_decimal(charges.brokerage))
 
@@ -486,6 +489,7 @@ async def execute_market_order(
         quantity=order.quantity,
         price=Decimal128(str(ltp)),
         value=Decimal128(str(notional)),
+        fx_rate=_money(fill_fx),
         brokerage=Decimal128(str(charges.brokerage)),
         total_charges=Decimal128(str(charges.total)),
         net_amount=Decimal128(

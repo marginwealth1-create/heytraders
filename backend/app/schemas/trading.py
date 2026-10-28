@@ -100,6 +100,7 @@ class TradeOut(BaseModel):
 
 class PositionOut(BaseModel):
     id: str
+    fx_rate: float = 1.0  # rupees per unit of native P&L (1 for INR / pre-conversion)
     user_id: str
     symbol: str
     # Full exchange contract identifier (e.g. `SENSEX25MAY75000CE`).
@@ -250,6 +251,7 @@ class InstrumentOut(BaseModel):
 
 class QuoteOut(BaseModel):
     token: str
+    fx_rate: float | None = None  # USD→INR, USD-quoted instruments only
     ltp: float
     change: float
     change_pct: float

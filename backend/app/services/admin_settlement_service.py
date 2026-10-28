@@ -63,18 +63,16 @@ def ist_week_bounds(any_dt: date | datetime) -> tuple[datetime, datetime]:
 # ── Aggregation ──────────────────────────────────────────────────────
 def _is_usd_position(p: Position) -> bool:
     """USD-quoted instrument? Crypto / forex / metals / energy segments."""
-    return market_data_service.is_usd_quoted_segment(p.segment_type) or bool(
-        p.instrument
-        and market_data_service.is_usd_quoted_segment(p.instrument.segment)
-    )
+    return market_data_service.position_is_usd(p)
 
 
-def _realised_inr(p: Position, fallback_usd_inr: Decimal) -> Decimal:
-    raw = to_decimal(p.realized_pnl)
-    if not _is_usd_position(p):
-        return raw
-    rate = to_decimal(p.open_usd_inr_rate) if p.open_usd_inr_rate is not None else fallback_usd_inr
-    return raw * rate
+def _realised_inr(p: Position, fallback_usd_inr: Decimal | None = None) -> Decimal:
+    """Rupees the position's realized P&L moved — close rate → open rate →
+    current (see position_service.realized_pnl_inr). `fallback_usd_inr` is
+    kept for callers' signatures; the shared helper owns the rule."""
+    from app.services.position_service import realized_pnl_inr
+
+    return realized_pnl_inr(p)
 
 
 async def _sub_admin_user_ids(sub_admin_id: PydanticObjectId) -> list[PydanticObjectId]:

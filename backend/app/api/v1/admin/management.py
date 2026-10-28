@@ -606,10 +606,7 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
     fallback_usd_inr = to_decimal(market_data_service.get_usd_inr_rate())
 
     def _is_usd(p) -> bool:
-        return market_data_service.is_usd_quoted_segment(p.segment_type) or (
-            p.instrument
-            and market_data_service.is_usd_quoted_segment(p.instrument.segment)
-        )
+        return market_data_service.position_is_usd(p)
 
     def _realised_inr(p) -> _D:
         raw = to_decimal(p.realized_pnl)
@@ -645,10 +642,7 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
     ).to_list()
     open_unrealised = _D("0")
     for p in open_positions:
-        raw = to_decimal(p.unrealized_pnl)
-        if _is_usd(p):
-            raw *= fallback_usd_inr
-        open_unrealised += raw
+        open_unrealised += to_decimal(p.unrealized_pnl)  # stored in rupees
 
     # Trades
     today_trades_count = await Trade.find(

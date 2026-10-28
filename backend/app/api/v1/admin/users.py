@@ -504,9 +504,7 @@ async def get_user(
 
         def _real_inr(p) -> float:
             raw = float(str(p.realized_pnl or 0))
-            is_usd = _mds.is_usd_quoted_segment(p.segment_type) or (
-                p.instrument and _mds.is_usd_quoted_segment(p.instrument.segment)
-            )
+            is_usd = _mds.position_is_usd(p)
             if not is_usd:
                 return raw
             rate = (
@@ -1365,10 +1363,7 @@ async def live_trade_stats(user_id: str, admin: CurrentAdmin):
     usd_inr = market_data_service.get_usd_inr_rate()
 
     def _is_usd(p) -> bool:
-        return market_data_service.is_usd_quoted_segment(p.segment_type) or (
-            p.instrument
-            and market_data_service.is_usd_quoted_segment(p.instrument.segment)
-        )
+        return market_data_service.position_is_usd(p)
 
     def _realised_inr(p) -> float:
         raw = float(str(p.realized_pnl))
@@ -1518,6 +1513,7 @@ async def live_trade_stats(user_id: str, admin: CurrentAdmin):
                 "ltp": ltp_native,
                 "unrealized_pnl_inr": round(raw, 2),
                 "is_usd": bool(_is_usd(p)),
+                "fx_rate": usd_inr if _is_usd(p) else 1.0,
             }
         )
 

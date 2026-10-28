@@ -271,15 +271,11 @@ export function OrderPanel({ instrument, ltp, bid, ask, open, high, low, close, 
   // entries + exits, so a LIMIT / SL / SL-M order is refused server-side.
   const pendingBlocked =
     Boolean(effSettings?.block_pending_orders) && orderType !== "MARKET";
-  // FX conversion has been disabled platform-wide — Infoway-fed prices
-  // (crypto / forex / metals / energy / international equities) are now
-  // treated as INR directly, so margin math runs against the raw feed
-  // number without a USD→INR multiplier. Keeping the names so downstream
-  // formulas don't need to change; both are hard-coded to the no-op
-  // values that the previous "native-INR segment" branch produced.
-  void fxRate;
-  const isUsdSeg = false;
-  const fxMultiplier = 1;
+  // USD-quoted instruments carry the operator-set USD→INR rate on the quote
+  // (`fx_rate`); the backend margins them in rupees at that rate. INR
+  // instruments have no fx_rate → 1. Fixed ₹/lot margin is never converted.
+  const fxMultiplier = Number(fxRate) > 0 ? Number(fxRate) : 1;
+  const isUsdSeg = fxMultiplier !== 1;
   // Admin's margin-mode dropdown — "fixed" means the configured value is
   // a flat ₹/lot, the rest of the price × lot_size math is bypassed.
   const marginCalcMode = String(effSettings?.margin_calc_mode || "").toLowerCase();

@@ -135,9 +135,10 @@ async def _settle_one_position(
     closed_qty = to_decimal(abs(qty_signed))
     sign = Decimal(1) if qty_signed > 0 else Decimal(-1)
     realized = (ltp - avg) * closed_qty * sign
-    is_usd = market_data_service.is_usd_quoted_segment(
-        pos.segment_type
-    ) or market_data_service.is_usd_quoted_segment(pos.instrument.segment)
+    # The position keeps NATIVE realized P&L (its close stamp converts it);
+    # the settlement record and the wallet move in rupees.
+    realized_native = quantize_money(realized)
+    is_usd = market_data_service.position_is_usd(pos)
     if is_usd:
         realized = realized * fx_rate
     realized = quantize_money(realized)
@@ -211,7 +212,7 @@ async def _settle_one_position(
         pos.ltp = Decimal128(str(ltp))
         # Freeze the realized slice onto the closing doc for the history view.
         pos.realized_pnl = Decimal128(
-            str(quantize_money(to_decimal(pos.realized_pnl) + realized))
+            str(quantize_money(to_decimal(pos.realized_pnl) + realized_native))
         )
         pos.unrealized_pnl = Decimal128("0")
         if pos.open_usd_inr_rate is not None and pos.close_usd_inr_rate is None:
