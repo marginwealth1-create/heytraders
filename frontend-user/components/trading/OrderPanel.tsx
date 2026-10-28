@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { cn, formatINR } from "@/lib/utils";
 import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 import { playBuyTone, playSellTone } from "@/lib/trade-audio";
-import { isInstrumentMarketOpen, marketLabel } from "@/lib/marketHours";
+import { isInstrumentMarketOpen, marketLabel, getMarketHoursInfo, useMarketHours } from "@/lib/marketHours";
 
 interface Props {
   instrument: any;
@@ -695,13 +695,14 @@ export function OrderPanel({ instrument, ltp, bid, ask, open, high, low, close, 
         instrument.exchange as string | undefined,
       )
     ) {
-      const label = marketLabel(
+      const hInfo = getMarketHoursInfo(
         instrument.segment as string | undefined,
         instrument.exchange as string | undefined,
       );
-      toast.error(`${label} market is closed. Try placing an AMO instead.`, {
-        duration: 5000,
-      });
+      toast.error(
+        `${hInfo.name} market is closed (Trading hours: ${hInfo.startTime} – ${hInfo.endTime} IST). Try placing an AMO instead.`,
+        { duration: 5000 },
+      );
       return;
     }
 

@@ -516,6 +516,18 @@ export const InstrumentAPI = {
     unwrap<any[]>(api.get(`/user/instruments/${token}/history`, { params: { interval, days } })),
 };
 
+export const MarketHoursAPI = {
+  get: () =>
+    unwrap<Record<string, {
+      name: string;
+      start_time: string;
+      end_time: string;
+      is_enabled: boolean;
+      days?: number[];
+      description?: string;
+    }>>(api.get("/user/instruments/market-hours")),
+};
+
 export const SegmentSettingsAPI = {
   effective: (token: string, action: "BUY" | "SELL" = "BUY", product_type: "MIS" | "NRML" | "CNC" = "MIS") =>
     unwrap<any>(

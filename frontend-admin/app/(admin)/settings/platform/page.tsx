@@ -7,6 +7,8 @@ import {
   BellOff,
   CalendarClock,
   Check,
+  Clock,
+  RotateCcw,
   CreditCard,
   FileText,
   IndianRupee,
@@ -81,12 +83,252 @@ export default function PlatformSettingsPage() {
         <NotificationsCard />
         <WeeklySettlementCard />
         <UsdInrRateCard />
+        <MarketHoursCard />
         <PromoButtonCard />
         <PaymentGatewayCard />
         <CarryForwardToggleCard />
         <TermsCard />
       </div>
     </div>
+  );
+}
+
+
+// ── Market trading hours (market-wise start and end time) ─────────────
+type MarketHourRow = {
+  name: string;
+  start_time: string;
+  end_time: string;
+  is_enabled: boolean;
+  days?: number[];
+  description?: string;
+};
+
+const DEFAULT_HOURS: Record<string, MarketHourRow> = {
+  NSE: {
+    name: "NSE (Equity & F&O)",
+    start_time: "09:15",
+    end_time: "15:30",
+    is_enabled: true,
+    days: [1, 2, 3, 4, 5],
+    description: "National Stock Exchange equity, futures & options",
+  },
+  BSE: {
+    name: "BSE (Equity & F&O)",
+    start_time: "09:15",
+    end_time: "15:30",
+    is_enabled: true,
+    days: [1, 2, 3, 4, 5],
+    description: "Bombay Stock Exchange equity, Sensex futures & options",
+  },
+  MCX: {
+    name: "MCX (Commodities)",
+    start_time: "09:00",
+    end_time: "23:30",
+    is_enabled: true,
+    days: [1, 2, 3, 4, 5],
+    description: "Multi Commodity Exchange: Gold, Silver, Crude Oil, Natural Gas",
+  },
+  FOREX: {
+    name: "Forex & Global (24/5)",
+    start_time: "00:00",
+    end_time: "23:59",
+    is_enabled: true,
+    days: [1, 2, 3, 4, 5],
+    description: "Foreign exchange currencies, global indices & commodities",
+  },
+  CRYPTO: {
+    name: "Crypto (24/7)",
+    start_time: "00:00",
+    end_time: "23:59",
+    is_enabled: true,
+    days: [0, 1, 2, 3, 4, 5, 6],
+    description: "Cryptocurrency 24/7 spot & futures markets",
+  },
+};
+
+function MarketHoursCard() {
+  const [hours, setHours] = useState<Record<string, MarketHourRow>>(DEFAULT_HOURS);
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    SettingsAPI.getMarketHours()
+      .then((res) => {
+        if (!alive || !res) return;
+        setHours((prev) => ({ ...prev, ...res }));
+        setLoaded(true);
+      })
+      .catch(() => {
+        if (alive) setLoaded(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  function updateRow(key: string, patch: Partial<MarketHourRow>) {
+    setHours((prev) => ({
+      ...prev,
+      [key]: { ...prev[key], ...patch },
+    }));
+  }
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      await SettingsAPI.setMarketHours(hours);
+      toast.success("Market hours configuration saved successfully", {
+        description: "Trading window checks will immediately enforce these hours.",
+      });
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to save market hours");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function handleReset() {
+    setHours(DEFAULT_HOURS);
+    toast.info("Market hours reset to standard defaults. Click Save to apply.");
+  }
+
+  const markets = [
+    { key: "NSE", label: "NSE", badgeColor: "bg-blue-500/15 text-blue-500" },
+    { key: "BSE", label: "BSE", badgeColor: "bg-indigo-500/15 text-indigo-500" },
+    { key: "MCX", label: "MCX", badgeColor: "bg-amber-500/15 text-amber-500" },
+    { key: "FOREX", label: "FOREX", badgeColor: "bg-emerald-500/15 text-emerald-500" },
+    { key: "CRYPTO", label: "CRYPTO", badgeColor: "bg-purple-500/15 text-purple-500" },
+  ];
+
+  return (
+    <Card className="overflow-hidden lg:col-span-3">
+      <CardHeader>
+        <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-center">
+          <div>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Clock className="size-4 text-primary" /> Market Trading Hours
+            </CardTitle>
+            <CardDescription>
+              Configure market-wise start time and end time (IST). When a user places a trade in the trading window, orders outside these configured hours will be rejected.
+            </CardDescription>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handleReset}
+              disabled={saving || !loaded}
+              className="gap-1.5"
+            >
+              <RotateCcw className="size-3.5" /> Defaults
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              onClick={handleSave}
+              disabled={saving || !loaded}
+              className="gap-1.5"
+            >
+              {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />}
+              Save Market Hours
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="overflow-x-auto rounded-lg border border-border">
+          <table className="w-full text-left text-sm">
+            <thead className="border-b border-border bg-muted/40 text-xs font-medium text-muted-foreground">
+              <tr>
+                <th className="px-4 py-3">Market</th>
+                <th className="px-4 py-3">Trading Session (IST)</th>
+                <th className="px-4 py-3">Days</th>
+                <th className="px-4 py-3 text-right">Status</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {markets.map(({ key, label, badgeColor }) => {
+                const row = hours[key] || DEFAULT_HOURS[key];
+                const isEnabled = row?.is_enabled ?? true;
+                const isCrypto = key === "CRYPTO";
+
+                return (
+                  <tr key={key} className={cn("transition-colors", !isEnabled && "opacity-60")}>
+                    <td className="px-4 py-3 align-top">
+                      <div className="flex items-center gap-2">
+                        <span className={cn("rounded px-2 py-0.5 text-xs font-bold", badgeColor)}>
+                          {label}
+                        </span>
+                        <span className="font-semibold text-foreground">{row?.name || label}</span>
+                      </div>
+                      <div className="mt-0.5 text-xs text-muted-foreground">
+                        {row?.description || ""}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 align-top">
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs text-muted-foreground">Start</span>
+                          <Input
+                            type="time"
+                            value={row?.start_time || "09:15"}
+                            onChange={(e) => updateRow(key, { start_time: e.target.value })}
+                            className="h-8 w-28 text-xs font-medium"
+                            disabled={!isEnabled || saving}
+                          />
+                        </div>
+                        <span className="text-muted-foreground">→</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs text-muted-foreground">End</span>
+                          <Input
+                            type="time"
+                            value={row?.end_time || "15:30"}
+                            onChange={(e) => updateRow(key, { end_time: e.target.value })}
+                            className="h-8 w-28 text-xs font-medium"
+                            disabled={!isEnabled || saving}
+                          />
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 align-middle text-xs font-medium text-muted-foreground">
+                      {isCrypto ? "24/7 (Mon - Sun)" : "Mon - Fri"}
+                    </td>
+                    <td className="px-4 py-3 align-middle text-right">
+                      <button
+                        type="button"
+                        onClick={() => updateRow(key, { is_enabled: !isEnabled })}
+                        disabled={saving}
+                        aria-pressed={isEnabled}
+                        className={cn(
+                          "relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full transition-colors disabled:opacity-50",
+                          isEnabled ? "bg-emerald-500" : "bg-muted",
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            "inline-block size-4 transform rounded-full bg-white shadow transition-transform",
+                            isEnabled ? "translate-x-6" : "translate-x-1",
+                          )}
+                        />
+                      </button>
+                      <div className="mt-1 text-[11px] font-medium text-muted-foreground">
+                        {isEnabled ? "Open" : "Closed"}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          ℹ Times are configured in Indian Standard Time (IST). When a user places an order on web or mobile, the trading window verifies whether the selected market is currently within its configured start and end time. Outside these hours, orders are blocked with an informative message.
+        </p>
+      </CardContent>
+    </Card>
   );
 }
 

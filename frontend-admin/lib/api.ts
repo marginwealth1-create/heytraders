@@ -1110,6 +1110,18 @@ export const SettingsAPI = {
   getPaymentGateway: () => unwrap<any>(api.get("/admin/settings/payment-gateway")),
   setPaymentGateway: (enabled: boolean) =>
     unwrap<any>(api.put("/admin/settings/payment-gateway", { setting_value: enabled })),
+  // Market-wise start & end time trading hours configuration
+  getMarketHours: () =>
+    unwrap<Record<string, {
+      name: string;
+      start_time: string;
+      end_time: string;
+      is_enabled: boolean;
+      days?: number[];
+      description?: string;
+    }>>(api.get("/admin/settings/market-hours")),
+  setMarketHours: (payload: Record<string, any>) =>
+    unwrap<any>(api.put("/admin/settings/market-hours", payload)),
   // Per-admin Terms & Conditions shown to this admin's users on their profile.
   getTerms: () => unwrap<{ terms: string }>(api.get("/admin/settings/terms")),
   setTerms: (terms: string) => unwrap<{ terms: string }>(api.put("/admin/settings/terms", { terms })),

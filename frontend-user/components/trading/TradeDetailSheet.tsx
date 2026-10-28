@@ -35,7 +35,7 @@ import {
 import { playBuyTone, playSellTone } from "@/lib/trade-audio";
 import { useMarketStream } from "@/lib/useMarketStream";
 import { getIndexLotSize } from "@/lib/indexLots";
-import { isInstrumentMarketOpen, marketLabel } from "@/lib/marketHours";
+import { isInstrumentMarketOpen, marketLabel, getMarketHoursInfo, useMarketHours } from "@/lib/marketHours";
 import { cn, formatINR, formatIST, formatPercent, pnlColor } from "@/lib/utils";
 import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
@@ -95,6 +95,7 @@ export function TradeDetailSheet(props: Props) {
 }
 
 function TradeDetailSheetInner({ token, open, onClose, onSwap, initialSide, seedQuote }: Props) {
+  useMarketHours();
   const qc = useQueryClient();
 
   // ── Live data ─────────────────────────────────────────────────────
@@ -580,12 +581,12 @@ function TradeDetailSheetInner({ token, open, onClose, onSwap, initialSide, seed
         (instrument as any).exchange as string | undefined,
       )
     ) {
-      const label = marketLabel(
+      const hInfo = getMarketHoursInfo(
         (instrument as any).segment as string | undefined,
         (instrument as any).exchange as string | undefined,
       );
       toast.error(
-        `${label} market is closed. Try placing an AMO instead.`,
+        `${hInfo.name} market is closed (Trading hours: ${hInfo.startTime} – ${hInfo.endTime} IST). Try placing an AMO instead.`,
         { duration: 5000 },
       );
       return;

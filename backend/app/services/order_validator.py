@@ -1281,21 +1281,12 @@ async def validate(
                         f"{h.description}: session closed at {h.close_time} IST."
                     )
 
-            from app.core.config import settings as cfg
+            from app.services.market_hours_service import is_market_open_now
 
-            if is_mcx:
-                # MCX: 09:00 – 23:30 IST (winter) / 23:55 IST (summer evening session)
-                # We use a generous 09:00 – 23:30 window.
-                from datetime import time as _t
-
-                if not (_t(9, 0) <= ist.time() <= _t(23, 30)):
-                    raise MarketClosedError("MCX is closed. Place AMO instead.")
-            else:
-                # NSE / BSE equities + F&O: 09:15 – 15:30 IST
-                open_t = parse_hhmm(cfg.MARKET_OPEN_TIME)
-                close_t = parse_hhmm(cfg.MARKET_CLOSE_TIME)
-                if not (open_t <= ist.time() <= close_t):
-                    raise MarketClosedError("Market is closed. Place AMO instead.")
+            ex_str = instrument.exchange.value if hasattr(instrument.exchange, "value") else str(instrument.exchange or "")
+            is_open, m_msg, _ = await is_market_open_now(ex_str, segment_type, at=ist)
+            if not is_open:
+                raise MarketClosedError(f"{m_msg} Place AMO instead.")
 
         # ── 11a-2) Open settle-buffer (stale-first-tick protection) ──────
         # We're confirmed in-session above (not weekend/holiday, inside the

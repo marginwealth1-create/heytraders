@@ -20,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/instruments", tags=["user-instruments"])
 
+
+@router.get("/market-hours", response_model=APIResponse[dict])
+async def get_user_market_hours():
+    """Market trading hours configured by admin."""
+    from app.services.market_hours_service import get_market_hours
+    cfg = await get_market_hours()
+    return APIResponse(data=cfg)
+
 # History-endpoint cache. The chart datafeed calls `/history` on every
 # token switch + every resolution change; before this cache, each call
 # round-tripped to Zerodha (~200-800 ms on cold cache) even for a token

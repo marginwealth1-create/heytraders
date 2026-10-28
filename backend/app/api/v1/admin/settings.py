@@ -210,6 +210,30 @@ async def set_terms(payload: _TermsPayload, admin: CurrentAdmin):
     )
 
 
+# ── Market trading hours configuration ──────────────────────────────
+@router.get("/settings/market-hours", response_model=APIResponse[dict])
+async def get_market_hours_settings(admin: CurrentAdmin):
+    _require_admin_or_super(admin)
+    from app.services.market_hours_service import get_market_hours
+    cfg = await get_market_hours()
+    return APIResponse(data=cfg)
+
+
+@router.put("/settings/market-hours", response_model=APIResponse[dict])
+async def update_market_hours_settings(payload: dict[str, Any], admin: CurrentAdmin):
+    _require_admin_or_super(admin)
+    from app.services.market_hours_service import update_market_hours
+    saved = await update_market_hours(payload)
+    await log_event(
+        action=AuditAction.SETTING_CHANGE,
+        entity_type="PlatformSetting",
+        entity_id="trading.market_hours",
+        actor_id=admin.id,
+        new_values=saved,
+    )
+    return APIResponse(data=saved, message="Market hours updated successfully.")
+
+
 # ── Platform settings ────────────────────────────────────────────────
 @router.get("/settings/platform", response_model=APIResponse[list])
 async def list_platform_settings(admin: CurrentAdmin, category: str | None = None):
