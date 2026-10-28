@@ -130,6 +130,16 @@ async def seed_platform_settings() -> None:
         ("security.password_min_len", 8, SettingType.INTEGER, "security", False, "Min password length"),
         ("security.failed_login_lock_min", 15, SettingType.INTEGER, "security", False, "Lockout window"),
         ("risk.max_platform_leverage", 5.0, SettingType.FLOAT, "risk", False, "Hard leverage ceiling"),
+        # Operator-set, NOT a live FX feed: the broker decides what a dollar is
+        # worth here. Read via market_data_service.get_usd_inr_rate().
+        (
+            "fx.usd_inr_rate",
+            97.0,
+            SettingType.FLOAT,
+            "trading",
+            False,
+            "USD to INR rate applied to forex / crypto / COMEX / international stock & index P&L and margin",
+        ),
         (
             "weekly_settlement.enabled",
             True,
@@ -210,13 +220,30 @@ async def seed_global_instruments() -> None:
 
 
 async def run_seed() -> None:
-    """Top-level idempotent seeder."""
-    await seed_netting_and_risk()
-    await seed_default_brokerage_plan()
-    await seed_super_admin()
-    await seed_company_bank()
-    await seed_wd_rules()
-    await seed_platform_settings()
-    await seed_holidays()
-    await seed_global_instruments()
-    logger.info("seed_complete")
+    """Top-level idempotent seeder.
+
+    Each step is isolated: the seeders are independent, so one raising (e.g.
+    `seed_super_admin` on a mobile-number conflict) must not silently skip the
+    rest — including the `fx.usd_inr_rate` money setting.
+    """
+    steps = (
+        ("netting_and_risk", seed_netting_and_risk),
+        ("default_brokerage_plan", seed_default_brokerage_plan),
+        ("super_admin", seed_super_admin),
+        ("company_bank", seed_company_bank),
+        ("wd_rules", seed_wd_rules),
+        ("platform_settings", seed_platform_settings),
+        ("holidays", seed_holidays),
+        ("global_instruments", seed_global_instruments),
+    )
+    failed: list[str] = []
+    for name, fn in steps:
+        try:
+            await fn()
+        except Exception:  # noqa: BLE001 — one bad seeder must not skip the rest
+            failed.append(name)
+            logger.exception("seed_step_failed", extra={"step": name})
+    if failed:
+        logger.error("seed_complete_with_failures", extra={"failed": failed})
+    else:
+        logger.info("seed_complete")

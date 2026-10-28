@@ -518,10 +518,8 @@ async def _infoway_overlay(token: str, base_quote: dict[str, Any]) -> dict[str, 
         # tick's timestamp from `base_quote` and look older than it is.
         _fts = live.get("feed_ts")
         merged["feed_ts"] = float(_fts) if _fts else None
-        # USD/INR snapshot so the frontend can show margin in real INR
-        # rather than displaying the USD number with a ₹ symbol (which is
-        # how users end up trying to place orders worth 80× their wallet).
-        merged["fx_rate"] = get_usd_inr_rate()
+        # `fx_rate` is stamped in `_stamp_fx_rate`, which every quote passes
+        # through and which only stamps USD-quoted segments.
         return merged
     except Exception:
         logger.exception("infoway_overlay_failed token=%s", token)
@@ -664,7 +662,38 @@ async def get_segment_for_token(token: str) -> tuple[str, str] | None:
 
 
 async def _apply_admin_spread(token: str, quote: dict[str, Any]) -> dict[str, Any]:
-    """Final overlay: apply the admin-configured spread to the live quote.
+    """Final overlay pass: admin spread markup, then the USD/INR stamp.
+
+    Split in two so the fx stamp can't be missed — the spread step has
+    several early `return quote` exits and each one would otherwise hand
+    back a quote with no rate on it.
+    """
+    return await _stamp_fx_rate(token, await _apply_spread_only(token, quote))
+
+
+async def _stamp_fx_rate(token: str, quote: dict[str, Any]) -> dict[str, Any]:
+    """Attach `fx_rate` to every quote for a USD-quoted instrument.
+
+    A COMEX / forex / US-stock contract is priced in dollars but the wallet
+    runs in INR, and `order_validator` multiplies the margin it locks by this
+    same rate. Without the field the order panel shows the dollar figure
+    behind a ₹ sign. Gated on the same `is_usd_quoted_segment` the validator
+    uses so display and charge can never disagree.
+    """
+    try:
+        seg_sym = await _segment_for_token(token)
+        if seg_sym is None or not is_usd_quoted_segment(seg_sym[0]):
+            return quote
+        merged = dict(quote)
+        merged["fx_rate"] = get_usd_inr_rate()
+        return merged
+    except Exception:  # noqa: BLE001 — a missing rate must not kill the quote
+        logger.exception("fx_rate_stamp_failed token=%s", token)
+        return quote
+
+
+async def _apply_spread_only(token: str, quote: dict[str, Any]) -> dict[str, Any]:
+    """Apply the admin-configured spread to the live quote.
 
     Fixed mode  → bid = ltp − pips/2, ask = ltp + pips/2 every tick. The
                   exchange spread is ignored entirely (broker-set markup).
@@ -724,26 +753,65 @@ async def _apply_admin_spread(token: str, quote: dict[str, Any]) -> dict[str, An
         return quote
 
 
-# ── USD → INR conversion (forex / crypto P&L is reported in INR) ─────
-USD_INR_FALLBACK = 83.0  # used only if Infoway hasn't pushed a USDINR tick yet
+# ── USD → INR conversion ─────────────────────────────────────────────
+# Operator-set rate (platform setting), NOT a live FX feed: a rate that moved
+# on its own would move every open client's P&L and margin with it.
+USD_INR_SETTING_KEY = "fx.usd_inr_rate"
+USD_INR_FALLBACK = 97.0  # used only before the setting row is seeded/read
+
+# The risk enforcer marks every open position once a second, so this must not
+# hit Mongo per position. One process-local value, refreshed every 30 s by
+# `usd_inr_refresh_loop` — an admin edit reaches every worker within one
+# interval without any cache-invalidation wiring. Mutated in place.
+_usd_inr_cache: dict[str, float] = {"rate": 0.0, "at": 0.0}
 
 
 def get_usd_inr_rate() -> float:
-    """Live USD/INR conversion rate. Infoway subscribes to USDINR by default,
-    so this is the rate at which crypto / forex P&L gets translated for
-    Indian wallets. Falls back to a sensible constant on a cold start."""
-    try:
-        from app.services.infoway_service import infoway
+    """USD→INR rate for P&L / margin on USD-quoted segments.
 
-        for sym in ("USDINR", "USDINR=X", "USD/INR"):
-            tick = infoway.get_tick(sym)
-            if tick:
-                ltp = float(tick.get("ltp") or 0)
-                if ltp > 0:
-                    return ltp
-    except Exception:  # noqa: BLE001
-        pass
-    return USD_INR_FALLBACK
+    SYNCHRONOUS on purpose: ~25 money-path call sites (P&L marking, margin
+    validation, settlements, admin blotters), several inside the 1 s risk
+    sweep. Open positions are marked at this CURRENT rate; the stamps on
+    Position / Trade are for money that has already moved.
+    """
+    rate = _usd_inr_cache["rate"]
+    return rate if rate > 0 else USD_INR_FALLBACK
+
+
+async def refresh_usd_inr_rate() -> float:
+    """Re-read the admin rate into the process-local cache. On a read failure
+    the last good value is kept — a transient DB hiccup must not snap live
+    P&L onto the fallback constant."""
+    try:
+        from app.models.platform_setting import PlatformSetting
+
+        row = await PlatformSetting.find_one(
+            PlatformSetting.setting_key == USD_INR_SETTING_KEY
+        )
+        val = float(row.setting_value) if row is not None else 0.0
+        if val > 0:
+            _usd_inr_cache["rate"] = val
+            _usd_inr_cache["at"] = _t.monotonic()
+            return val
+        logger.warning("usd_inr_rate_missing_or_zero key=%s", USD_INR_SETTING_KEY)
+    except Exception:  # noqa: BLE001 — never break the loop over a settings read
+        logger.warning("usd_inr_rate_read_failed", exc_info=True)
+    return get_usd_inr_rate()
+
+
+async def usd_inr_refresh_loop(interval_sec: float = 30.0) -> None:
+    """Keep the admin USD→INR rate warm in this process."""
+    import asyncio
+
+    logger.info("usd_inr_refresh_loop_started", extra={"interval_sec": interval_sec})
+    while True:
+        try:
+            await refresh_usd_inr_rate()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("usd_inr_refresh_failed")
+        await asyncio.sleep(interval_sec)
 
 
 def is_infoway_lot_segment(segment: str | None) -> bool:
@@ -755,10 +823,8 @@ def is_infoway_lot_segment(segment: str | None) -> bool:
     This is the segment classifier the ORDER PLACEMENT path uses to pick
     between `infoway_lots.get_infoway_lot_size` and the canonical Indian
     lot tables. It is intentionally separate from `is_usd_quoted_segment`
-    below: that flag now governs *FX conversion* of P&L / margin only, and
-    has been disabled per the broker's spec ("treat the Infoway feed price
-    as INR directly"). Without this split, disabling FX conversion would
-    also break lot-size resolution for forex/crypto/etc.
+    below, which governs USD→INR conversion of P&L / margin only — sharing
+    one classifier would couple two unrelated decisions.
     """
     s = (segment or "").upper()
     if s in ("STOCKS", "INDICES"):
@@ -772,22 +838,35 @@ def is_infoway_lot_segment(segment: str | None) -> bool:
     )
 
 
+# Segments whose feed price is in USD, so P&L / margin is multiplied by the
+# admin USD→INR rate. Exact matches and prefixes only — never substring tests,
+# so a future "NSE_CRYPTO_ETF" can't be swept in by accident.
+_USD_SEGMENTS_EXACT = frozenset({
+    "FOREX",
+    "COMMODITIES",
+    "STOCKS",    # international stocks, not NSE_EQUITY
+    "INDICES",   # international indices, not NSE index F&O
+})
+_USD_SEGMENT_PREFIXES = ("CRYPTO_", "FOREX_", "CDS_")
+
+# Everything Zerodha feeds is already INR. Checked FIRST so no whitelist rule
+# above can ever reach an Indian instrument.
+_INR_SEGMENT_PREFIXES = ("NSE_", "BSE_", "MCX_", "NFO_", "BFO_", "NCDEX_")
+
+
 def is_usd_quoted_segment(segment: str | None) -> bool:
     """Whether the segment's P&L / margin needs USD→INR conversion.
 
-    Per the broker's spec, Infoway-feed prices (forex / crypto / spot
-    metals / energy / international stocks & indices) are now treated as
-    INR directly — there is no live USD→INR multiplication on P&L, no
-    margin scaling, and the UI renders these prices with ₹ rather than $.
-    So this helper always returns False; every legacy call site that gated
-    FX conversion on it becomes a no-op without further changes.
-
-    For Infoway lot-table selection use ``is_infoway_lot_segment`` above.
+    The ONE classifier for display, margin, the fill and every reversal path.
+    Intentionally not ``is_infoway_lot_segment`` above, which answers "which
+    lot table?" with loose substring matching.
     """
-    # Reference the parameter so linters don't flag it unused — the
-    # signature is kept stable for every existing caller.
-    _ = segment
-    return False
+    s = str(getattr(segment, "value", segment) or "").upper().strip()
+    if not s:
+        return False
+    if s.startswith(_INR_SEGMENT_PREFIXES):
+        return False
+    return s in _USD_SEGMENTS_EXACT or s.startswith(_USD_SEGMENT_PREFIXES)
 
 
 # Short in-process overlay cache (token → (timestamp_ms, payload)). The
