@@ -237,6 +237,17 @@ async def update_platform_setting(key: str, payload: UpdatePlatformSettingReques
     s = await PlatformSetting.find_one(PlatformSetting.setting_key == key)
     if s is None:
         raise HTTPException(status_code=404, detail="Setting not found")
+    if key == "fx.usd_inr_rate":
+        # Moves every USD position's rupee P&L and margin — super-admin only.
+        if admin.role != UserRole.SUPER_ADMIN:
+            raise HTTPException(status_code=403, detail="Only the super-admin can change the USD→INR rate")
+        try:
+            rate = float(payload.setting_value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Rate must be a number") from None
+        if not 0 < rate <= 1000:
+            raise HTTPException(status_code=400, detail="Rate must be > 0 and <= 1000")
+        payload.setting_value = rate
     s.setting_value = payload.setting_value
     await s.save()
     await log_event(
@@ -246,6 +257,10 @@ async def update_platform_setting(key: str, payload: UpdatePlatformSettingReques
         actor_id=admin.id,
         new_values={"value": payload.setting_value},
     )
+    if key == "fx.usd_inr_rate":
+        from app.services.market_data_service import refresh_usd_inr_rate
+
+        await refresh_usd_inr_rate()  # this worker now; others within 30 s
     return APIResponse(data={"ok": True})
 
 

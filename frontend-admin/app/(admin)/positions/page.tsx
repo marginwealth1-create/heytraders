@@ -362,7 +362,7 @@ function AdminPositionsInner() {
       // poll, so it stays exact at poll boundaries and smooth in between.
       if (!(liveLtp > 0) || !(restLtp > 0) || !Number.isFinite(qty)) return r;
       const basePnl = Number(r.unrealized_pnl ?? 0);
-      const livePnl = basePnl + (liveLtp - restLtp) * qty;
+      const livePnl = basePnl + (liveLtp - restLtp) * qty * (Number(r.current_usd_inr_rate) || 1);
       return { ...r, ltp: liveLtp, unrealized_pnl: livePnl };
     });
   }, [openRows, liveQuotes, tab]);

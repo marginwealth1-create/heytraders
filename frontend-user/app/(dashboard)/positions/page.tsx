@@ -9,6 +9,10 @@ import { resolveRealPositionId as resolveRealPositionIdShared } from "@/lib/posi
 import { useMarketStream } from "@/lib/useMarketStream";
 import { usePriceFlash } from "@/lib/usePriceFlash";
 import { isInstrumentMarketOpen } from "@/lib/marketHours";
+
+// Rupees per unit of native P&L — the server stamps `fx_rate` on USD rows
+// (the USD→INR rate); INR and pre-conversion rows are 1.
+const fxOf = (r: any) => Number(r?.fx_rate) || 1;
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -499,7 +503,7 @@ export default function PositionsPage() {
     const avg = Number(p.avg_price ?? 0);
     const qty = Number(p.quantity ?? 0);
     if (!price || !avg || !qty) return s;
-    return s + (price - avg) * qty;
+    return s + (price - avg) * qty * fxOf(p);
   }, 0);
 
   // CF Required (carry-forward margin) — sums each non-Infoway position's
@@ -891,7 +895,7 @@ export default function PositionsPage() {
         const price = liveLtpFor(r, side) || Number(r.ltp ?? 0);
         const avg = Number(r.avg_price ?? 0);
         const qty = Number(r.quantity ?? 0);
-        const pnl = (price > 0 && avg > 0 && qty !== 0) ? (price - avg) * qty : 0;
+        const pnl = (price > 0 && avg > 0 && qty !== 0) ? (price - avg) * qty * fxOf(r) : 0;
         return (
           <span className={pnlColor(pnl)}>{formatINR(pnl)}</span>
         );
@@ -1283,7 +1287,7 @@ export default function PositionsPage() {
         const entry = Number(r.price ?? r.avg_price ?? 0);
         const qty = Number(r.quantity ?? 0);
         const dir = side === "SELL" ? -1 : 1;
-        const pnl = (price > 0 && entry > 0 && qty !== 0) ? dir * (price - entry) * qty : 0;
+        const pnl = (price > 0 && entry > 0 && qty !== 0) ? dir * (price - entry) * qty * fxOf(r) : 0;
         return <span className={pnlColor(pnl)}>{formatINR(pnl)}</span>;
       },
     },
@@ -1662,7 +1666,7 @@ export default function PositionsPage() {
                 const avg = Number(closeRow.avg_price ?? 0);
                 const qty = Number(closeRow.quantity ?? 0);
                 const hasM2m = px > 0 && avg > 0 && qty !== 0;
-                const m2m = hasM2m ? (px - avg) * qty : 0;
+                const m2m = hasM2m ? (px - avg) * qty * fxOf(closeRow) : 0;
                 return (
                   <div className="space-y-2">
                     <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5 text-sm">
@@ -2378,7 +2382,7 @@ function ActiveMobileCard({
   // disabled. Keeps mobile + desktop totals in lockstep.
   const dir = side === "SELL" ? -1 : 1;
   const pnl =
-    ltp > 0 && entry > 0 && qty !== 0 ? dir * (ltp - entry) * qty : 0;
+    ltp > 0 && entry > 0 && qty !== 0 ? dir * (ltp - entry) * qty * fxOf(r) : 0;
 
   // Margin figures — only rendered on the Active variant (the Position
   // card drops them per the user's request for a cleaner layout).

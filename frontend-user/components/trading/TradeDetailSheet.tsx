@@ -323,10 +323,8 @@ function TradeDetailSheetInner({ token, open, onClose, onSwap, initialSide, seed
   const buyPrice = ask || ltp;
   const sideQuote = side === "BUY" ? buyPrice : sellPrice;
   const refPrice = orderType === "MARKET" ? sideQuote : Number(limitPrice || ltp);
-  // fx_rate is intentionally not consumed — margin/notional run on the
-  // raw feed number which we now interpret as INR.
-  void quote?.fx_rate;
-  const fxMultiplier = 1;
+  // USD→INR rate stamped on USD-quoted quotes; 1 for INR instruments.
+  const fxMultiplier = Number(liveTick?.fx_rate ?? quote?.fx_rate) || 1;
 
   // ── Upper / lower circuit (daily price band) ──────────────────────
   // Pre-flight mirror of the server gate so the user sees the lock BEFORE

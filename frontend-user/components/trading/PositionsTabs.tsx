@@ -6,6 +6,10 @@ import { toast } from "sonner";
 import { Pencil, X, Zap } from "lucide-react";
 import { InstrumentAPI, OrderAPI, PositionAPI } from "@/lib/api";
 import { isOptimisticId, resolveRealPositionId } from "@/lib/positionIds";
+
+// Rupees per unit of native P&L — the server stamps `fx_rate` on USD rows
+// (the USD→INR rate); INR and pre-conversion rows are 1.
+const fxOf = (r: any) => Number(r?.fx_rate) || 1;
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -207,7 +211,7 @@ export function PositionsTabs({ positions, pendingOrders, history, cancelled, to
     const { qty } = resolveQty(t);
     const avg = Number(t.price ?? 0);
     const pnl = (avg > 0 && qty > 0)
-      ? (side === "BUY" ? price - avg : avg - price) * qty
+      ? (side === "BUY" ? price - avg : avg - price) * qty * fxOf(t)
       : Number(t.pnl ?? 0);
     return { ...t, ltp: price, pnl };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -832,7 +836,7 @@ function PositionRow({
   const serverPnl = Number(position.unrealized_pnl ?? 0);
   const derivedPnl =
     Number.isFinite(avg) && Number.isFinite(ltp) && qty > 0
-      ? (isBuy ? ltp - avg : avg - ltp) * qty
+      ? (isBuy ? ltp - avg : avg - ltp) * qty * fxOf(position)
       : serverPnl;
   // Trust the server's P/L — the backend now marks against the CLOSE-side
   // price (bid for a long, ask for a short), so it reflects what the user
@@ -894,7 +898,7 @@ function ActiveTradeRow({
   const serverPnl = Number(trade.pnl ?? 0);
   const derivedPnl =
     Number.isFinite(avg) && Number.isFinite(ltp) && qty > 0
-      ? (isBuy ? ltp - avg : avg - ltp) * qty
+      ? (isBuy ? ltp - avg : avg - ltp) * qty * fxOf(trade)
       : serverPnl;
   // Trust the server's close-side P/L (see PositionRow above); derived is
   // only a fallback until the first server refresh lands.

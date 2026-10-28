@@ -392,6 +392,18 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     import asyncio as _asyncio
     from functools import partial as _partial
 
+    # Admin USD→INR rate, warmed into THIS process. Deliberately not
+    # leader-gated: `get_usd_inr_rate()` is a synchronous, process-local read
+    # on the money path, so every worker needs its own warm copy — a
+    # leader-only refresher would leave followers on the fallback constant.
+    from app.services import market_data_service as _mds_boot
+
+    await _mds_boot.refresh_usd_inr_rate()
+    app._usd_inr_task = _asyncio.create_task(  # type: ignore[attr-defined]
+        _mds_boot.usd_inr_refresh_loop(interval_sec=30.0),
+        name="usd_inr_refresh",
+    )
+
     from app.core.leader_lock import leader_elected as _leader_elected
     from app.core.loop_supervisor import supervise as _supervise
     from app.services import market_data_service
@@ -1049,6 +1061,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         task.cancel()
         try:
             await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    usd_task = getattr(app, "_usd_inr_task", None)
+    if usd_task is not None:
+        usd_task.cancel()
+        try:
+            await usd_task
         except (asyncio.CancelledError, Exception):
             pass
 
