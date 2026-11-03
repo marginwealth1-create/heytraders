@@ -43,7 +43,7 @@ DEFAULT_MARKET_HOURS: dict[str, dict[str, Any]] = {
     "MCX": {
         "name": "MCX (Commodities)",
         "start_time": "09:00",
-        "end_time": "23:30",
+        "end_time": "23:55",
         "is_enabled": True,
         "days": [1, 2, 3, 4, 5],
         "description": "Multi Commodity Exchange: Gold, Silver, Crude Oil, Natural Gas",

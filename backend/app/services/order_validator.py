@@ -573,9 +573,16 @@ async def validate(
     #   • An open position exists with an `opened_at` timestamp we can
     #     compare against.
     # Zero means "no minimum" — opt out per segment.
+    #
+    # The user's own Exit / Close buttons ALSO send is_squareoff=True (from
+    # "WEB") to reuse the close path, so `not is_squareoff` let every app exit
+    # skip both hold timers (30-Oct TJZTD4: 2-min hold set, BTCUSD closed at
+    # 60 s). Exempt only system closes (risk / rollover / admin) and parked
+    # SL/TP legs — those fire later via the poller, not now.
+    user_close = not is_squareoff or (placed_from == "WEB" and order_type == OrderType.MARKET)
     if (
         is_reducing
-        and not is_squareoff
+        and user_close
         and is_expiry_day_now
         and open_position is not None
         and getattr(open_position, "opened_at", None) is not None
@@ -622,7 +629,7 @@ async def validate(
     # squareoff. Zero = feature off.
     if (
         is_reducing
-        and not is_squareoff
+        and user_close
         and open_position is not None
         and getattr(open_position, "opened_at", None) is not None
     ):
@@ -1066,6 +1073,21 @@ async def validate(
             s["leverage"] = 1.0
             s["fixed_margin_per_lot"] = 0.0
 
+    # 8b) NRML on an exchange segment is held overnight, so it locks the
+    # OVERNIGHT tier now (Times mode otherwise keeps the intraday leverage for
+    # every product). Expiry day: the expiry rules above already chose the
+    # tier. Crypto / forex / international rows have no carry tier — the
+    # resolver hands them intraday values, so their NRML stays intraday.
+    if (
+        product_type == ProductType.NRML
+        and not is_expiry_day_now
+        and str(segment_type).upper().startswith(("NSE", "BSE", "NFO", "BFO", "MCX"))
+    ):
+        s["leverage"] = s.get("overnight_leverage") or s.get("leverage")
+        s["margin_percentage"] = s.get("overnight_margin_percentage") or s.get("margin_percentage")
+        if s.get("margin_calc_mode") == "fixed":
+            s["fixed_margin_per_lot"] = s.get("overnight_fixed_margin_per_lot") or s.get("fixed_margin_per_lot")
+
     # 9) margin check (all-Decimal arithmetic — never mix Decimal × float)
     margin_pct = to_decimal(s.get("margin_percentage") or 100.0) / to_decimal(100)
     leverage = to_decimal(s.get("leverage") or 1.0)
@@ -1195,9 +1217,32 @@ async def validate(
                 "No funds available to open a new position. "
                 "Close existing positions or add funds."
             )
-        if margin_required > available:
+        # The opening brokerage is debited from the same cash the moment this
+        # fills, so the order needs margin + its own brokerage free (₹2,500
+        # margin + ₹25 brokerage → ₹2,525). Without it a fill whose margin ate
+        # all the cash left the brokerage unpaid as settlement outstanding.
+        # Same call as the matching engine, so it's exactly what gets charged.
+        from app.services import brokerage_calculator
+
+        opening_charges = to_decimal(
+            (
+                await brokerage_calculator.calculate(
+                    segment_type=instrument.segment,
+                    action=action,
+                    product_type=product_type,
+                    qty=quantity,
+                    price=ref_price,
+                    lot_size=instrument.lot_size,
+                    netting_override=s,
+                    is_closing=False,
+                    charge_on=s.get("charge_on"),
+                )
+            ).total
+        )
+        if margin_required + opening_charges > available:
             raise InsufficientFundsError(
-                f"Need ₹{margin_required:.2f}, have ₹{available:.2f}"
+                f"Need ₹{margin_required + opening_charges:.2f} (margin ₹{margin_required:.2f}"
+                f" + brokerage ₹{opening_charges:.2f}), have ₹{available:.2f}"
             )
 
     # 10) stop-loss mandatory

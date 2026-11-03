@@ -74,6 +74,16 @@ const CLOSE_REASON_META: Record<
     label: "CF · Insufficient funds",
     cls: "bg-amber-500/10 text-amber-400 ring-amber-500/30",
   },
+  // EOD rollover squared the part of the book the funds couldn't carry.
+  CARRY_FORWARD_TRIM: {
+    label: "CF · Trimmed",
+    cls: "bg-amber-500/10 text-amber-400 ring-amber-500/30",
+  },
+  // EOD rollover squared part of this position; the rest carried overnight.
+  CARRY_FORWARD_PARTIAL: {
+    label: "CF · Part closed",
+    cls: "bg-amber-500/10 text-amber-400 ring-amber-500/30",
+  },
   // Segment doesn't allow overnight at all (intraday-only product).
   EOD_OVERNIGHT_DISABLED: {
     label: "EOD · Intraday only",
@@ -471,15 +481,24 @@ function AdminPositionsInner() {
     }
   }
 
+  // Platform-wide panic square-off. Typed confirmation, not a one-tap
+  // confirm(): a single mis-tap on the header button flattened every open
+  // position on the platform (31-Oct). The backend requires the same text.
+  const [emergencyOpen, setEmergencyOpen] = useState(false);
+  const [emergencyText, setEmergencyText] = useState("");
+  const [emergencyBusy, setEmergencyBusy] = useState(false);
   async function emergencyAll() {
-    if (!confirm("⚠ EMERGENCY: Square off ALL open positions across the platform?")) return;
+    setEmergencyBusy(true);
     try {
-      const r = await TradingAPI.emergencySquareoffAll();
+      const r = await TradingAPI.emergencySquareoffAll(emergencyText);
       toast.success(`Squared off ${r.placed}/${r.total} positions`);
+      setEmergencyOpen(false);
       qc.invalidateQueries({ queryKey: ["admin", "positions"] });
       qc.invalidateQueries({ queryKey: ["admin", "accounts"] });
     } catch (e: any) {
       toast.error(e.message);
+    } finally {
+      setEmergencyBusy(false);
     }
   }
 
@@ -1233,7 +1252,10 @@ function AdminPositionsInner() {
           <Button
             variant="destructive"
             size="sm"
-            onClick={emergencyAll}
+            onClick={() => {
+              setEmergencyText("");
+              setEmergencyOpen(true);
+            }}
             className="h-8 px-2 text-xs sm:h-9 sm:px-3 sm:text-sm"
             title="Emergency square-off all positions"
           >
@@ -1597,6 +1619,48 @@ function AdminPositionsInner() {
         onClose={() => setRateHistoryRow(null)}
       />
 
+      {/* ── Platform-wide square-off: typed confirmation ───────── */}
+      <Dialog open={emergencyOpen} onOpenChange={(o) => !emergencyBusy && setEmergencyOpen(o)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-destructive">
+              <AlertOctagon className="size-5" />
+              Square off ALL positions?
+            </DialogTitle>
+            <DialogDescription asChild>
+              <div className="space-y-3 pt-2 text-sm">
+                <p>
+                  This closes <b>{openRows?.length ?? 0} open position(s) of every user</b> on the
+                  platform at market price. It cannot be undone.
+                </p>
+                <p>
+                  Type <b className="font-mono">SQUARE OFF</b> to confirm.
+                </p>
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={emergencyText}
+            onChange={(e) => setEmergencyText(e.target.value)}
+            placeholder="SQUARE OFF"
+            aria-label="Type SQUARE OFF to confirm"
+          />
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setEmergencyOpen(false)} disabled={emergencyBusy}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={emergencyAll}
+              disabled={emergencyBusy || emergencyText.trim().toUpperCase() !== "SQUARE OFF"}
+            >
+              {emergencyBusy ? <Loader2 className="size-4 animate-spin" /> : "Square off all"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* ── Close / Square-off confirmation dialog ─────────────── */}
       <Dialog open={!!closeTarget} onOpenChange={(o) => !o && setCloseTarget(null)}>
         <DialogContent className="sm:max-w-sm">
@@ -1732,6 +1796,8 @@ function AdminPositionsInner() {
                   <option value="STOP_OUT">STOP_OUT (risk auto-flatten)</option>
                   <option value="CARRY_FORWARD_FAIL">CARRY_FORWARD_FAIL (insufficient overnight margin)</option>
                   <option value="EOD_OVERNIGHT_DISABLED">EOD_OVERNIGHT_DISABLED (intraday-only segment)</option>
+                  <option value="CARRY_FORWARD_TRIM">CARRY_FORWARD_TRIM (squared to fit funds)</option>
+                  <option value="CARRY_FORWARD_PARTIAL">CARRY_FORWARD_PARTIAL (part squared, rest carried)</option>
                   <option value="ADMIN">ADMIN (manual close)</option>
                   <option value="EOD">EOD (auto-rollover)</option>
                 </select>

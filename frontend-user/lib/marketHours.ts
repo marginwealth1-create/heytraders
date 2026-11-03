@@ -211,15 +211,19 @@ export function isInstrumentMarketOpen(
     return !(etMin >= CLOSE && etMin < REOPEN);
   }
 
-  // MCX commodities: Mon-Fri 09:00-23:30 IST
+  // MCX commodities: Mon-Fri 09:00-23:55 IST (platform close = backend MCX_CLOSE).
   if (seg.startsWith("MCX") || exch === "MCX") {
     if (!weekday) return false;
-    return min >= 9 * 60 && min <= 23 * 60 + 30;
+    return min >= 9 * 60 && min <= 23 * 60 + 55;
   }
 
-  // NSE / BSE equity, F&O — Mon-Fri 09:15-15:30 IST
+  // NSE / BSE equity, F&O — Mon-Fri 09:15-15:41 IST (platform close, operator-set).
+  // Catch-all: anything we couldn't classify falls into this bucket,
+  // which is safer than defaulting to "open" because Indian equity is
+  // the dominant segment and a wrong "closed" is better than a wrong
+  // "open" (the backend rejects either way; we just avoid the flicker).
   if (!weekday) return false;
-  return min >= 9 * 60 + 15 && min <= 15 * 60 + 30;
+  return min >= 9 * 60 + 15 && min <= 15 * 60 + 41;
 }
 
 /** Friendly label used in the "Market is closed" toast */

@@ -56,8 +56,8 @@ async def test_is_market_open_now_mcx():
     is_open, msg, _ = await is_market_open_now("MCX", "MCX_FUTURE", at=dt_eve)
     assert is_open is True
 
-    # Wednesday 23:45 PM IST (after 23:30 close)
-    dt_closed = datetime(2026, 10, 28, 23, 45, 0, tzinfo=IST)
+    # Wednesday 23:58 PM IST (after 23:55 close)
+    dt_closed = datetime(2026, 10, 28, 23, 58, 0, tzinfo=IST)
     is_open, msg, _ = await is_market_open_now("MCX", "MCX_FUTURE", at=dt_closed)
     assert is_open is False
-    assert "23:30" in msg
+    assert "23:55" in msg
