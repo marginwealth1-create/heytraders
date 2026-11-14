@@ -29,7 +29,8 @@ from app.models.transaction import DepositRequest, WalletTransaction, Withdrawal
 from app.models.user import AdminPermissions, User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.schemas.admin.common import BlockUserRequest
-from app.utils.time_utils import now_utc
+from app.services import tradebook_builder
+from app.utils.time_utils import now_utc, to_ist
 
 _DB = f"{settings.MONGODB_DB_NAME}_test_scope_admin_consumers"
 _GOLD = InstrumentRef(token="G1", symbol="GOLD", exchange="MCX", segment="MCX")
@@ -176,6 +177,37 @@ async def test_execution_reports_cover_every_pool(w):
         )
     # Sub-admin still sees only its own pool.
     assert (await reports.similar_activity(w.a2, 1, 60, 3, 50, None)).data["clusters"] == []
+
+
+async def test_top_movers_ranks_any_week_by_billing_net(w):
+    # Last week c_a1 closed +500 net of a ₹30 charge, and a +900 close an admin
+    # took back: picking that week ranks the Billing Net, live fills only.
+    lo, _hi = tradebook_builder.periods()["last_week"]
+    for i, (pnl, undone) in enumerate(((500, False), (900, True))):
+        await Trade(
+            trade_number=f"LW{i}",
+            order_id=PydanticObjectId(),
+            user_id=w.c_a1.id,
+            instrument=_GOLD,
+            action="SELL",
+            product_type="MIS",
+            quantity=1,
+            price=Decimal128("101"),
+            value=Decimal128("101"),
+            executed_at=lo + timedelta(days=2),
+            pnl_inr=Decimal128(str(pnl)),
+            total_charges=Decimal128("30"),
+            superseded_by_reopen=undone,
+        ).insert()
+    monday = to_ist(lo).date()
+    week = (monday.isoformat(), (monday + timedelta(days=6)).isoformat())
+    top = (await reports.top_movers(w.sa, 1, 10, False, None, *week)).data
+    assert [(r["user_id"], r["pnl"], r["trades"]) for r in top["clients"]["gainers"]] == [
+        (str(w.c_a1.id), 500.0, 1)
+    ]
+    # No dates: the last `days` days, as before — this week's three closes.
+    top = (await reports.top_movers(w.sa, 1, 10, False, None)).data
+    assert {r["user_id"] for r in top["clients"]["gainers"]} == _ids(w.c_direct, w.c_a1, w.c_a2)
     slip = (await reports.slippage_report(w.a2, 7, "user", 50, None)).data
     assert slip["totals"]["fills"] == 1
 

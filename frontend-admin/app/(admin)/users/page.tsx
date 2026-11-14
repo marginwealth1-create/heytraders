@@ -1,7 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { Suspense, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { Plus, Search, TrendingDown, TrendingUp } from "lucide-react";
 import { UsersAPI } from "@/lib/api";
@@ -41,11 +42,34 @@ type LiveStat = {
 };
 
 export default function AdminUsersPage() {
+  // useSearchParams must sit inside Suspense for the static prerender.
+  return (
+    <Suspense fallback={null}>
+      <AdminUsersInner />
+    </Suspense>
+  );
+}
+
+function AdminUsersInner() {
   const me = useAdminAuthStore((s) => s.admin);
   const [q, setQ] = useState("");
   const [status, setStatus] = useState<string>("");
-  const [mode, setMode] = useState<"live" | "demo">("live");
-  const [page, setPage] = useState(1);
+  // Live / Demo tab and page live in the URL, so Back from a user's
+  // profile lands on the tab and page the admin left.
+  const router = useRouter();
+  const sp = useSearchParams();
+  const mode: "live" | "demo" = sp?.get("mode") === "demo" ? "demo" : "live";
+  const page = Math.max(1, Number(sp?.get("page")) || 1);
+  function show(nextMode: "live" | "demo", nextPage: number) {
+    const p = new URLSearchParams();
+    if (nextMode === "demo") p.set("mode", "demo");
+    if (nextPage > 1) p.set("page", String(nextPage));
+    const qs = p.toString();
+    router.replace(qs ? `/users?${qs}` : "/users", { scroll: false });
+  }
+  const setPage = (n: number) => {
+    if (n !== page) show(mode, n);
+  };
   const [ledgerUser, setLedgerUser] = useState<any | null>(null);
   const [statsUser, setStatsUser] = useState<any | null>(null);
   const pageSize = 20;
@@ -288,7 +312,7 @@ export default function AdminUsersPage() {
       {/* Live / Demo mode toggle */}
       <div className="inline-flex rounded-lg border border-border bg-muted/40 p-1">
         <button
-          onClick={() => { setMode("live"); setPage(1); }}
+          onClick={() => show("live", 1)}
           className={`rounded-md px-4 py-1.5 text-xs font-semibold transition-colors ${
             !isDemo
               ? "bg-background shadow text-foreground"
@@ -298,7 +322,7 @@ export default function AdminUsersPage() {
           Live
         </button>
         <button
-          onClick={() => { setMode("demo"); setPage(1); }}
+          onClick={() => show("demo", 1)}
           className={`rounded-md px-4 py-1.5 text-xs font-semibold transition-colors ${
             isDemo
               ? "bg-amber-500/20 shadow text-amber-500"
@@ -390,10 +414,10 @@ export default function AdminUsersPage() {
           <span>
             Page {page} of {totalPages}
           </span>
-          <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
+          <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(page - 1)}>
             Prev
           </Button>
-          <Button variant="outline" size="sm" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>
+          <Button variant="outline" size="sm" disabled={page >= totalPages} onClick={() => setPage(page + 1)}>
             Next
           </Button>
         </div>

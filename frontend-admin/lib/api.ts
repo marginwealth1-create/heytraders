@@ -727,8 +727,15 @@ export const MoneyAPI = {
 };
 
 export const ReportsAdminAPI = {
-  // Instruments by live % move + clients by realised P&L.
-  topMovers: (params: { days?: number; include_options?: boolean; limit?: number }) =>
+  // Instruments by live % move + clients by Billing Net P&L over whole IST
+  // days from_date..to_date (YYYY-MM-DD), else the last `days` days.
+  topMovers: (params: {
+    days?: number;
+    from_date?: string;
+    to_date?: string;
+    include_options?: boolean;
+    limit?: number;
+  }) =>
     unwrap<any>(api.get("/admin/reports/top-movers", { params })),
   // Clients trading the same symbol + side inside one time window.
   similarActivity: (params: {

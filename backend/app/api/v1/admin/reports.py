@@ -293,13 +293,17 @@ async def top_movers(
         description="Options swing tens of percent daily and swamp the ranking; off by default",
     ),
     _: None = Depends(require_perm("reports", "read")),
+    from_date: str | None = None,
+    to_date: str | None = None,
 ) -> APIResponse[Any]:
-    """Two rankings: instruments by live % change, and clients by realised P&L.
+    """Two rankings: instruments by live % change, and clients by Net P&L.
 
     Symbols come from the feed leader's `mdlive` snapshots — that is exactly
     the set of instruments actually streaming, so nothing here invents a price
-    for a symbol nobody is watching. Clients are ranked on realised P&L only
-    (open trades are not marked here), which keeps one comparable rupee figure.
+    for a symbol nobody is watching. Clients are ranked on their Billing
+    statement Net P&L over the window (open trades are not marked here):
+    whole IST days `from_date`..`to_date` (YYYY-MM-DD) when given, else the
+    last `days` days.
     """
     from app.core.redis_client import get_redis
     from app.models.instrument import Instrument
@@ -374,34 +378,32 @@ async def top_movers(
     except Exception:
         logger.exception("top_movers_symbols_failed")
 
-    # ── Clients: realised P&L over the window ───────────────────────────
-    since = now_utc() - timedelta(days=days)
-    match: dict[str, Any] = {"executed_at": {"$gte": since}, "pnl_inr": {"$ne": None}}
+    # ── Clients: Billing Net P&L over the window ────────────────────────
+    lo, hi = (
+        tradebook_builder.window(from_date, to_date)
+        if from_date or to_date
+        else (now_utc() - timedelta(days=days), None)
+    )
     scope = await scoped_user_ids(admin, all_pools=True)
-    if scope is not None:
-        if not scope:
-            return APIResponse(
-                data={
-                    "symbols": {"gainers": gainers, "losers": losers},
-                    "clients": {"gainers": [], "losers": []},
-                    "days": days,
-                }
-            )
-        match["user_id"] = {"$in": scope}
-
-    ranked = await Trade.aggregate(
-        [
-            {"$match": match},
-            {
-                "$group": {
-                    "_id": "$user_id",
-                    "pnl": {"$sum": {"$toDouble": "$pnl_inr"}},
-                    "trades": {"$sum": 1},
-                }
-            },
-            {"$sort": {"pnl": -1}},
-        ]
-    ).to_list()
+    net = {uid: g - b for uid, (g, b) in (await tradebook_builder.booked(scope, lo, hi)).items()}
+    closes = {
+        r["_id"]: r["n"]
+        for r in await Trade.aggregate(
+            [
+                {
+                    "$match": {
+                        "user_id": {"$in": list(net)},
+                        "executed_at": {k: v for k, v in (("$gte", lo), ("$lte", hi)) if v},
+                        "pnl_inr": {"$ne": None},
+                        **LIVE_FILL,
+                    }
+                },
+                {"$group": {"_id": "$user_id", "n": {"$sum": 1}}},
+            ]
+        ).to_list()
+    }
+    ranked = [{"_id": uid, "pnl": float(v), "trades": closes.get(uid, 0)} for uid, v in net.items()]
+    ranked.sort(key=lambda r: r["pnl"], reverse=True)
 
     user_docs = await User.find(
         {"_id": {"$in": [r["_id"] for r in ranked[:limit] + ranked[-limit:]]}}

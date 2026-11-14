@@ -108,10 +108,6 @@ export function UserActionMenu({ user, onChange }: Props) {
       toast.error("Enter a positive amount");
       return;
     }
-    if (!note.trim()) {
-      toast.error("Reason is mandatory");
-      return;
-    }
     setBusy(true);
     try {
       await UsersAPI.walletAdjust(user.id, {
@@ -647,7 +643,7 @@ function AmountDialog({
             <Input
               value={note}
               onChange={(e) => setNote(e.target.value)}
-              placeholder="Mandatory for audit trail"
+              placeholder="Optional"
             />
           </div>
         </div>
