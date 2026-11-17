@@ -32,6 +32,9 @@ from app.services import (
     position_service,
     wallet_service,
 )
+from app.services.order_validator import bracket_direction_error
+from app.services.zerodha_service import zerodha
+from app.utils.background import fire_and_forget
 from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import epoch, now_utc
 
@@ -112,6 +115,16 @@ def _trade_number() -> str:
     return f"T{now_utc().strftime('%y%m%d')}{secrets.token_hex(4).upper()}"
 
 
+def _ask_feed(token: str) -> None:
+    """Get a token nobody streams onto the live feed, so a retry finds a price.
+    `subscribe` seeds `_state` (and forwards to the leader from a non-leader);
+    a numeric Zerodha token also needs the Kite WS, which `subscribe` never
+    reaches on the leader itself."""
+    market_data_service.subscribe([str(token)])
+    if str(token).isdigit():
+        fire_and_forget(zerodha.subscribe_tokens_on_demand([int(token)]), label="engine_cold_subscribe")
+
+
 async def execute_market_order(
     order: Order,
     *,
@@ -159,6 +172,13 @@ async def execute_market_order(
         ask = to_decimal(ask_raw) if ask_raw not in (None, 0, "0") else None
     except Exception:
         logger.exception("matching_engine_quote_fetch_failed")
+
+    # No price at all for an entry (a token nobody streams yet): it is refused
+    # below (STALE_FEED) — its margin and SL / TP legs were checked against no
+    # price either. Ask the feed for the token so the retry has one.
+    no_price = not (ltp and ltp > 0) and bid is None and ask is None
+    if no_price and not order.is_squareoff and force_fill_price is None:
+        _ask_feed(order.instrument.token)
 
     # ── Crossed / locked-quote guard (anti-arbitrage) ───────────────────
     # A valid market ALWAYS has ask >= bid. A stale or bad tick — common in the
@@ -235,8 +255,15 @@ async def execute_market_order(
                         "deviation_pct": float(deviation) * 100,
                     },
                 )
+        elif order.is_squareoff:
+            fill_price = expected_price  # an exit must always go through
         else:
-            fill_price = expected_price
+            # No live price at all: the client's price would check against
+            # nothing. 17 Nov (V5HMK3) and 9 Nov (DPA374) both opened this way.
+            raise OrderRejectedError(
+                "Live price not available yet for this instrument. Please retry in a few seconds.",
+                code="STALE_FEED",
+            )
     elif live_side is not None:
         fill_price = live_side
     # else: keep ltp fallback
@@ -387,6 +414,20 @@ async def execute_market_order(
                         "side_price": str(spread_side),
                     },
                 )
+
+    # A MARKET entry's SL / TP legs, against the book it fills into. The guard
+    # at placement read the client's own price, which the 1% cap above may have
+    # overruled: a leg already through the close side (the bid for a long, the
+    # ask for a short — what the risk loop fires legs on) fires on the next
+    # tick and books its untraded price. Checked before anything is written,
+    # so a refusal leaves no trade behind.
+    if order.order_type == OrderType.MARKET and not order.is_squareoff:
+        close_side = (bid if order.action == OrderAction.BUY else ask) or raw_ltp
+        _berr = bracket_direction_error(
+            order.action, close_side, sl=order.bracket_stop_loss, tp=order.bracket_target
+        )
+        if _berr:
+            raise OrderRejectedError(_berr, code="BRACKET_WRONG_SIDE")
 
     # ── Existing-position lookup first (needed to classify the fill as
     #    opening vs closing — `charge_on` gates brokerage on one or both).
@@ -609,8 +650,6 @@ async def execute_market_order(
                 )
 
             try:
-                from app.utils.background import fire_and_forget
-
                 fire_and_forget(_notify_pnl_sharing(), label="pnl_sharing_ws")
             except Exception:
                 # No background helper available / scheduling failed — fall

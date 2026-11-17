@@ -10,6 +10,8 @@ from fastapi import APIRouter, HTTPException
 from app.core.dependencies import CurrentUser
 from app.core.redis_client import publish
 from app.models._base import Exchange, InstrumentType
+from app.models.order import Order, OrderStatus
+from app.models.position import Position, PositionStatus
 from app.models.watchlist import Watchlist, WatchlistItem
 from app.schemas.common import APIResponse
 from app.schemas.trading import WatchlistAddItem, WatchlistCreate
@@ -224,6 +226,15 @@ async def _zerodha_unsubscribe_if_orphan(token: str) -> None:
     still_used = await WatchlistItem.find_one(WatchlistItem.instrument_token == token)
     if still_used is not None:
         return  # someone else still wants ticks for this instrument
+    # So do a held position and a parked order: the risk loop and the pending
+    # poller price them off the feed, and an unsubscribed token keeps its last
+    # tick in memory — the position marks at it, a parked SL never fires.
+    if await Position.find_one(
+        {"instrument.token": token, "status": PositionStatus.OPEN.value}
+    ) or await Order.find_one(
+        {"instrument.token": token, "status": {"$in": [OrderStatus.OPEN.value, OrderStatus.PARTIAL.value]}}
+    ):
+        return
     try:
         from app.services.zerodha_service import zerodha
         await zerodha.unsubscribe_tokens_on_demand([token_int])

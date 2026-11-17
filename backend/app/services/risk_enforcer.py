@@ -1300,8 +1300,9 @@ async def enforce_once(shard_id: int = 0, num_shards: int = 1) -> int:
     # no price for the token: no SL / TP / stop-out acts on it, and its
     # positions sit out the stop-out closes, until a fresh packet arrives. The
     # token joins the resubscribe below at most once a minute.
-    # ponytail: a pyramid add stamps no time on the position — a stale quote
-    # still marks it; per-fill times if that ever bites.
+    # A held token stays on the feed (the WS pool's eviction and trim skip it,
+    # a watchlist removal leaves it), so an add to an open position meets a
+    # live quote; with no price at all the engine refuses the entry.
     _opened: dict[str, float] = {}
     for ps in positions_by_user.values():
         for p in ps:

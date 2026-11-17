@@ -1524,8 +1524,14 @@ def hold_tokens(owner: str, tokens) -> None:
         subscribe(missing)
 
 
+def held_tokens() -> set[str]:
+    """Every token pinned by `hold_tokens` — what open positions and parked
+    orders are priced off. The Kite WS pool never evicts or trims these."""
+    return set().union(*_held.values())
+
+
 def unsubscribe(tokens: list[str]) -> None:
-    held = set().union(*_held.values())
+    held = held_tokens()
     for t in tokens:
         if t not in held:
             _subscribed.discard(t)

@@ -1323,7 +1323,7 @@ class ZerodhaService:
 
         # Build the must-keep set: open positions + active watchlist items +
         # LRU-exempt tokens (admin-pinned defaults like NIFTY/BANKNIFTY).
-        must_keep: set[int] = set(self._token_protected)
+        must_keep: set[int] = self._protected_now()
         must_keep_added_from_positions = 0
         try:
             from app.models.position import Position, PositionStatus
@@ -2618,12 +2618,13 @@ class ZerodhaService:
             # tokens (admin-pinned, open positions) are never evicted.
             shortfall = len(new_tokens) - total_capacity
             if shortfall > 0:
+                protected = self._protected_now()
                 evict_candidates = sorted(
                     (
                         (ts, tok)
                         for tok, ts in self._token_last_used.items()
                         if tok in self._token_to_ws
-                        and tok not in self._token_protected
+                        and tok not in protected
                         and tok not in set(tokens)
                     ),
                     key=lambda x: x[0],
@@ -2639,7 +2640,7 @@ class ZerodhaService:
                             extra={
                                 "evicted": len(to_evict),
                                 "for_new": len(new_tokens),
-                                "protected_skipped": sum(1 for t in self._token_to_ws if t in self._token_protected),
+                                "protected_skipped": sum(1 for t in self._token_to_ws if t in protected),
                             },
                         )
                     except Exception:
@@ -2669,6 +2670,16 @@ class ZerodhaService:
             },
         )
         return len(new_tokens)
+
+    def _protected_now(self) -> set[int]:
+        """Tokens the pool must keep streaming: the admin-pinned ones, plus
+        every token an open position or a parked order is priced off
+        (market_data_service.hold_tokens — the risk loop and the poller).
+        Evicted, those froze at their last tick and the position went on
+        marking at it."""
+        from app.services import market_data_service as _mds  # noqa: PLC0415 — as everywhere here
+
+        return self._token_protected | {int(t) for t in _mds.held_tokens() if str(t).isdigit()}
 
     def mark_tokens_protected(self, tokens: list[int]) -> None:
         """Mark tokens as exempt from LRU eviction. Use for instruments
@@ -2723,6 +2734,12 @@ class ZerodhaService:
                 # timestamp slot, otherwise it accumulates over time and
                 # the eviction candidate list grows unbounded.
                 self._token_last_used.pop(token, None)
+                # Nor its last tick: read back once the token is re-subscribed,
+                # a noon GOLD26NOV135000CE tick priced a 20:48 short (17 Nov).
+                tick = self.ticks_by_token.pop(token, None) or {}
+                sym = tick.get("symbol")
+                if sym and (self.ticks_by_symbol.get(sym) or {}).get("token") == token:
+                    self.ticks_by_symbol.pop(sym, None)
                 if ws_idx is not None and ws_idx < len(self._tickers):
                     entry = self._tickers[ws_idx]
                     entry["tokens"].discard(token)
