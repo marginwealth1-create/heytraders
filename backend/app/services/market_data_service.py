@@ -1367,6 +1367,39 @@ def get_quote_instant(token: str) -> dict[str, Any]:
     return {}
 
 
+# Unsubscribing a token (last watchlist removal, expiry cleanup) leaves its last
+# tick in memory, and the instant reads above hand it back once the token is
+# re-subscribed. 17 Nov a noon tick of GOLD26NOV135000CE (2305.50) marked a
+# short opened at 20:48 for 1786 and stopped it out, the live book at
+# 1787 / 1795.5. A quote whose last exchange packet came more than this before
+# a position on its token opened, or an order on it was placed, never saw the
+# market that position / order lives in. A quiet contract's quote that printed
+# after the position opened still stands.
+QUOTE_PREDATES_SEC = 60
+
+
+def drop_quotes_predating(
+    ltp_map: dict[str, Any], quote_map: dict[str, Any], since: dict[str, float]
+) -> list[str]:
+    """Blank (LTP None, quote {}) each token whose quote's exchange packet is
+    more than QUOTE_PREDATES_SEC older than `since[token]` (Unix seconds) —
+    the newest position opened / order placed on it — and return those
+    tokens: no price for it until a fresh packet arrives. A quote with no
+    exchange packet time (MetaAPI / Infoway, Kite non-FULL modes) is left
+    alone."""
+    stale = []
+    for tok, opened in since.items():
+        try:
+            ets = float((quote_map.get(tok) or {}).get("exchange_timestamp") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ets > 0 and opened - ets > QUOTE_PREDATES_SEC:
+            ltp_map[tok] = None
+            quote_map[tok] = {}
+            stale.append(tok)
+    return stale
+
+
 async def get_quotes(tokens: list[str]) -> list[dict[str, Any]]:
     # Previously this looped serially — each token's `_overlay_all` blocked
     # on Zerodha + Infoway timeouts (~2 s each) BEFORE moving to the next

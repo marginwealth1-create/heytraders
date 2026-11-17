@@ -33,7 +33,7 @@ from app.services import (
     wallet_service,
 )
 from app.utils.decimal_utils import quantize_money, to_decimal
-from app.utils.time_utils import now_utc
+from app.utils.time_utils import epoch, now_utc
 
 logger = logging.getLogger(__name__)
 
@@ -199,22 +199,26 @@ async def execute_market_order(
     # price and PnL accrues from it. Still subject to the zero/negative
     # sanity guard below.
     SLIPPAGE_CAP = Decimal("0.01")  # 1 %
+    # A bracket SL/TP fire: the risk enforcer passes the user's OWN stored
+    # trigger as `expected_price`. A parked LIMIT / SL exit (a per-fill TP /
+    # SL) is fired by the poller at its own limit / trigger the same way.
+    _exact_close = str(getattr(order, "close_reason", "") or "") in ("SL_HIT", "TP_HIT")
+    _own_price = _exact_close or order.order_type != OrderType.MARKET
     if force_fill_price is not None and force_fill_price > 0:
         fill_price = force_fill_price
-    # A SERVER-initiated squareoff carrying an expected_price is a bracket
-    # SL/TP fire — the risk enforcer passes the user's OWN stored trigger as
-    # `expected_price`. That is not a browser value, so honour it EXACTLY: the
-    # user set the barrier at that price and expects the close booked THERE,
-    # not at whatever LTP the (1–2 s) risk tick drifted to. The 1% anti-tamper
-    # cap below is for ENTRY orders only — applying it to bracket fires is what
-    # filled "SL 260 set → closed at 255" when the tick lagged >1% past the
-    # trigger. (EOD-rollover / kill-switch / zero-price squareoffs pass
-    # expected_price == ltp, so this books at ltp for them — no change.)
-    elif order.is_squareoff and expected_price is not None and expected_price > 0:
+    # That price is the user's, not a browser value, so honour it EXACTLY:
+    # the user set the barrier there and expects the close booked THERE, not
+    # at whatever LTP the (1–2 s) risk tick drifted to. Applying the 1% cap to
+    # bracket fires is what filled "SL 260 set → closed at 255" when the tick
+    # lagged >1% past the trigger.
+    elif order.is_squareoff and _own_price and expected_price is not None and expected_price > 0:
         fill_price = expected_price
-    # Prefer the client-supplied expected price when it's within 1% of the
-    # current live side — that keeps ENTRY identical to what the order
-    # panel was showing, and the cap blocks any browser-side tampering.
+    # Prefer the expected price when it's within 1% of the current live side:
+    # the order panel's price for an entry (the cap blocks browser-side
+    # tampering), and for any other squareoff (stop-out, EOD rollover) the
+    # close-side mark the server decided on. A mark >1% off the live book is
+    # not a price: 17 Nov a stop-out booked 2305.50 off a tick left in memory
+    # since noon while the book stood at 1787 / 1795.5.
     elif expected_price is not None and expected_price > 0:
         reference = live_side or ltp
         if reference and reference > 0:
@@ -340,7 +344,6 @@ async def execute_market_order(
     # decision (2026-06-23): SL/TP must exit at EXACTLY the set price even
     # though the broker forgoes its half-spread markup on these closes. Stop-
     # out / manual / ordinary market fills are unaffected and still get spread.
-    _exact_close = str(getattr(order, "close_reason", "") or "") in ("SL_HIT", "TP_HIT")
     if (
         order.order_type == OrderType.MARKET
         and not (force_fill_price is not None and force_fill_price > 0)
@@ -913,6 +916,15 @@ async def trigger_pending_orders() -> int:
     ltp_map: dict[str, Decimal | None] = {
         tok: market_data_service.get_ltp_instant(tok) for tok in unique_tokens
     }
+    # A quote from before an order on its token was placed is no price for the
+    # token (a tick left in memory since an unsubscribe): it must not fire one.
+    placed: dict[str, float] = {}
+    for o in rows:
+        if o.created_at is not None:
+            placed[o.instrument.token] = max(placed.get(o.instrument.token, 0.0), epoch(o.created_at))
+    market_data_service.drop_quotes_predating(
+        ltp_map, {tok: market_data_service.get_quote_instant(tok) for tok in unique_tokens}, placed
+    )
 
     # Cross-worker dedup. The poller runs in every uvicorn worker — without
     # a distributed claim, two workers reading the same OPEN limit order in

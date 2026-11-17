@@ -25,6 +25,11 @@ def to_ist(dt: datetime) -> datetime:
     return dt.astimezone(IST)
 
 
+def epoch(dt: datetime) -> float:
+    """Unix seconds of a stored instant (Mongo hands back naive UTC)."""
+    return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).timestamp()
+
+
 def to_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=IST)
