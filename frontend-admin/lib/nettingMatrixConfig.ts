@@ -283,8 +283,8 @@ export const CATEGORY_FIELDS: Record<string, FieldDef[]> = {
 // Admin matrix rows whose underlying instruments don't settle daily —
 // there is no concept of an overnight margin for these segments. Keep
 // in sync with INTRADAY_ONLY_ADMIN_ROWS in
-// backend/app/services/netting_service.py.
-const INTRADAY_ONLY_ROWS = new Set(["FOREX", "STOCKS", "INDICES", "COMMODITIES", "CRYPTO"]);
+// backend/app/services/netting_service.py. FOREX carries (03:30 IST rollover).
+const INTRADAY_ONLY_ROWS = new Set(["STOCKS", "INDICES", "COMMODITIES", "CRYPTO"]);
 
 // Field keys that represent an overnight / carryforward dimension of margin.
 // Hidden for the Infoway segments above so admins don't enter values that

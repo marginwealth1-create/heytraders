@@ -32,7 +32,7 @@ from app.utils.decimal_utils import (
     to_decimal,
     to_decimal128,
 )
-from app.utils.time_utils import UTC, now_utc
+from app.utils.time_utils import UTC, is_weekend, now_utc
 
 import logging
 
@@ -2279,6 +2279,17 @@ def affordable_carry(qty: Decimal, cash: Decimal, locked: Decimal, full_margin: 
     return max(min(keep, qty - step), Decimal(0))
 
 
+def rollover_fire_at(group: str, fire_at: Any, day: Any, muhurat_close: Any = None) -> Any:
+    """When `group` rolls on the IST `day`: `fire_at`, a Muhurat session's
+    close + 1 min, or None when it doesn't roll that day. Forex closes its
+    Mon-Fri sessions on Tue-Sat mornings and keeps no Indian calendar."""
+    if group == "FOREX":
+        return fire_at if day.weekday() in (1, 2, 3, 4, 5) else None
+    if muhurat_close is not None:
+        return rollover_fire_time(muhurat_close, 1)
+    return None if is_weekend(day) else fire_at
+
+
 def rollover_fire_time(close: Any, delay_min: int) -> Any:
     """close + delay as a wall-clock time, clamped to 23:59. divmod, because
     a naive minute add ("15:66") never matches and silently skips the day."""
@@ -2799,9 +2810,11 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
 
         • NSE/BSE/F&O → 15:41, the platform's NSE close (operator-set)
         • MCX         → close + 1 min
-        • Forex / crypto / international → no daily close, never rolled
+        • Forex       → 03:30, Tue-Sat (the Mon-Fri sessions' close)
+        • Crypto / other international → no daily close, never rolled
 
-    Weekends and the exchange's full-day holidays are skipped. The "done
+    Weekends and the exchange's full-day holidays are skipped (not for
+    forex, which has neither). The "done
     today" marker is persisted in Redis as well as memory, so a restart
     after the close never sweeps the same book a second time.
     """
@@ -2813,11 +2826,12 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     from app.models._base import Exchange as _Exchange
     from app.models.holiday import TradingHoliday as _TradingHoliday
     from app.utils.time_utils import (
+        FOREX_ROLLOVER,
+        FOREX_SEGMENTS,
         INDIAN_EQUITY_FNO_SEGMENTS,
         MCX_CLOSE,
         NSE_BSE_CLOSE,
         MCX_SEGMENTS,
-        is_weekend,
         now_ist,
     )
 
@@ -2828,6 +2842,7 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     groups = (
         ("INDIAN_EQUITY_FNO", INDIAN_EQUITY_FNO_SEGMENTS, rollover_fire_time(NSE_BSE_CLOSE, 0)),
         ("MCX", MCX_SEGMENTS, rollover_fire_time(MCX_CLOSE, 1)),
+        ("FOREX", FOREX_SEGMENTS, FOREX_ROLLOVER),
     )
 
     async def _done(group: str, day: str) -> bool:
@@ -2859,56 +2874,54 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
             from app.utils.time_utils import muhurat_window as _mw
 
             _mu = _mw(now.date())  # Muhurat day: roll at the session close
-            if _mu is not None or not is_weekend(now.date()):
-                day_key = now.strftime("%Y%m%d")
-                for group_name, group_set, fire_at in groups:
-                    if _mu is not None:
-                        fire_at = rollover_fire_time(_mu[1], 1)
-                    if now.time() < fire_at or await _done(group_name, day_key):
-                        continue
-                    # Full-day exchange holiday → market never opened, so
-                    # nothing should roll or be squared off today. Mark the
-                    # day done so we don't re-check every minute. FAIL-OPEN:
-                    # any lookup error proceeds with the rollover so a guard
-                    # bug can never suppress a real EOD sweep.
+            day_key = now.strftime("%Y%m%d")
+            for group_name, group_set, close_at in groups:
+                fire_at = rollover_fire_at(group_name, close_at, now.date(), _mu[1] if _mu else None)
+                if fire_at is None or now.time() < fire_at or await _done(group_name, day_key):
+                    continue
+                # Full-day exchange holiday → market never opened, so
+                # nothing should roll or be squared off today. Mark the
+                # day done so we don't re-check every minute. FAIL-OPEN:
+                # any lookup error proceeds with the rollover so a guard
+                # bug can never suppress a real EOD sweep.
+                holiday = None
+                try:
+                    _exch = _group_exchange.get(group_name)
+                    if _exch is not None:
+                        holiday = await _TradingHoliday.find_one(
+                            _TradingHoliday.holiday_date == now.date(),
+                            _TradingHoliday.exchange == _exch,
+                            _TradingHoliday.is_full_day == True,  # noqa: E712
+                        )
+                except Exception:  # noqa: BLE001
                     holiday = None
-                    try:
-                        _exch = _group_exchange.get(group_name)
-                        if _exch is not None:
-                            holiday = await _TradingHoliday.find_one(
-                                _TradingHoliday.holiday_date == now.date(),
-                                _TradingHoliday.exchange == _exch,
-                                _TradingHoliday.is_full_day == True,  # noqa: E712
-                            )
-                    except Exception:  # noqa: BLE001
-                        holiday = None
-                    if holiday is not None:
-                        await _mark_done(group_name, day_key)
-                        _log.info(
-                            "intraday_to_carry_skipped_holiday",
-                            extra={"group": group_name, "date": day_key},
-                        )
-                        continue
-                    # Expiry-day settlement FIRST — close every open position
-                    # on an instrument expiring TODAY at its close/clearing
-                    # price, so an expiring contract is never carried forward.
-                    try:
-                        exp_summary = await settle_expiring_today(group_set)
-                        if exp_summary.get("settled"):
-                            _log.info(
-                                "expiry_day_settled_group",
-                                extra={"group": group_name, **exp_summary},
-                            )
-                    except Exception:  # noqa: BLE001
-                        _log.exception(
-                            "expiry_day_settle_failed", extra={"group": group_name}
-                        )
-                    summary = await convert_intraday_to_carry(group_set)
+                if holiday is not None:
                     await _mark_done(group_name, day_key)
                     _log.info(
-                        "intraday_to_carry_rolled",
-                        extra={"group": group_name, **summary},
+                        "intraday_to_carry_skipped_holiday",
+                        extra={"group": group_name, "date": day_key},
                     )
+                    continue
+                # Expiry-day settlement FIRST — close every open position
+                # on an instrument expiring TODAY at its close/clearing
+                # price, so an expiring contract is never carried forward.
+                try:
+                    exp_summary = await settle_expiring_today(group_set)
+                    if exp_summary.get("settled"):
+                        _log.info(
+                            "expiry_day_settled_group",
+                            extra={"group": group_name, **exp_summary},
+                        )
+                except Exception:  # noqa: BLE001
+                    _log.exception(
+                        "expiry_day_settle_failed", extra={"group": group_name}
+                    )
+                summary = await convert_intraday_to_carry(group_set)
+                await _mark_done(group_name, day_key)
+                _log.info(
+                    "intraday_to_carry_rolled",
+                    extra={"group": group_name, **summary},
+                )
         except Exception:  # noqa: BLE001
             _log.exception("intraday_to_carry_loop_failed")
         try:

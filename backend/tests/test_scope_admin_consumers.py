@@ -231,8 +231,25 @@ async def test_summary_reports_cover_every_pool(w):
 
 async def _list(actor, **kw):
     args = {"q": None, "role": None, "status": None, "parent_id": None, "mode": "live"}
-    args.update(page=1, page_size=50, **kw)
+    args.update(page=1, page_size=50)
+    args.update(kw)
     return (await users_api.list_users(actor, _=None, **args)).data
+
+
+async def test_list_users_by_trading_activity_funds_and_weekly_pnl(w):
+    # c_direct / c_a1 / c_a2 traded 5 min ago (+100 / +200 / +300); c_b1 never.
+    def ids(d):
+        return [r["id"] for r in d["items"]]
+
+    assert set(ids(await _list(w.sa, activity="active"))) == _ids(w.c_direct, w.c_a1, w.c_a2)
+    assert ids(await _list(w.sa, activity="inactive")) == [str(w.c_b1.id)]
+    assert ids(await _list(w.sa, sort="pnl_desc"))[:3] == [str(w.c_a2.id), str(w.c_a1.id), str(w.c_direct.id)]
+    await Wallet.get_motor_collection().update_one(
+        {"user_id": w.c_direct.id}, {"$set": {"available_balance": Decimal128("5000")}}
+    )
+    assert ids(await _list(w.sa, sort="funds_desc"))[0] == str(w.c_direct.id)
+    last = await _list(w.sa, sort="funds_asc", page=2, page_size=3)  # pages after ranking
+    assert ids(last) == [str(w.c_direct.id)] and last["meta"]["total"] == 4
 
 
 async def test_list_users_super_admin_sees_every_pool_writes_flagged(w):

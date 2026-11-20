@@ -111,7 +111,12 @@ async def _resolve_super_admin_id() -> PydanticObjectId | None:
 # Admin matrix rows whose instruments don't settle daily — no separate
 # overnight margin exists. The resolver always reads the *Intraday* column
 # for these rows and the admin UI greys out the overnight cells.
-INTRADAY_ONLY_ADMIN_ROWS = frozenset({"FOREX", "STOCKS", "INDICES", "COMMODITIES", "CRYPTO"})
+INTRADAY_ONLY_ADMIN_ROWS = frozenset({"STOCKS", "INDICES", "COMMODITIES", "CRYPTO"})
+# Rows that carry overnight (FOREX rolls at 03:30 IST since 2026-11-20) but
+# whose Overnight Margin, until an admin tier sets one, is the Intraday one —
+# the base row's seeded 100 would otherwise turn a 500x book into a 100x
+# carry check overnight.
+OVERNIGHT_DEFAULTS_TO_INTRADAY = frozenset({"FOREX"})
 
 # Module-local debounce for "netting_eff:*" wipes. The admin Segment Matrix
 # fires N parallel PUTs (one per dirty segment); without this each call
@@ -2077,7 +2082,12 @@ def _to_legacy_dict(
     # to a value different from the seed default; otherwise inherit the
     # row's segment-wide intraday/overnight value.
     seg_intraday = float(pick("intradayMargin", 100.0) or 100.0)
-    seg_overnight = float(pick("overnightMargin", 100.0) or 100.0)
+    seg_overnight = (
+        seg_intraday
+        if seg_name_for_check in OVERNIGHT_DEFAULTS_TO_INTRADAY
+        and getattr(override, "overnightMargin", None) is None
+        else float(pick("overnightMargin", 100.0) or 100.0)
+    )
     seg_value_for_now = seg_overnight if is_overnight else seg_intraday
 
     def _opt_pick(field: str, ovn_field: str) -> float:

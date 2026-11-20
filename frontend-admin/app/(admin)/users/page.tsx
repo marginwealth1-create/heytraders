@@ -54,6 +54,9 @@ function AdminUsersInner() {
   const me = useAdminAuthStore((s) => s.admin);
   const [q, setQ] = useState("");
   const [status, setStatus] = useState<string>("");
+  // active = traded in the last 7 days; sort by balance or this week's P&L.
+  const [activity, setActivity] = useState<string>("");
+  const [sort, setSort] = useState<string>("");
   // Live / Demo tab and page live in the URL, so Back from a user's
   // profile lands on the tab and page the admin left.
   const router = useRouter();
@@ -75,11 +78,13 @@ function AdminUsersInner() {
   const pageSize = 20;
 
   const { data, isFetching } = useQuery({
-    queryKey: ["admin", "users", { q, status, mode, page, pageSize }],
+    queryKey: ["admin", "users", { q, status, activity, sort, mode, page, pageSize }],
     queryFn: () =>
       UsersAPI.list({
         q: q || undefined,
         status: status || undefined,
+        activity: activity || undefined,
+        sort: sort || undefined,
         mode,
         page,
         page_size: pageSize,
@@ -366,6 +371,34 @@ function AdminUsersInner() {
           <option value="PENDING">Pending</option>
           <option value="BLOCKED">Blocked</option>
           <option value="CLOSED">Closed</option>
+        </select>
+        <select
+          value={activity}
+          onChange={(e) => {
+            setPage(1);
+            setActivity(e.target.value);
+          }}
+          className="h-10 rounded-md border border-border bg-background px-3 text-sm"
+          aria-label="Trading activity"
+        >
+          <option value="">Active + inactive</option>
+          <option value="active">Active (traded in 7 days)</option>
+          <option value="inactive">Inactive (no trade in 7 days)</option>
+        </select>
+        <select
+          value={sort}
+          onChange={(e) => {
+            setPage(1);
+            setSort(e.target.value);
+          }}
+          className="h-10 rounded-md border border-border bg-background px-3 text-sm"
+          aria-label="Sort users"
+        >
+          <option value="">Newest first</option>
+          <option value="funds_desc">Funds: high to low</option>
+          <option value="funds_asc">Funds: low to high</option>
+          <option value="pnl_desc">Weekly P&amp;L: high to low</option>
+          <option value="pnl_asc">Weekly P&amp;L: low to high</option>
         </select>
         {!isDemo && <LiveBadge fetching={liveStatsQuery.isFetching} />}
       </div>

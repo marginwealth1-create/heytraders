@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -21,8 +22,10 @@ from app.core.dependencies import (
 )
 from app.core.security import hash_password
 from app.models.audit_log import AuditAction
+from app.models.trade import LIVE_FILL, Trade
 from app.models.transaction import TransactionType
 from app.models.user import User, UserRole, UserStatus
+from app.models.wallet import Wallet
 from app.schemas.admin.common import (
     BlockUserRequest,
     CreateUserRequest,
@@ -31,7 +34,8 @@ from app.schemas.admin.common import (
 from app.schemas.common import APIResponse
 from app.services import tradebook_builder, user_service, wallet_service
 from app.services.audit_service import log_event
-from app.utils.decimal_utils import to_decimal128
+from app.utils.decimal_utils import to_decimal, to_decimal128
+from app.utils.time_utils import now_utc
 
 router = APIRouter(prefix="/users", tags=["admin-users"])
 
@@ -140,7 +144,13 @@ async def list_users(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
     _: None = Depends(require_perm("users", "read")),
+    activity: str | None = None,
+    sort: str | None = None,
 ):
+    """`activity`: active = traded (a live fill) in the last 7 days,
+    inactive = not. `sort`: funds_desc / funds_asc (balance = available +
+    used margin, the Balance column) or pnl_desc / pnl_asc (this IST week's
+    Net P&L, the Weekly P&L column); default newest first."""
     query: dict[str, Any] = {}
     # /admin/users is for trading users only. Sub-admins are listed at
     # /admin/management/sub-admins (super-admin only). Reject role filters
@@ -221,12 +231,16 @@ async def list_users(
         and_clauses.append(scope)
     else:
         query.update(scope)
+    if activity in ("active", "inactive"):
+        and_clauses.append(await _traded_last_week(activity == "active"))
     if and_clauses:
         query["$and"] = and_clauses
 
     total = await User.find(query).count()
     rows = (
-        await User.find(query)
+        await _ranked_page(query, sort, page, page_size)
+        if sort in _RANKED_SORTS
+        else await User.find(query)
         .sort("-created_at")
         .skip((page - 1) * page_size)
         .limit(page_size)
@@ -246,7 +260,6 @@ async def list_users(
     # Batch-load wallets for the page so the admin list can surface the
     # `available_balance` + `settlement_outstanding` columns. One round-trip
     # via $in keeps this O(1) instead of N+1 over wallet_service.summary().
-    from app.models.wallet import Wallet
     user_ids = [u.id for u in rows]
     wallets = await Wallet.find({"user_id": {"$in": user_ids}}).to_list()
     wallet_map = {str(w.user_id): w for w in wallets}
@@ -287,6 +300,38 @@ async def list_users(
             "meta": {"page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size},
         }
     )
+
+
+_RANKED_SORTS = ("funds_desc", "funds_asc", "pnl_desc", "pnl_asc")
+
+
+async def _traded_last_week(traded: bool) -> dict[str, Any]:
+    """Users with (or without) a live fill in the last 7 days."""
+    ids = await Trade.get_motor_collection().distinct(
+        "user_id", {"executed_at": {"$gte": now_utc() - timedelta(days=7)}, **LIVE_FILL}
+    )
+    return {"_id": {"$in" if traded else "$nin": ids}}
+
+
+async def _ranked_page(query: dict[str, Any], sort: str, page: int, page_size: int) -> list[User]:
+    """One page of the users matching `query`, ranked by balance (available +
+    used margin) or this IST week's Net P&L. Both live outside the user doc,
+    so every match is ranked, then paged.
+    ponytail: the whole scope is ranked per request — fine at a few hundred
+    clients; a stored per-user figure if the book grows past that."""
+    ids = [d["_id"] async for d in User.get_motor_collection().find(query, {"_id": 1})]
+    if sort.startswith("funds"):
+        key = {
+            w.user_id: to_decimal(w.available_balance) + to_decimal(w.used_margin)
+            for w in await Wallet.find({"user_id": {"$in": ids}}).to_list()
+        }
+    else:
+        week = tradebook_builder.periods()["week"]
+        key = {uid: g - b for uid, (g, b) in (await tradebook_builder.booked(ids, *week)).items()}
+    ids.sort(key=lambda i: key.get(i, Decimal(0)), reverse=sort.endswith("_desc"))
+    page_ids = ids[(page - 1) * page_size : page * page_size]
+    found = {u.id: u for u in await User.find({"_id": {"$in": page_ids}}).to_list()}
+    return [found[i] for i in page_ids if i in found]
 
 
 @router.get("/live-stats", response_model=APIResponse[dict])

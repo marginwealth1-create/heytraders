@@ -405,6 +405,7 @@ export function UserActionMenu({ user, onChange }: Props) {
         setAmount={setAmount}
         note={note}
         setNote={setNote}
+        showNote={false}
         busy={busy}
         onCancel={close}
         onSubmit={() => runWalletAdjust("addFund")}
@@ -601,6 +602,7 @@ function AmountDialog({
   setAmount,
   note,
   setNote,
+  showNote = true,
   busy,
   onCancel,
   onSubmit,
@@ -614,6 +616,7 @@ function AmountDialog({
   setAmount: (v: string) => void;
   note: string;
   setNote: (v: string) => void;
+  showNote?: boolean;
   busy: boolean;
   onCancel: () => void;
   onSubmit: () => void;
@@ -638,14 +641,16 @@ function AmountDialog({
               autoFocus
             />
           </div>
-          <div className="space-y-1.5">
-            <Label>Reason / narration</Label>
-            <Input
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              placeholder="Optional"
-            />
-          </div>
+          {showNote && (
+            <div className="space-y-1.5">
+              <Label>Reason / narration</Label>
+              <Input
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="Optional"
+              />
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onCancel}>
