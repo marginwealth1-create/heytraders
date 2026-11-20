@@ -115,6 +115,8 @@ TARGET_SETTINGS = {
         "marginCalcMode": "fixed",
         "intradayMargin": 25000.0,
         "overnightMargin": 25000.0,
+        "minLots": 1.0,
+        "orderLots": 1.0,
     },
 }
 

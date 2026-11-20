@@ -197,13 +197,14 @@ export function OrderPanel({ instrument, ltp, bid, ask, open, high, low, close, 
   //     keep the server-resolved minimum so the form opens with a valid
   //     fractional default (e.g. crypto 0.001, forex 0.01).
   const exchUpper = String(instrument?.exchange ?? "").toUpperCase();
+  const isFixedMode = String(effSettings?.margin_calc_mode || "").toLowerCase() === "fixed";
   const isIndianExchange =
     exchUpper === "NSE" ||
     exchUpper === "BSE" ||
     exchUpper === "MCX" ||
     exchUpper === "NFO" ||
     exchUpper === "BFO";
-  const defaultLot = isIndianExchange ? Math.max(1, minLot) : minLot;
+  const defaultLot = isIndianExchange || isFixedMode ? Math.max(1, minLot) : minLot;
 
   // Reset lot + product when instrument changes OR when we get a fresh
   // server-resolved minimum (so a crypto market correctly starts at 0.001

@@ -293,7 +293,8 @@ function TradeDetailSheetInner({ token, open, onClose, onSwap, initialSide, seed
   // forex / crypto fall back to the fractional segment minimum.
   const isIndianExchange =
     exch === "NSE" || exch === "BSE" || exch === "MCX" || exch === "NFO" || exch === "BFO";
-  const defaultLot = isIndianExchange ? Math.max(1, minLot) : minLot;
+  const isFixedMode = String(effSettings?.margin_calc_mode || "").toLowerCase() === "fixed";
+  const defaultLot = isIndianExchange || isFixedMode ? Math.max(1, minLot) : minLot;
 
   useEffect(() => {
     if (!open) return;
