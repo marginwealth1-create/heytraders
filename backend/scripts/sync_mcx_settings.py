@@ -5,7 +5,11 @@ Aligns MCX FUT margin to 500x Times and brokerage to 150/Crore to match MarginWe
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+
+# Ensure backend root is on sys.path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core.database import close_database, init_database
 from app.models.netting import NettingSegment, NettingScriptOverride, UserSegmentOverride
