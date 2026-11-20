@@ -415,18 +415,19 @@ async def settle_expired_position(
     token = pos.instrument.token
 
     # ── Resolve a non-zero settlement price ──────────────────────────
+    # A price, not a money amount: forex / metals quote past 2 dp.
     settle = (
-        quantize_money(to_decimal(settlement_price))
+        quantize_basis(to_decimal(settlement_price))
         if settlement_price is not None
         else ZERO
     )
     if settle <= ZERO:
         try:
-            settle = quantize_money(to_decimal(await market_data_service.get_ltp(token)))
+            settle = quantize_basis(to_decimal(await market_data_service.get_ltp(token)))
         except Exception:  # noqa: BLE001
             settle = ZERO
     if settle <= ZERO:
-        settle = quantize_money(to_decimal(pos.ltp))
+        settle = quantize_basis(to_decimal(pos.ltp))
     if settle <= ZERO:
         # No usable price anywhere — never settle at 0. Leave OPEN so a
         # later run (with an admin-supplied price) can settle it.

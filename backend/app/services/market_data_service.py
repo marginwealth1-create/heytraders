@@ -25,7 +25,7 @@ from typing import Any
 
 from app.core.redis_client import cache_get, cache_set, publish, publish_batch
 from app.models.instrument import Instrument  # noqa: F401 — kept for downstream imports
-from app.utils.decimal_utils import quantize_money, to_decimal
+from app.utils.decimal_utils import quantize_basis, quantize_money, to_decimal
 
 logger = logging.getLogger(__name__)
 
@@ -1046,7 +1046,7 @@ async def get_ltp_batch_mdlive(tokens: list[str]) -> dict[str, Decimal | None]:
         try:
             ltp = float(json.loads(val).get("ltp") or 0)
             if ltp > 0:
-                out[t] = quantize_money(to_decimal(ltp))
+                out[t] = quantize_basis(to_decimal(ltp))
         except Exception:
             continue
     return out
@@ -1113,7 +1113,7 @@ async def get_ltp_quote_batch_mdlive(
             ltp = float(data.get("ltp") or 0)
             if ltp > 0:
                 quote_out[t] = data
-                ltp_out[t] = quantize_money(to_decimal(ltp))
+                ltp_out[t] = quantize_basis(to_decimal(ltp))
         except Exception:
             continue
     return ltp_out, quote_out
@@ -1270,8 +1270,10 @@ async def get_quote(token: str) -> dict[str, Any]:
 
 
 async def get_ltp(token: str) -> Decimal:
+    # A price, not a money amount: 2 dp booked a GBPUSD BUY seen at 1.31152
+    # at 1.3100 (20 Nov). Indian feeds quote 2 dp anyway.
     q = await get_quote(token)
-    return quantize_money(to_decimal(q["ltp"]))
+    return quantize_basis(to_decimal(q["ltp"]))
 
 
 async def get_display_ltp(token: str) -> Decimal:

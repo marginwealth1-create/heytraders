@@ -35,7 +35,7 @@ from app.services import (
 from app.services.order_validator import bracket_direction_error
 from app.services.zerodha_service import zerodha
 from app.utils.background import fire_and_forget
-from app.utils.decimal_utils import quantize_money, to_decimal
+from app.utils.decimal_utils import quantize_basis, quantize_money, to_decimal
 from app.utils.time_utils import epoch, now_utc
 
 logger = logging.getLogger(__name__)
@@ -268,7 +268,7 @@ async def execute_market_order(
         fill_price = live_side
     # else: keep ltp fallback
 
-    fill_price = quantize_money(fill_price)
+    fill_price = quantize_basis(fill_price)  # a price keeps the feed's decimals (GBPUSD 1.31152)
 
     # ── Sanity guard: NEVER fill at zero / negative ──────────────────
     # If the upstream feed is down (Zerodha WS dropped + REST timing
@@ -396,7 +396,7 @@ async def execute_market_order(
             else:
                 # Floating with a wide-enough live book: keep the real side.
                 spread_side = ask if order.action == OrderAction.BUY else bid
-            spread_side = quantize_money(spread_side)
+            spread_side = quantize_basis(spread_side)
             # Safety cap: a mis-keyed spread (e.g. a fat-finger 50000) must
             # NEVER book a wildly off-market fill — that is exactly how the
             # GOLD ₹1.38 cr phantom profit happened. Beyond 20 % of LTP,

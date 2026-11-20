@@ -327,10 +327,10 @@ async def test_the_trade_book_and_pnl_pdfs_keep_fractions_and_precision(w):
     got = [tuple(r[head.index(h)] for h in ("Symbol", "Qty", "Price", "Value")) for r in rows]
     assert got == [
         ("M&M", "1,500", "200.00", "₹300,000.00"),
-        ("EURUSD", "0.05", "$1.08", "$0.05"),  # Qty printed 0
+        ("EURUSD", "0.05", "$1.08345", "$0.05"),  # Qty printed 0; the fill keeps its 5 dp
         ("BTCUSD", "0.25", "$61,000.00", "$15,250.00"),  # a dollar notional printed ₹15,250.00
     ]
-    # The engine fills at 2 dp today; a finer price prints in full.
+    # A finer price prints in full.
     assert report_pdf_service._fmt_rate("1.08345", "CRYPTO") == "1.08345"
     assert report_pdf_service._fmt_rate(1.0834512, "CDS") == "1.083451"
     assert report_pdf_service._fmt_rate(24500, "NFO") == "24,500.00"
