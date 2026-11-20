@@ -46,7 +46,7 @@ async def test_is_market_open_now_nse():
     dt_sun = datetime(2026, 10, 25, 11, 0, 0, tzinfo=IST)
     is_open, msg, _ = await is_market_open_now("NSE", "NSE_EQUITY", at=dt_sun)
     assert is_open is False
-    assert "Sunday" in msg
+    assert "weekend" in msg.lower() or "sunday" in msg.lower()
 
 
 @pytest.mark.asyncio

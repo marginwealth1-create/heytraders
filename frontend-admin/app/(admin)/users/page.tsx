@@ -1,7 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { Suspense, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { Plus, Search, TrendingDown, TrendingUp } from "lucide-react";
 import { UsersAPI } from "@/lib/api";
@@ -41,21 +42,49 @@ type LiveStat = {
 };
 
 export default function AdminUsersPage() {
+  // useSearchParams must sit inside Suspense for the static prerender.
+  return (
+    <Suspense fallback={null}>
+      <AdminUsersInner />
+    </Suspense>
+  );
+}
+
+function AdminUsersInner() {
   const me = useAdminAuthStore((s) => s.admin);
   const [q, setQ] = useState("");
   const [status, setStatus] = useState<string>("");
-  const [mode, setMode] = useState<"live" | "demo">("live");
-  const [page, setPage] = useState(1);
+  // active = traded in the last 7 days; sort by balance or this week's P&L.
+  const [activity, setActivity] = useState<string>("");
+  const [sort, setSort] = useState<string>("");
+  // Live / Demo tab and page live in the URL, so Back from a user's
+  // profile lands on the tab and page the admin left.
+  const router = useRouter();
+  const sp = useSearchParams();
+  const mode: "live" | "demo" = sp?.get("mode") === "demo" ? "demo" : "live";
+  const page = Math.max(1, Number(sp?.get("page")) || 1);
+  function show(nextMode: "live" | "demo", nextPage: number) {
+    const p = new URLSearchParams();
+    if (nextMode === "demo") p.set("mode", "demo");
+    if (nextPage > 1) p.set("page", String(nextPage));
+    const qs = p.toString();
+    router.replace(qs ? `/users?${qs}` : "/users", { scroll: false });
+  }
+  const setPage = (n: number) => {
+    if (n !== page) show(mode, n);
+  };
   const [ledgerUser, setLedgerUser] = useState<any | null>(null);
   const [statsUser, setStatsUser] = useState<any | null>(null);
   const pageSize = 20;
 
   const { data, isFetching } = useQuery({
-    queryKey: ["admin", "users", { q, status, mode, page, pageSize }],
+    queryKey: ["admin", "users", { q, status, activity, sort, mode, page, pageSize }],
     queryFn: () =>
       UsersAPI.list({
         q: q || undefined,
         status: status || undefined,
+        activity: activity || undefined,
+        sort: sort || undefined,
         mode,
         page,
         page_size: pageSize,
@@ -230,10 +259,27 @@ export default function AdminUsersPage() {
         return (
           <span
             className={`text-sm font-semibold tabular-nums ${up ? "text-emerald-500" : "text-destructive"}`}
-            title="Realised P&L booked this week (Mon → now)"
+            title="Billing statement Net P&L this week (Mon → now, IST), net of brokerage"
           >
             {up ? "+" : "−"}₹
             {Math.abs(v).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </span>
+        );
+      },
+    },
+    {
+      key: "settlement",
+      header: "Settlement",
+      align: "right",
+      render: (r) => {
+        const v = Number(r.wallet?.settlement_outstanding ?? 0);
+        if (v <= 0) return <span className="text-sm text-muted-foreground">—</span>;
+        return (
+          <span
+            className="text-sm font-semibold tabular-nums text-destructive"
+            title="Loss the wallet couldn't cover (went below ₹0) — settlement outstanding"
+          >
+            ₹{v.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </span>
         );
       },
@@ -271,7 +317,7 @@ export default function AdminUsersPage() {
       {/* Live / Demo mode toggle */}
       <div className="inline-flex rounded-lg border border-border bg-muted/40 p-1">
         <button
-          onClick={() => { setMode("live"); setPage(1); }}
+          onClick={() => show("live", 1)}
           className={`rounded-md px-4 py-1.5 text-xs font-semibold transition-colors ${
             !isDemo
               ? "bg-background shadow text-foreground"
@@ -281,7 +327,7 @@ export default function AdminUsersPage() {
           Live
         </button>
         <button
-          onClick={() => { setMode("demo"); setPage(1); }}
+          onClick={() => show("demo", 1)}
           className={`rounded-md px-4 py-1.5 text-xs font-semibold transition-colors ${
             isDemo
               ? "bg-amber-500/20 shadow text-amber-500"
@@ -325,6 +371,34 @@ export default function AdminUsersPage() {
           <option value="PENDING">Pending</option>
           <option value="BLOCKED">Blocked</option>
           <option value="CLOSED">Closed</option>
+        </select>
+        <select
+          value={activity}
+          onChange={(e) => {
+            setPage(1);
+            setActivity(e.target.value);
+          }}
+          className="h-10 rounded-md border border-border bg-background px-3 text-sm"
+          aria-label="Trading activity"
+        >
+          <option value="">Active + inactive</option>
+          <option value="active">Active (traded in 7 days)</option>
+          <option value="inactive">Inactive (no trade in 7 days)</option>
+        </select>
+        <select
+          value={sort}
+          onChange={(e) => {
+            setPage(1);
+            setSort(e.target.value);
+          }}
+          className="h-10 rounded-md border border-border bg-background px-3 text-sm"
+          aria-label="Sort users"
+        >
+          <option value="">Newest first</option>
+          <option value="funds_desc">Funds: high to low</option>
+          <option value="funds_asc">Funds: low to high</option>
+          <option value="pnl_desc">Weekly P&amp;L: high to low</option>
+          <option value="pnl_asc">Weekly P&amp;L: low to high</option>
         </select>
         {!isDemo && <LiveBadge fetching={liveStatsQuery.isFetching} />}
       </div>
@@ -373,10 +447,10 @@ export default function AdminUsersPage() {
           <span>
             Page {page} of {totalPages}
           </span>
-          <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
+          <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(page - 1)}>
             Prev
           </Button>
-          <Button variant="outline" size="sm" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>
+          <Button variant="outline" size="sm" disabled={page >= totalPages} onClick={() => setPage(page + 1)}>
             Next
           </Button>
         </div>
@@ -537,6 +611,7 @@ function UserMobileCard({
   onStats: () => void;
 }) {
   const weeklyPnl = Number(r.wallet?.weekly_closed_pnl ?? 0);
+  const settlementDue = Number(r.wallet?.settlement_outstanding ?? 0);
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-gradient-to-br from-card to-card/60 p-3 shadow-sm transition-shadow hover:shadow-md">
@@ -600,6 +675,21 @@ function UserMobileCard({
           <span className="font-semibold tabular-nums">
             {weeklyPnl > 0 ? "+" : "−"}₹
             {Math.abs(weeklyPnl).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </span>
+        </div>
+      )}
+
+      {/* Loss / charges the wallet couldn't cover when they were booked —
+          outside Balance and Weekly P&L (informational; not auto-recovered
+          from deposits). */}
+      {settlementDue > 0 && (
+        <div
+          className="mt-1.5 flex items-center justify-between rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-600 dark:text-amber-400"
+          title="Loss or charges the wallet couldn't cover at the time (settlement outstanding)"
+        >
+          <span>Settlement due</span>
+          <span className="font-semibold tabular-nums">
+            ₹{settlementDue.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </span>
         </div>
       )}

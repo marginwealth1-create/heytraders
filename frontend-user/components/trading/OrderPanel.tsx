@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { cn, formatINR } from "@/lib/utils";
 import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 import { playBuyTone, playSellTone } from "@/lib/trade-audio";
-import { isInstrumentMarketOpen, marketLabel, getMarketHoursInfo, useMarketHours } from "@/lib/marketHours";
+import { getMarketClosedMessage, isInstrumentMarketOpen } from "@/lib/marketHours";
 
 interface Props {
   instrument: any;
@@ -500,6 +500,23 @@ export function OrderPanel({ instrument, ltp, bid, ask, open, high, low, close, 
       toast.error("Instrument not loaded — try selecting it again");
       return;
     }
+    // ── Market-closed pre-check (runs FIRST so clicking Buy/Sell outside
+    //    configured hours always alerts the user that the market is closed) ──
+    if (
+      !isInstrumentMarketOpen(
+        instrument.segment as string | undefined,
+        instrument.exchange as string | undefined,
+      )
+    ) {
+      toast.error(
+        getMarketClosedMessage(
+          instrument.segment as string | undefined,
+          instrument.exchange as string | undefined,
+        ),
+        { duration: 5000 },
+      );
+      return;
+    }
     // ── No live quote on this side ─────────────────────────────────────
     // Block the order outright when there's no real bid (for SELL) or ask
     // (for BUY). Otherwise an illiquid option / dead feed would let the
@@ -680,27 +697,17 @@ export function OrderPanel({ instrument, ltp, bid, ask, open, high, low, close, 
     }
 
     // ── Market-closed pre-check ───────────────────────────────────────
-    // The backend's order_validator raises MarketClosedError when the
-    // instrument's segment is outside its trading window (NSE/BSE 9:15-
-    // 15:30 IST, MCX 9:00-23:30 IST, Forex 24/5, Crypto 24/7, etc.). The
-    // backend toast says "Market is closed. Place AMO instead." but it
-    // only fires AFTER the round-trip — by then the optimistic insert
-    // below has already shown the position row in the Positions tab. The
-    // user sees the trade appear, then disappear with an error toast.
-    // Pre-check here against the same hours the backend uses so the
-    // order never leaves the panel and the positions table stays clean.
     if (
       !isInstrumentMarketOpen(
         instrument.segment as string | undefined,
         instrument.exchange as string | undefined,
       )
     ) {
-      const hInfo = getMarketHoursInfo(
-        instrument.segment as string | undefined,
-        instrument.exchange as string | undefined,
-      );
       toast.error(
-        `${hInfo.name} market is closed (Trading hours: ${hInfo.startTime} – ${hInfo.endTime} IST). Try placing an AMO instead.`,
+        getMarketClosedMessage(
+          instrument.segment as string | undefined,
+          instrument.exchange as string | undefined,
+        ),
         { duration: 5000 },
       );
       return;
@@ -1266,16 +1273,16 @@ export function OrderPanel({ instrument, ltp, bid, ask, open, high, low, close, 
             </span>
           </div>
           {/* Intraday vs this order's overnight (Carry Fwd) margin, side by
-              side. Carry Fwd only for segments with a daily settlement
-              (NSE / BSE cash + F&O, MCX) — Infoway-fed segments (Forex,
-              Stocks, Indices, Commodities, Crypto) have no overnight tier;
+              side. Carry Fwd only for segments with a daily rollover
+              (NSE / BSE cash + F&O, MCX, Forex at 03:30 IST) — Stocks,
+              Indices, Commodities and Crypto have no overnight tier;
               mirrors the backend's INTRADAY_ONLY_ADMIN_ROWS. */}
           <div className="grid grid-cols-2 gap-1.5 py-0.5">
             <div className="rounded border border-border bg-background/40 px-2 py-1">
               <div className="text-[10px] text-muted-foreground">Intraday</div>
               <div className="font-tabular font-semibold">{formatINR(intradayMargin)}</div>
             </div>
-            {!["FOREX", "STOCKS", "INDICES", "COMMODITIES", "CRYPTO"].some((s) => seg.includes(s)) && (
+            {!["STOCKS", "INDICES", "COMMODITIES", "CRYPTO"].some((s) => seg.includes(s)) && (
               <div className="rounded border border-border bg-background/40 px-2 py-1">
                 <div className="text-[10px] text-muted-foreground">Carry Fwd</div>
                 <div className="font-tabular font-semibold">{formatINR(carryforwardMargin)}</div>
@@ -1376,7 +1383,16 @@ export function OrderPanel({ instrument, ltp, bid, ask, open, high, low, close, 
           variant={side === "BUY" ? "buy" : "sell"}
           className="h-11 w-full text-sm font-semibold"
           loading={submitting}
-          disabled={sidePriceMissing || circBlockedNow || entryInsideRange || pendingBlocked}
+          disabled={
+            (sidePriceMissing &&
+              isInstrumentMarketOpen(
+                instrument?.segment as string | undefined,
+                instrument?.exchange as string | undefined,
+              )) ||
+            circBlockedNow ||
+            entryInsideRange ||
+            pendingBlocked
+          }
           onClick={submit}
         >
           {side} {fmtLots(lots)} {isCrypto || isForex ? "lots" : `lot${lots === 1 ? "" : "s"}`}

@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import io
 import os
+from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors as rl_colors
 from reportlab.lib.pagesizes import A4
@@ -25,12 +28,16 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.fonts import addMapping
 from reportlab.platypus import (
+    CondPageBreak,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
     Table,
     TableStyle,
 )
+
+from app.utils.decimal_utils import quantize_basis, quantize_money
+from app.utils.time_utils import now_ist, to_ist
 
 BRAND = rl_colors.HexColor("#3B5BDB")  # MarginWealth brand blue
 BRAND_SOFT = rl_colors.HexColor("#EEF2FF")
@@ -136,6 +143,13 @@ def _rupee() -> str:
     return "₹" if _HAS_RUPEE else "Rs. "
 
 
+def _text(v: Any) -> str:
+    """Data as Paragraph text. ReportLab parses it as mini-XML: an "&" in a
+    scrip ("M&M") printed "M&M;", a "<" in a client's name 500'd the PDF (or
+    made it fetch an <img> URL). A ₹ in it goes through _rupee() too."""
+    return escape(str(v)).replace("₹", _rupee())
+
+
 def _num(v: Any) -> float:
     """Parse a payload number that may ALREADY be a display-formatted string.
 
@@ -159,22 +173,87 @@ def _num(v: Any) -> float:
         return 0.0
 
 
+# Forex and crypto quote to 5–6 places; Indian markets to the paisa.
+_FINE_RATE = frozenset({"CDS", "CRYPTO"})
+_UNIT_STEP = Decimal("0.00000001")
+
+
+@dataclass(frozen=True)
+class Num:
+    """A number in a printed table, held at exactly the precision the PDF
+    prints it, so the PDF's text and the workbook's cell are one value.
+    kind: "amt" 2 dp | "inr" 2 dp with ₹ | "rate" 2 dp | "fine" 2–6 dp
+    (CDS / CRYPTO) | "qty" units, fractions kept. `usd`: a USD-quoted rate
+    or notional says so — the P&L and charges beside it are rupees, so
+    61,000 → 60,000 on 0.25 BTC beside a Gross of 24,250 read as broken."""
+
+    value: Decimal
+    kind: str = "amt"
+    usd: bool = False
+
+    def __str__(self) -> str:
+        if self.kind == "qty":
+            return f"{self.value:,.8f}".rstrip("0").rstrip(".")
+        text = f"{self.value:,.{6 if self.kind == 'fine' else 2}f}"
+        if self.kind == "fine":  # trailing zeros trimmed back to 2 dp
+            whole, frac = text.split(".")
+            text = f"{whole}.{frac.rstrip('0').ljust(2, '0')}"
+        if self.usd:
+            return f"${text}"
+        return f"{_rupee()}{text}" if self.kind == "inr" else text
+
+
+def _dec(v: Any) -> Decimal:
+    """The float the PDF always formatted, exactly (Decimal(float), not its
+    repr): rounded at the printed precision it reads as the f-string read it,
+    so a re-downloaded statement prints what was sent. A half-paisa average
+    rounds as its float lies: 115.325 printed 115.33, 2.675 printed 2.67."""
+    return Decimal(_num(v))
+
+
+def _amt(v: Any, kind: str = "amt", usd: Any = False) -> Num:
+    return Num(quantize_money(_dec(v)), kind, bool(usd))
+
+
+def _rate(v: Any, exchange: Any = "", usd: Any = False) -> Num | str:
+    """A price at its market's precision: 2 dp, or up to 6 for CDS / CRYPTO
+    (EURUSD 1.08345 printed 1.08)."""
+    if v is None or v == "":
+        return ""
+    fine = str(exchange) in _FINE_RATE
+    d = _dec(v)
+    return Num(quantize_basis(d) if fine else quantize_money(d), "fine" if fine else "rate", bool(usd))
+
+
+def _qty(v: Any) -> Num | str:
+    """Units, fractions kept: a 0.05 BTC fill printed 0."""
+    if v is None or v == "":
+        return "—"
+    return Num(_dec(v).quantize(_UNIT_STEP), "qty")
+
+
+def _total(cells: Any) -> Num:
+    """Printed amounts summed exactly, so a Totals line is its rows' sum."""
+    return Num(sum((c.value for c in cells), Decimal(0)))
+
+
 def _fmt_money(v: float | int | str | None) -> str:
-    return f"{_rupee()}{_num(v):,.2f}"
+    return str(_amt(v, "inr"))
 
 
 def _fmt_qty(v: Any) -> str:
-    try:
-        return f"{int(v):,}"
-    except (TypeError, ValueError):
-        return str(v or "—")
+    return str(_qty(v))
+
+
+def _fmt_rate(v: Any, exchange: Any = "") -> str:
+    return str(_rate(v, exchange))
 
 
 def _fmt_date(v: Any) -> str:
     if v is None:
         return "—"
     if isinstance(v, datetime):
-        return v.strftime("%d %b %Y, %H:%M")
+        return to_ist(v).strftime("%d %b %Y, %H:%M")
     return str(v)
 
 
@@ -252,8 +331,8 @@ def _header(title: str, subtitle: str, user_label: str, styles: dict) -> list:
     return [
         band,
         Spacer(1, 8),
-        Paragraph(title, styles["title"]),
-        Paragraph(subtitle, styles["subtitle"]),
+        Paragraph(_text(title), styles["title"]),
+        Paragraph(_text(subtitle), styles["subtitle"]),
         Spacer(1, 6),
     ]
 
@@ -288,7 +367,7 @@ def _table(rows: list[list[Any]], col_widths: list[float]) -> Table:
     def cell(value: Any, header: bool) -> Any:
         if isinstance(value, Paragraph):
             return value
-        return Paragraph(str(value), head_style if header else body_style)
+        return Paragraph(_text(value), head_style if header else body_style)
 
     wrapped: list[list[Any]] = []
     for i, r in enumerate(rows):
@@ -327,8 +406,8 @@ def _summary_grid(items: list[tuple[str, str]], styles: dict) -> Table:
     bold = _FONT_BOLD
     for label, value in items:
         cell = Paragraph(
-            f"<font color='#64748B' size='8'>{label.upper()}</font><br/>"
-            f"<font name='{bold}' color='#0F172A' size='13'>{value}</font>",
+            f"<font color='#64748B' size='8'>{_text(label.upper())}</font><br/>"
+            f"<font name='{bold}' color='#0F172A' size='13'>{_text(value)}</font>",
             styles["value"],
         )
         row.append(cell)
@@ -371,13 +450,209 @@ def _doc() -> tuple[SimpleDocTemplate, io.BytesIO]:
 
 
 def _user_label(user) -> str:
-    code = getattr(user, "user_code", None) or ""
-    name = getattr(user, "full_name", None) or ""
+    code = _text(getattr(user, "user_code", None) or "")
+    name = _text(getattr(user, "full_name", None) or "")
     return f"{name}<br/><font size='9'>{code}</font>" if code or name else "Trader"
 
 
 def _footer_text() -> str:
-    return f"Generated by MarginWealth on {datetime.now().strftime('%d %b %Y, %H:%M IST')}"
+    return f"Generated by MarginWealth on {now_ist().strftime('%d %b %Y, %H:%M IST')}"
+
+
+# ── The two documents' printed tables (PDF and workbook read these) ──
+
+
+@dataclass
+class Section:
+    """One printed table: the PDF draws it, the workbook writes it."""
+
+    title: str
+    headers: list[str]
+    weights: list[float]  # the PDF's column widths, relative (mm for the Trade Book)
+    rows: list[list[Any]]
+    totals: list[Any] | None = None
+    empty: str = "None."
+    card: bool = False  # Financial Standings: label / value cards in the PDF
+
+
+_EXCHANGE_ORDER = ("NSE", "BSE", "MCX", "CDS", "CRYPTO")
+_TRADES_HEAD = [
+    "Ticket Id", "Script", "Qty", "Buy Rate", "Sell Rate", "Buy Time", "Sell Time",
+    "Brokerage", "Gross PL", "Net PL", "Comment",
+]  # fmt: skip
+_FINANCIAL = (
+    ("Balance", "balance"), ("Gross PnL", "gross_pnl"), ("Brokerage", "brokerage"), ("Net PnL", "net_pnl"),
+)  # fmt: skip
+
+
+def trade_book_section(rows: list[dict[str, Any]]) -> Section:
+    """The Trade Book's table: one row per fill, newest first, as
+    tradebook_builder.trade_rows lists them (settlement legs included)."""
+    return Section(
+        "Trade Book",
+        ["Date", "Trade #", "Symbol", "Side", "Qty", "Price", "Value", "Charges"],
+        # mm, 180 in all: the frame's width (an IST date and time needs the room).
+        [32, 22, 26, 14, 16, 22, 26, 22],
+        [
+            [
+                _fmt_date(r.get("executed_at")),
+                r.get("trade_number") or "—",
+                r.get("symbol") or "—",
+                (r.get("action") or "").upper(),
+                _qty(r.get("quantity")),
+                _rate(r.get("price"), r.get("exchange"), r.get("usd")),
+                _amt(r.get("value"), "inr", r.get("usd")),  # a notional in its own currency
+                _amt(r.get("total_charges"), "inr"),
+            ]
+            for r in rows
+        ],
+    )
+
+
+def billing_sections(payload: dict[str, Any]) -> list[Section]:
+    """The Billing statement's tables (tradebook_builder.statement_payload),
+    in the operator's order (handoff §4.1): Brought Forward → Funds
+    Transactions (→ Reversals and Adjustments) → one Trades List per
+    exchange → Script-wise P&L → Carry Forward → All Segments → Financial
+    Standings. Nothing here is a live price; every Totals line is the sum of
+    the rows printed above it."""
+    out = [
+        Section(
+            "Brought Forward",
+            ["Ticket Id", "Open Time", "Script", "Side", "Qty", "Price"],
+            [7, 10, 12, 5, 6, 8],
+            [
+                [d["ticket_id"], d["time"], d["script"], d["side"], _qty(d["qty"]),
+                 _rate(d["price"], d["exchange"], d.get("usd"))]
+                for d in payload.get("brought_forward", [])
+            ],  # fmt: skip
+            empty="Nothing brought forward.",
+        )
+    ]
+
+    # Funds, opening on the ledger's balance.
+    funds = payload.get("funds", {})
+    money = [(m, _amt(m["amount"])) for m in funds.get("rows", [])]
+    out.append(
+        Section(
+            "Funds Transactions",
+            ["Time", "Type", "Amount", "Comment"],
+            [10, 8, 8, 24],
+            [["", "Opening Balance", _amt(funds.get("opening_balance")), ""]]
+            + [[m["time"], m["type"], a, m["comment"]] for m, a in money],
+            ["", "Net Funds", _total(a for _, a in money), ""],
+        )
+    )
+    # What moved the account that is neither Funds nor Net PnL: an undo's
+    # reversal, a since-undone fill's P&L and charges. Opening + Net Funds +
+    # Net PnL + Net Adjustments is the Balance.
+    adjusted = [(m, _amt(m["amount"])) for m in payload.get("adjustments", [])]
+    if adjusted:
+        out.append(
+            Section(
+                "Reversals and Adjustments",
+                ["Time", "Type", "Amount", "Comment"],
+                [10, 8, 8, 24],
+                [[m["time"], m["type"], a, m["comment"]] for m, a in adjusted],
+                ["", "Net Adjustments", _total(a for _, a in adjusted), ""],
+            )
+        )
+
+    # One Trades List per exchange; both legs on one line.
+    closed = payload.get("closed_transactions", [])
+    exchanges = sorted(
+        {r["exchange"] for r in closed},
+        key=lambda e: (_EXCHANGE_ORDER.index(e) if e in _EXCHANGE_ORDER else len(_EXCHANGE_ORDER), e),
+    )
+    segments: list[list[Any]] = []
+    for ex in exchanges:
+        rows = [
+            [r["ticket_id"], r["script"], _qty(r["qty"]),
+             _rate(r["buy_rate"], ex, r.get("usd")), _rate(r["sell_rate"], ex, r.get("usd")),
+             r["buy_time"], r["sell_time"],
+             _amt(r["brokerage"]), _amt(r["gross_pnl"]), _amt(r["net_pnl"]), r["comment"]]
+            for r in closed
+            if r["exchange"] == ex
+        ]  # fmt: skip
+        brk, gross = _total(r[7] for r in rows), _total(r[8] for r in rows)
+        net = Num(gross.value - brk.value)
+        segments.append([ex, brk, gross, net])
+        out.append(
+            Section(
+                f"{ex} Trades List",
+                _TRADES_HEAD,
+                [6, 11, 5, 7, 7, 10, 10, 6, 7, 7, 8],
+                rows,
+                ["", "Totals", "", "", "", "", "", brk, gross, net, ""],
+            )
+        )
+    if not exchanges:
+        out.append(Section("Trades List", [], [], [], empty="No closed trades in this period."))
+
+    sw = [
+        [s["exchange"], s["script"], _qty(s["qty"]),
+         _rate(s["avg_buy"], s["exchange"], s.get("usd")), _rate(s["avg_sell"], s["exchange"], s.get("usd")),
+         _amt(s["buy_turnover"], usd=s.get("usd")), _amt(s["sell_turnover"], usd=s.get("usd")),
+         s["first_time"], s["last_time"],
+         _amt(s["brokerage"]), _amt(s["gross_pnl"]), _amt(s["net_pnl"])]
+        for s in payload.get("script_wise", [])
+    ]  # fmt: skip
+    out.append(
+        Section(
+            "Script-wise P&L",
+            ["Exchange", "Script", "Qty", "Avg Buy", "Avg Sell", "Buy Turnover", "Sell Turnover",
+             "First Trade", "Last Trade", "Brokerage", "Gross PL", "Net PL"],  # fmt: skip
+            [5, 10, 5, 7, 7, 8, 8, 10, 10, 6, 7, 7],
+            sw,
+            ["", "Totals", "", "", "", "", "", "", "", *(_total(r[i] for r in sw) for i in (9, 10, 11))],
+            empty="No closed trades in this period.",
+        )
+    )
+
+    # Carry Forward: what the period hands on.
+    cf = [
+        [d["ticket_id"], d["time"], d["script"], d["side"], _qty(d["qty"]),
+         _rate(d["price"], d["exchange"], d.get("usd")), _amt(d["commission"]),
+         _amt(d["value"], usd=d.get("usd"))]
+        for d in payload.get("carry_forward", [])
+    ]  # fmt: skip
+    cf_com = _total(r[6] for r in cf)
+    out.append(
+        Section(
+            "Carry Forward",
+            ["Ticket Id", "Open Time", "Script", "Side", "Qty", "Price", "Commission", "Value"],
+            [7, 10, 12, 5, 6, 8, 7, 9],
+            cf,
+            ["", "", "Totals", "", "", "", cf_com, ""],
+            empty="Nothing carried forward.",
+        )
+    )
+
+    # All Segments: the one overall figure, back together. The carried
+    # positions' opening charges are the period's too.
+    if cf_com.value:
+        segments.append(["Carry Forward", cf_com, Num(Decimal(0)), Num(-cf_com.value)])
+    out.append(
+        Section(
+            "All Segments",
+            ["Segment", "Brokerage", "Gross PL", "Net PL"],
+            [10, 8, 8, 8],
+            segments,
+            ["All Segments", *(_total(r[i] for r in segments) for i in (1, 2, 3))],
+        )
+    )
+
+    fin = payload.get("financial", {})
+    out.append(
+        Section(
+            "Financial Standings",
+            [label for label, _ in _FINANCIAL],
+            [1, 1, 1, 1],
+            [[_amt(fin.get(key, 0), "inr") for _, key in _FINANCIAL]],
+            card=True,
+        )
+    )
+    return out
 
 
 # ── Builders ──────────────────────────────────────────────────────────
@@ -434,11 +709,11 @@ def build_pnl_pdf(user, payload: dict) -> bytes:
                     f"{('+' if pnl >= 0 else '')}{_fmt_money(pnl)}",
                 ],
             )
-        # Trimmed column widths — 28+22+22+28+28+24+28 = 180mm fit the
-        # 180mm content area exactly. With the wider 8pt + wrapping font
-        # set in `_table()`, money columns now have room for ₹1,23,45,678.
+        # 28+20+20+30+30+24+28 = 180mm, the content area exactly (it summed
+        # to 168). With the 8pt wrapping font set in `_table()`, money
+        # columns have room for ₹1,23,45,678.
         elems.append(
-            _table(rows, [26 * mm, 18 * mm, 18 * mm, 28 * mm, 28 * mm, 22 * mm, 28 * mm]),
+            _table(rows, [28 * mm, 20 * mm, 20 * mm, 30 * mm, 30 * mm, 24 * mm, 28 * mm]),
         )
 
     elems.append(Spacer(1, 14))
@@ -451,34 +726,13 @@ def build_tradebook_pdf(user, rows: list[dict]) -> bytes:
     styles = _styles()
     doc, buf = _doc()
     elems = _header(
-        "Tradebook",
+        "Trade Book",
         f"{len(rows)} trades",
         _user_label(user),
         styles,
     )
-    body: list[list[Any]] = [
-        ["Date", "Trade #", "Symbol", "Side", "Qty", "Price", "Value", "Charges"],
-    ]
-    for r in rows:
-        side = (r.get("action") or "").upper()
-        body.append(
-            [
-                _fmt_date(r.get("executed_at")),
-                r.get("trade_number") or "—",
-                r.get("symbol") or "—",
-                side,
-                _fmt_qty(r.get("quantity")),
-                _fmt_money(r.get("price")),
-                _fmt_money(r.get("value")),
-                _fmt_money(r.get("total_charges")),
-            ],
-        )
-    elems.append(
-        _table(
-            body,
-            [28 * mm, 22 * mm, 24 * mm, 14 * mm, 16 * mm, 22 * mm, 26 * mm, 22 * mm],
-        ),
-    )
+    t = trade_book_section(rows)
+    elems.append(_table([t.headers, *t.rows], [w * mm for w in t.weights]))
     elems.append(Spacer(1, 14))
     elems.append(Paragraph(_footer_text(), styles["footer"]))
     doc.build(elems)
@@ -539,11 +793,10 @@ def build_tax_pdf(user, payload: dict) -> bytes:
 
 
 def build_full_tradebook_pdf(user, payload: dict) -> bytes:
-    """ARK Trader-style comprehensive tradebook PDF (landscape A4).
-
-    Sections: Branded Header → Closed Transactions → Money Totals →
-    Opened Deals → Pending Orders → Financial Standings.
-    """
+    """The Billing statement (landscape A4), in the operator's order (handoff
+    §4.1): Brought Forward → Funds Transactions → one Trades List per exchange
+    → Script-wise P&L → Carry Forward → All Segments → Financial Standings.
+    Rates print at their market's precision, units with their fractions."""
     from reportlab.lib.pagesizes import landscape
 
     ACCENT = BRAND
@@ -558,7 +811,7 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
         buf, pagesize=landscape(A4),
         leftMargin=10 * mm, rightMargin=10 * mm,
         topMargin=12 * mm, bottomMargin=12 * mm,
-        title="Trade Book",
+        title="Billing Statement",
     )
     page_w = landscape(A4)[0] - 20 * mm
 
@@ -566,22 +819,20 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
     uname = getattr(user, "full_name", None) or ""
     account_label = f"{code}: {uname}" if code and uname else code or uname or "Trader"
 
-    admin_brand = payload.get("admin_brand_name", "") or ""
     rng_from = payload.get("from_label", "Beginning")
     rng_to = payload.get("to_label", "Now")
-    generated_at = payload.get("generated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    total_brokerage = _num(payload.get("total_brokerage", 0))
+    generated_at = payload.get("generated_at", now_ist().strftime("%Y-%m-%d %H:%M:%S"))
 
     # ── Branded header ─────────────────────────────────────────────
-    brand_name = admin_brand or "MarginWealth"
+    brand_name = payload.get("admin_brand_name", "") or "MarginWealth"
     header_data = [
         [
             Paragraph(
-                f"<font name='{_FONT_BOLD}' size='12' color='#3B5BDB'>{brand_name}</font>",
+                f"<font name='{_FONT_BOLD}' size='12' color='#3B5BDB'>{_text(brand_name)}</font>",
                 styles["title"],
             ),
             Paragraph(
-                f"<font name='{_FONT_BOLD}' size='16' color='#263C9C'>Trade Book</font>",
+                f"<font name='{_FONT_BOLD}' size='16' color='#263C9C'>Billing Statement</font>",
                 styles["title"],
             ),
             Paragraph(
@@ -607,12 +858,15 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
     elems: list = [
         header_tbl,
         Spacer(1, 4),
-        Paragraph(f"<b>{account_label}</b>", meta_style),
-        Paragraph(f"<b>From:</b> {rng_from}  <b>To:</b> {rng_to}  |  <b>Time:</b> {generated_at}", meta_style),
+        Paragraph(f"<b>{_text(account_label)}</b>", meta_style),
+        Paragraph(
+            f"<b>From:</b> {_text(rng_from)}  <b>To:</b> {_text(rng_to)}  |  "
+            f"<b>Time:</b> {_text(generated_at)}",
+            meta_style,
+        ),
         Spacer(1, 8),
     ]
 
-    # ── Helper: green-header table (6pt font, no wrapping) ─────────
     base_ss = getSampleStyleSheet()
 
     def _ark_cell_style(bold: bool = False, size: int = FONT_SZ, color=None) -> ParagraphStyle:
@@ -625,24 +879,30 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
             wordWrap="CJK",
         )
 
-    def _ark_table(
+    th = _ark_cell_style(bold=True, size=HDR_SZ)
+    td = _ark_cell_style(bold=False, size=FONT_SZ)
+    td_b = _ark_cell_style(bold=True, size=FONT_SZ, color=TEXT)
+
+    def section(title: str) -> None:
+        # Claim room for the heading, the header row and a line of data, or
+        # the heading strands at a page foot with its table overleaf.
+        elems.extend([CondPageBreak(25 * mm), Paragraph(f"<b>{_text(title)}</b>", styles["h2"])])
+
+    def table(
         headers: list[str],
-        rows: list[list[str]],
-        col_widths: list[float],
-        totals_row: list[str] | None = None,
-    ) -> Table:
-        th = _ark_cell_style(bold=True, size=HDR_SZ)
-        td = _ark_cell_style(bold=False, size=FONT_SZ)
-
-        data: list[list] = [[Paragraph(h, th) for h in headers]]
-        for r in rows:
-            data.append([Paragraph(str(c), td) for c in r])
-
-        if totals_row:
-            td_b = _ark_cell_style(bold=True, size=FONT_SZ, color=TEXT)
-            data.append([Paragraph(str(c), td_b) for c in totals_row])
-
-        t = Table(data, colWidths=col_widths, hAlign="LEFT", repeatRows=1)
+        weights: list[float],
+        rows: list[list[Any]],
+        totals: list[Any] | None = None,
+        empty: str = "None.",
+    ) -> None:
+        if not rows:
+            elems.extend([Paragraph(_text(empty), styles["subtitle"]), Spacer(1, 8)])
+            return
+        data = [[Paragraph(_text(h), th) for h in headers]]
+        data += [[Paragraph(_text(c), td) for c in r] for r in rows]
+        if totals:
+            data.append([Paragraph(_text(c), td_b) for c in totals])
+        t = Table(data, colWidths=[page_w * w / sum(weights) for w in weights], hAlign="LEFT", repeatRows=1)
         style_cmds: list = [
             ("BACKGROUND", (0, 0), (-1, 0), ACCENT),
             ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
@@ -654,221 +914,52 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
             ("TOPPADDING", (0, 0), (-1, -1), 2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
         ]
-        for i in range(1, len(data)):
-            if i % 2 == 0:
-                style_cmds.append(("BACKGROUND", (0, i), (-1, i), rl_colors.HexColor("#FAFAFA")))
-        if totals_row:
-            last = len(data) - 1
-            style_cmds.append(("BACKGROUND", (0, last), (-1, last), ACCENT_SOFT))
-            style_cmds.append(("LINEABOVE", (0, last), (-1, last), 0.75, ACCENT))
+        style_cmds += [
+            ("BACKGROUND", (0, i), (-1, i), rl_colors.HexColor("#FAFAFA")) for i in range(2, len(data), 2)
+        ]
+        if totals:
+            style_cmds += [
+                ("BACKGROUND", (0, -1), (-1, -1), ACCENT_SOFT),
+                ("LINEABOVE", (0, -1), (-1, -1), 0.75, ACCENT),
+            ]
         t.setStyle(TableStyle(style_cmds))
-        return t
-
-    # ── Section 1: Closed Transactions ─────────────────────────────
-    closed = payload.get("closed_transactions", [])
-    elems.append(Paragraph("<b>Closed Transactions</b>", styles["h2"]))
-
-    ct_headers = [
-        "Time", "Type", "Ticket Id", "Script", "Amt",
-        "Side", "Open Price", "Close Price",
-        "DP/WD/AJ", "Brokerage", "Total PnL",
-    ]
-    # 11 cols, proportional to page_w — fills entire page
-    _ct = [8, 3.5, 7, 9, 4, 3.5, 7, 7, 7, 6, 7]
-    _ct_sum = sum(_ct)
-    ct_widths = [page_w * w / _ct_sum for w in _ct]
-
-    ct_rows: list[list[str]] = []
-    total_brokerage_col = 0.0
-    total_pnl = 0.0
-    for tx in closed:
-        brokerage = _num(tx.get("brokerage") or 0)
-        pnl = _num(tx.get("total_pnl") or 0)
-        total_brokerage_col += brokerage
-        total_pnl += pnl
-
-        pnl_str = f"{pnl:,.2f}" if pnl else ""
-        dp_wd = tx.get("dp_wd_aj", "")
-        if dp_wd and isinstance(dp_wd, (int, float)):
-            dp_wd = f"{dp_wd:,.2f}"
-
-        ct_rows.append([
-            tx.get("time", ""),
-            tx.get("type", ""),
-            str(tx.get("ticket_id", "")),
-            tx.get("script", ""),
-            str(tx.get("amount", "")),
-            tx.get("type_detail", ""),
-            tx.get("open_price", ""),
-            tx.get("close_price", ""),
-            str(dp_wd),
-            f"{brokerage:,.2f}" if brokerage else "0.00",
-            pnl_str,
-        ])
-
-    totals_row = [
-        "", "", "", "", "Totals", "", "", "",
-        "", f"{total_brokerage_col:,.2f}",
-        f"{total_pnl:,.2f}",
-    ]
-
-    if ct_rows:
-        elems.append(_ark_table(ct_headers, ct_rows, ct_widths, totals_row))
-    else:
-        elems.append(Paragraph("No closed transactions in this period.", styles["subtitle"]))
-    elems.append(Spacer(1, 8))
-
-    # ── Section 2: Money Totals + Brokerage ────────────────────────
-    money = payload.get("money_totals", {})
-    elems.append(Paragraph("<b>Money Totals</b>", styles["h2"]))
-
-    money_headers = ["CreditIn", "CreditOut", "Deposit", "Withdraw", "Adjustment", "Bonus", "Total Brokerage"]
-    mw = page_w / 7
-    money_widths = [mw] * 7
-    money_row = [
-        f"{_num(money.get('credit_in', 0)):,.2f}",
-        f"{_num(money.get('credit_out', 0)):,.2f}",
-        f"{_num(money.get('deposit', 0)):,.2f}",
-        f"{_num(money.get('withdraw', 0)):,.2f}",
-        f"{_num(money.get('adjustment', 0)):,.2f}",
-        f"{_num(money.get('bonus', 0)):,.2f}",
-        f"{total_brokerage:,.2f}",
-    ]
-    elems.append(_ark_table(money_headers, [money_row], money_widths))
-    elems.append(Spacer(1, 8))
-
-    # ── Section 3: Opened Deals ────────────────────────────────────
-    opened = payload.get("opened_deals", [])
-    elems.append(Paragraph("<b>Opened Deals</b>", styles["h2"]))
-
-    od_headers = [
-        "Ticket Id", "Time", "Side", "Amt", "Script",
-        "Price", "SL", "TP", "Current Price",
-        "Commission", "Total PnL", "Value",
-    ]
-    _od = [7, 9, 4, 5, 10, 8, 7, 7, 8, 7, 8, 10]
-    _od_sum = sum(_od)
-    od_widths = [page_w * w / _od_sum for w in _od]
-    od_rows: list[list[str]] = []
-    od_total_amt = 0.0
-    od_total_com = 0.0
-    od_total_pnl = 0.0
-    od_total_val = 0.0
-    for d in opened:
-        # `amount` arrives pre-formatted ("9,000.00") from the payload builder,
-        # so parse comma-tolerantly — a bare float() 500'd the whole PDF.
-        amt = _num(d.get("amount"))
-        com = _num(d.get("commission"))
-        pnl = _num(d.get("total_pnl"))
-        val = _num(d.get("value"))
-        od_total_amt += amt
-        od_total_com += com
-        od_total_pnl += pnl
-        od_total_val += val
-        od_rows.append([
-            str(d.get("ticket_id", "")),
-            d.get("time", ""),
-            d.get("type_detail", ""),
-            f"{amt:,.2f}" if amt else str(d.get("amount", "")),
-            d.get("script", ""),
-            d.get("price", ""),
-            d.get("sl", ""),
-            d.get("tp", ""),
-            d.get("current_price", ""),
-            f"{com:,.2f}",
-            f"{pnl:,.2f}",
-            f"{val:,.2f}",
-        ])
-
-    od_totals = [
-        "", "", "Totals", f"{od_total_amt:,.2f}", "", "", "", "", "",
-        f"{od_total_com:,.2f}", f"{od_total_pnl:,.2f}", f"{od_total_val:,.2f}",
-    ]
-    if od_rows:
-        elems.append(_ark_table(od_headers, od_rows, od_widths, od_totals))
-    else:
-        elems.append(Paragraph("No open deals.", styles["subtitle"]))
-    elems.append(Spacer(1, 8))
-
-    # ── Section 4: Pending Orders ──────────────────────────────────
-    pending = payload.get("pending_orders", [])
-    elems.append(Paragraph("<b>Pending Orders</b>", styles["h2"]))
-
-    po_headers = ["Order Id", "Type", "Side", "Amt", "Script", "Price", "SL", "TP", "Time"]
-    pw = page_w / 9
-    po_widths = [pw] * 9
-    po_rows: list[list[str]] = []
-    for o in pending:
-        po_rows.append([
-            str(o.get("order_id", "")),
-            o.get("type", ""),
-            o.get("type_detail", ""),
-            str(o.get("amount", "")),
-            o.get("script", ""),
-            str(o.get("price", "")),
-            str(o.get("sl", "")),
-            str(o.get("tp", "")),
-            o.get("time", ""),
-        ])
-    if po_rows:
-        elems.append(_ark_table(po_headers, po_rows, po_widths))
-    else:
-        elems.append(Paragraph("No pending orders.", styles["subtitle"]))
-    elems.append(Spacer(1, 8))
-
-    # ── Section 5: Financial Standings ─────────────────────────────
-    fin = payload.get("financial", {})
-    elems.append(Paragraph("<b>Financial Standings</b>", styles["h2"]))
-
-    fin_items = [
-        ("Balance", f"{_rupee()}{_num(fin.get('balance', 0)):,.2f}"),
-        ("Credit", f"{_rupee()}{_num(fin.get('credit', 0)):,.2f}"),
-        ("Equity", f"{_rupee()}{_num(fin.get('equity', 0)):,.2f}"),
-        ("Total PnL", f"{_rupee()}{_num(fin.get('total_pnl', 0)):,.2f}"),
-        ("Used Margin", f"{_rupee()}{_num(fin.get('used_margin', 0)):,.2f}"),
-        ("Holding Margin", f"{_rupee()}{_num(fin.get('holding_margin', 0)):,.2f}"),
-        ("Free Margin", f"{_rupee()}{_num(fin.get('free_margin', 0)):,.2f}"),
-        ("Margin Level", fin.get("margin_level", "0.00%")),
-        ("Brokerage Paid", f"{_rupee()}{total_brokerage:,.2f}"),
-    ]
+        elems.extend([t, Spacer(1, 8)])
 
     td_fin = ParagraphStyle(
         "ark_fin", parent=base_ss["Normal"],
         fontName=_FONT_NAME, fontSize=8, leading=11, textColor=TEXT,
     )
-    fin_data: list[list] = []
-    fin_row: list = []
-    for label, value in fin_items:
-        cell = Paragraph(
-            f"<font color='#64748B' size='7'><b>{label}</b></font><br/>"
-            f"<font name='{_FONT_BOLD}' size='10'>{value}</font>",
-            td_fin,
+    for sec in billing_sections(payload):
+        section(sec.title)
+        if not sec.card:
+            table(sec.headers, sec.weights, sec.rows, sec.totals, sec.empty)
+            continue
+        # Financial Standings: the period's own four figures.
+        cards = Table(
+            [[
+                Paragraph(
+                    f"<font color='#64748B' size='7'><b>{_text(label)}</b></font><br/>"
+                    f"<font name='{_FONT_BOLD}' size='10'>{_text(value)}</font>",
+                    td_fin,
+                )
+                for label, value in zip(sec.headers, sec.rows[0], strict=True)
+            ]],
+            colWidths=[page_w / len(sec.headers)] * len(sec.headers),
         )
-        fin_row.append(cell)
-        if len(fin_row) == 5:
-            fin_data.append(fin_row)
-            fin_row = []
-    if fin_row:
-        while len(fin_row) < 5:
-            fin_row.append(Paragraph("", td_fin))
-        fin_data.append(fin_row)
-
-    cw = page_w / 5
-    fin_tbl = Table(fin_data, colWidths=[cw] * 5)
-    fin_tbl.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("BOX", (0, 0), (-1, -1), 0.5, ACCENT),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, GRID),
-        ("BACKGROUND", (0, 0), (-1, -1), ACCENT_SOFT),
-    ]))
-    elems.append(fin_tbl)
+        cards.setStyle(TableStyle([
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("BOX", (0, 0), (-1, -1), 0.5, ACCENT),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, GRID),
+            ("BACKGROUND", (0, 0), (-1, -1), ACCENT_SOFT),
+        ]))
+        elems.append(cards)
 
     elems.append(Spacer(1, 10))
     elems.append(Paragraph(
-        f"{brand_name}  |  Generated on {datetime.now().strftime('%d %b %Y, %H:%M IST')}",
+        f"{_text(brand_name)}  |  Generated on {now_ist().strftime('%d %b %Y, %H:%M IST')}",
         styles["footer"],
     ))
     doc.build(elems)
@@ -876,6 +967,8 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
 
 
 def build_margin_pdf(user, summary: dict) -> bytes:
+    """`summary`: user reports' _margin_payload (the wallet summary plus the
+    statement's lifetime `brokerage`)."""
     styles = _styles()
     doc, buf = _doc()
     elems = _header(
@@ -894,7 +987,7 @@ def build_margin_pdf(user, summary: dict) -> bytes:
                 ("Unrealized P&L", _fmt_money(summary.get("unrealized_pnl"))),
                 ("Total deposits", _fmt_money(summary.get("total_deposits"))),
                 ("Total withdrawals", _fmt_money(summary.get("total_withdrawals"))),
-                ("Total brokerage", _fmt_money(summary.get("total_brokerage"))),
+                ("Total brokerage", _fmt_money(summary.get("brokerage"))),
             ],
             styles,
         ),

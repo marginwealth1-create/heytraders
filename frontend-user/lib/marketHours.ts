@@ -1,77 +1,141 @@
 /**
- * Frontend market-hours guard — used so the UI doesn't fire close / new
- * orders when the backend will obviously reject them with MARKET_CLOSED.
- *
- * Why: previously, clicking "Close" on a position outside market hours
- * triggered the same optimistic-remove pipeline as any other close — the
- * row disappeared for ~1 s, then the backend rejected and the row came
- * back with a tiny error toast. Traders kept thinking the close worked
- * for a moment and then "got reversed." Pre-checking here means we show
- * one clear "Market is closed" message and the position stays put.
- *
- * Market hours are dynamically configured by the Administrator in Platform Settings
- * (/settings/platform). The trading window fetches and enforces the configured
- * start time and end time per market (NSE, BSE, MCX, FOREX, CRYPTO).
+ * Frontend market-hours guard — backed by the admin-configured Market Trading
+ * Hours (`GET /api/v1/user/support/market-hours`) so any change made in
+ * Admin → Platform Settings → Market Trading Hours is enforced immediately
+ * when a user places or closes a trade.
  */
 
-import { useQuery } from "@tanstack/react-query";
-import { MarketHoursAPI } from "./api";
+import { API_URL } from "@/lib/constants";
 
-export type MarketHoursConfig = {
-  [market: string]: {
-    name: string;
-    start_time: string;
-    end_time: string;
-    is_enabled: boolean;
-    days?: number[];
-    description?: string;
-  };
+export type MarketKey = "NSE" | "BSE" | "MCX" | "FOREX" | "CRYPTO";
+
+export interface MarketHourEntry {
+  enabled: boolean;
+  start: string;
+  end: string;
+  days: string;
+}
+
+export type MarketHoursMap = Record<MarketKey, MarketHourEntry>;
+
+export const DEFAULT_MARKET_HOURS: MarketHoursMap = {
+  NSE: {
+    enabled: true,
+    start: "09:15",
+    end: "15:30",
+    days: "Mon - Fri",
+  },
+  BSE: {
+    enabled: true,
+    start: "09:15",
+    end: "15:30",
+    days: "Mon - Fri",
+  },
+  MCX: {
+    enabled: true,
+    start: "09:00",
+    end: "23:55",
+    days: "Mon - Fri",
+  },
+  FOREX: {
+    enabled: true,
+    start: "00:00",
+    end: "23:59",
+    days: "Mon - Fri",
+  },
+  CRYPTO: {
+    enabled: true,
+    start: "00:00",
+    end: "23:59",
+    days: "24/7 (Mon - Sun)",
+  },
 };
 
 const STORAGE_KEY = "app.market_hours";
+let _hoursCache: MarketHoursMap = { ...DEFAULT_MARKET_HOURS };
+let _lastFetchMs = 0;
+let _inFlight: Promise<MarketHoursMap> | null = null;
+const _FETCH_INTERVAL_MS = 15_000;
 
-let _configuredHours: MarketHoursConfig | null = null;
-
-// Initialise from localStorage if in browser
-if (typeof window !== "undefined") {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (raw) _configuredHours = JSON.parse(raw);
-  } catch {}
+function _mergeHours(raw: unknown): MarketHoursMap {
+  const out: MarketHoursMap = {
+    NSE: { ...DEFAULT_MARKET_HOURS.NSE },
+    BSE: { ...DEFAULT_MARKET_HOURS.BSE },
+    MCX: { ...DEFAULT_MARKET_HOURS.MCX },
+    FOREX: { ...DEFAULT_MARKET_HOURS.FOREX },
+    CRYPTO: { ...DEFAULT_MARKET_HOURS.CRYPTO },
+  };
+  if (!raw || typeof raw !== "object") return out;
+  const r = raw as Record<string, any>;
+  (Object.keys(out) as MarketKey[]).forEach((k) => {
+    const item = r[k];
+    if (item && typeof item === "object") {
+      out[k] = {
+        enabled: item.enabled !== undefined ? Boolean(item.enabled) : out[k].enabled,
+        start: typeof item.start === "string" && item.start.includes(":") ? item.start : out[k].start,
+        end: typeof item.end === "string" && item.end.includes(":") ? item.end : out[k].end,
+        days: typeof item.days === "string" && item.days ? item.days : out[k].days,
+      };
+    }
+  });
+  return out;
 }
 
-export function setConfiguredMarketHours(cfg: MarketHoursConfig | null) {
-  _configuredHours = cfg;
-  if (typeof window !== "undefined" && cfg) {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
-    } catch {}
+if (typeof window !== "undefined") {
+  try {
+    const saved = window.localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      _hoursCache = _mergeHours(JSON.parse(saved));
+    }
+  } catch {
+    // ignore storage read errors
   }
 }
 
-export function getConfiguredMarketHours(): MarketHoursConfig | null {
-  return _configuredHours;
+export async function refreshMarketHours(force = false): Promise<MarketHoursMap> {
+  if (typeof window === "undefined") return _hoursCache;
+  const now = Date.now();
+  if (!force && now - _lastFetchMs < _FETCH_INTERVAL_MS) {
+    return _hoursCache;
+  }
+  if (_inFlight) return _inFlight;
+  _inFlight = (async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/v1/user/support/market-hours`, {
+        method: "GET",
+        cache: "no-store",
+      });
+      if (res.ok) {
+        const json = await res.json();
+        const raw = json?.data?.hours ?? json?.hours;
+        if (raw) {
+          _hoursCache = _mergeHours(raw);
+          _lastFetchMs = Date.now();
+          try {
+            window.localStorage.setItem(STORAGE_KEY, JSON.stringify(_hoursCache));
+          } catch {
+            // ignore storage write errors
+          }
+        }
+      }
+    } catch {
+      // keep existing cache on transient network error
+    } finally {
+      _inFlight = null;
+    }
+    return _hoursCache;
+  })();
+  return _inFlight;
 }
 
-/** Hook to fetch and sync latest market hours set by admin */
-export function useMarketHours() {
-  const { data, isLoading } = useQuery({
-    queryKey: ["platform-market-hours"],
-    queryFn: async () => {
-      try {
-        const res = await MarketHoursAPI.get();
-        if (res) {
-          setConfiguredMarketHours(res);
-          return res;
-        }
-      } catch {}
-      return getConfiguredMarketHours();
-    },
-    staleTime: 60_000,
-    refetchOnWindowFocus: true,
+if (typeof window !== "undefined") {
+  void refreshMarketHours(true);
+  window.addEventListener("focus", () => {
+    void refreshMarketHours(true);
   });
-
-  return { hours: data || getConfiguredMarketHours(), isLoading };
+  setInterval(() => {
+    void refreshMarketHours(false);
+  }, _FETCH_INTERVAL_MS);
 }
 
 /** Minutes since IST midnight for the given JS Date (no tz library needed). */
@@ -82,107 +146,57 @@ function _istMinutes(date: Date): number {
     minute: "2-digit",
     hour12: false,
   }).formatToParts(date);
-  const h = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
+  const h = Number(parts.find((p) => p.type === "hour")?.value ?? "0") % 24;
   const m = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
   return h * 60 + m;
 }
 
-/** IST day-of-week (0 = Sun, 6 = Sat). */
+/**
+ * Special sessions (Diwali Muhurat): on these IST dates NSE / BSE / MCX trade
+ * ONLY inside this window (minutes since IST midnight), weekend or not.
+ * Mirror of backend `time_utils.MUHURAT_SESSIONS` — edit both together.
+ */
+const MUHURAT_SESSIONS: Record<string, [number, number]> = {
+  "2026-11-08": [14 * 60 + 20, 15 * 60 + 40],
+};
+
+function _istDateKey(date: Date): string {
+  return new Date(date.getTime() + (5 * 60 + 30) * 60_000).toISOString().slice(0, 10);
+}
+
+/** null = not a muhurat day / not an Indian market (normal rules); else open?. */
+export function muhuratOpen(key: string, now: Date = new Date()): boolean | null {
+  if (key !== "NSE" && key !== "BSE" && key !== "MCX") return null;
+  const w = MUHURAT_SESSIONS[_istDateKey(now)];
+  if (!w) return null;
+  const min = _istMinutes(now);
+  return min >= w[0] && min <= w[1];
+}
+
+/** IST day-of-week (0 = Sun, 1 = Mon, ..., 5 = Fri, 6 = Sat). */
 function _istDay(date: Date): number {
   const ist = new Date(date.getTime() + (5 * 60 + 30) * 60_000);
   return ist.getUTCDay();
 }
 
-/** Map exchange and segment to canonical market key (NSE, BSE, MCX, FOREX, CRYPTO) */
-export function resolveMarket(segmentType?: string | null, exchange?: string | null): string {
-  const seg = (segmentType || "").toUpperCase();
-  const exch = (exchange || "").toUpperCase();
-
-  if (seg.includes("CRYPTO") || exch === "CRYPTO" || exch === "BINANCE") return "CRYPTO";
-  if (seg.startsWith("MCX") || exch === "MCX" || seg === "COMMODITIES") return "MCX";
-  if (seg.startsWith("BSE") || seg.startsWith("BFO") || exch === "BSE" || exch === "BFO") return "BSE";
-  if (
-    seg === "FOREX" ||
-    seg === "STOCKS" ||
-    seg === "INDICES" ||
-    seg.includes("FOREX") ||
-    seg.includes("FX") ||
-    exch === "CDS" ||
-    seg.startsWith("CDS")
-  ) {
-    return "FOREX";
-  }
-  return "NSE";
+function _parseHhMm(hhmm: string, fallbackMin: number): number {
+  const parts = (hhmm || "").trim().split(":");
+  if (parts.length < 2) return fallbackMin;
+  const h = Number(parts[0]);
+  const m = Number(parts[1]);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return fallbackMin;
+  return h * 60 + m;
 }
 
-/** Information helper for a given instrument's market hours */
-export function getMarketHoursInfo(segmentType?: string | null, exchange?: string | null) {
-  const market = resolveMarket(segmentType, exchange);
-  const cfg = _configuredHours?.[market];
-  const defaults: Record<string, { name: string; start: string; end: string }> = {
-    NSE: { name: "NSE", start: "09:15", end: "15:30" },
-    BSE: { name: "BSE", start: "09:15", end: "15:30" },
-    MCX: { name: "MCX", start: "09:00", end: "23:30" },
-    FOREX: { name: "Forex", start: "00:00", end: "23:59" },
-    CRYPTO: { name: "Crypto", start: "00:00", end: "23:59" },
-  };
-  const d = defaults[market] || defaults.NSE;
-  return {
-    market,
-    name: cfg?.name || d.name,
-    startTime: cfg?.start_time || d.start,
-    endTime: cfg?.end_time || d.end,
-    isEnabled: cfg?.is_enabled ?? true,
-  };
-}
-
-/**
- * Returns true when the segment's exchange is currently accepting trades.
- * Checks against the admin-configured market hours if available, with standard
- * exchange defaults as fallback.
- */
-export function isInstrumentMarketOpen(
+export function resolveMarketKey(
   segmentType?: string | null,
   exchange?: string | null,
-  now: Date = new Date(),
-): boolean {
-  const market = resolveMarket(segmentType, exchange);
-  const cfg = _configuredHours?.[market];
-
-  const min = _istMinutes(now);
-  const day = _istDay(now);
-
-  // If dynamic config is available, enforce it
-  if (cfg) {
-    // 1. Is market enabled?
-    if (cfg.is_enabled === false) return false;
-
-    // 2. Day of week check
-    if (Array.isArray(cfg.days) && !cfg.days.includes(day)) return false;
-
-    // 3. Time check
-    const [sh, sm] = (cfg.start_time || "09:15").split(":").map(Number);
-    const [eh, em] = (cfg.end_time || "15:30").split(":").map(Number);
-    const startMin = (sh || 0) * 60 + (sm || 0);
-    const endMin = (eh || 0) * 60 + (em || 0);
-
-    if (startMin <= endMin) {
-      return min >= startMin && min <= endMin;
-    } else {
-      // Overnight session (e.g. 17:00 to 02:30)
-      return min >= startMin || min <= endMin;
-    }
-  }
-
-  // --- Fallback standard exchange defaults when config is not yet loaded ---
+): MarketKey {
   const seg = (segmentType || "").toUpperCase();
   const exch = (exchange || "").toUpperCase();
-  const weekday = day !== 0 && day !== 6;
-
-  // Crypto trades 24/7
-  if (seg.includes("CRYPTO") || exch === "CRYPTO" || exch === "BINANCE") return true;
-
-  // International FX / OTC forex clock
+  if (seg.includes("CRYPTO") || exch === "CRYPTO" || exch === "BINANCE") {
+    return "CRYPTO";
+  }
   if (
     seg === "FOREX" ||
     seg === "STOCKS" ||
@@ -190,48 +204,72 @@ export function isInstrumentMarketOpen(
     seg === "COMMODITIES" ||
     seg.includes("FOREX") ||
     seg.includes("FX") ||
+    seg.startsWith("CDS") ||
     exch === "CDS"
   ) {
-    const etParts = new Intl.DateTimeFormat("en-GB", {
-      timeZone: "America/New_York",
-      weekday: "short",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    }).formatToParts(now);
-    const etDay = etParts.find((p) => p.type === "weekday")?.value ?? "";
-    const etH = Number(etParts.find((p) => p.type === "hour")?.value ?? "0") % 24;
-    const etM = Number(etParts.find((p) => p.type === "minute")?.value ?? "0");
-    const etMin = etH * 60 + etM;
-    const CLOSE = 17 * 60; // 17:00 ET
-    const REOPEN = 18 * 60; // 18:00 ET
-    if (etDay === "Sat") return false;
-    if (etDay === "Sun") return etMin >= CLOSE;
-    if (etDay === "Fri") return etMin < CLOSE;
-    return !(etMin >= CLOSE && etMin < REOPEN);
+    return "FOREX";
   }
-
-  // MCX commodities: Mon-Fri 09:00-23:55 IST (platform close = backend MCX_CLOSE).
   if (seg.startsWith("MCX") || exch === "MCX") {
-    if (!weekday) return false;
-    return min >= 9 * 60 && min <= 23 * 60 + 55;
+    return "MCX";
   }
-
-  // NSE / BSE equity, F&O — Mon-Fri 09:15-15:41 IST (platform close, operator-set).
-  // Catch-all: anything we couldn't classify falls into this bucket,
-  // which is safer than defaulting to "open" because Indian equity is
-  // the dominant segment and a wrong "closed" is better than a wrong
-  // "open" (the backend rejects either way; we just avoid the flicker).
-  if (!weekday) return false;
-  return min >= 9 * 60 + 15 && min <= 15 * 60 + 41;
+  if (seg.startsWith("BSE") || seg.startsWith("BFO") || exch === "BSE" || exch === "BFO") {
+    return "BSE";
+  }
+  return "NSE";
 }
 
-/** Friendly label used in the "Market is closed" toast */
-export function marketLabel(segmentType?: string | null, exchange?: string | null): string {
-  const market = resolveMarket(segmentType, exchange);
-  const cfg = _configuredHours?.[market];
-  if (cfg?.name) return cfg.name;
+export function getMarketHourConfig(
+  segmentType?: string | null,
+  exchange?: string | null,
+): MarketHourEntry & { key: MarketKey } {
+  if (typeof window !== "undefined" && Date.now() - _lastFetchMs >= _FETCH_INTERVAL_MS) {
+    void refreshMarketHours(false);
+  }
+  const key = resolveMarketKey(segmentType, exchange);
+  const cfg = _hoursCache[key] ?? DEFAULT_MARKET_HOURS[key];
+  return { key, ...cfg };
+}
 
+/**
+ * Returns true when the segment's exchange is currently accepting trades
+ * according to the admin-configured Market Trading Hours (IST).
+ */
+export function isInstrumentMarketOpen(
+  segmentType?: string | null,
+  exchange?: string | null,
+  now: Date = new Date(),
+): boolean {
+  const cfg = getMarketHourConfig(segmentType, exchange);
+  if (!cfg.enabled) return false;
+  const mu = muhuratOpen(cfg.key, now);
+  if (mu !== null) return mu;
+
+  const min = _istMinutes(now);
+  const day = _istDay(now); // 0 = Sun, 1..5 = Mon..Fri, 6 = Sat
+  const startMin = _parseHhMm(cfg.start, 0);
+  const endMin = _parseHhMm(cfg.end, 23 * 60 + 59);
+  const is24x7Days =
+    cfg.key === "CRYPTO" || cfg.days.includes("24/7") || cfg.days.includes("Sun");
+
+  if (startMin <= endMin) {
+    if (!is24x7Days && (day === 0 || day === 6)) {
+      return false;
+    }
+    return min >= startMin && min <= endMin;
+  } else {
+    // Overnight session crossing midnight (e.g. 03:30 -> 02:30 IST)
+    if (is24x7Days) {
+      return min >= startMin || min <= endMin;
+    }
+    // Mon-Fri overnight:
+    // - Mon..Fri (1..5): open from startMin..23:59
+    // - Tue..Sat (2..6): open from 00:00..endMin (tail of previous weekday)
+    return (day >= 1 && day <= 5 && min >= startMin) || (day >= 2 && day <= 6 && min <= endMin);
+  }
+}
+
+/** Friendly label used in the "Market is closed" alert/toast. */
+export function marketLabel(segmentType?: string | null, exchange?: string | null): string {
   const seg = (segmentType || "").toUpperCase();
   const exch = (exchange || "").toUpperCase();
   if (seg.includes("CRYPTO") || exch === "CRYPTO") return "Crypto";
@@ -240,6 +278,22 @@ export function marketLabel(segmentType?: string | null, exchange?: string | nul
   if (seg === "STOCKS") return "Global stocks";
   if (seg === "INDICES") return "Global indices";
   if (seg.startsWith("MCX") || exch === "MCX") return "MCX";
-  if (seg.startsWith("BSE") || exch === "BSE") return "BSE";
+  if (seg.startsWith("BSE") || seg.startsWith("BFO") || exch === "BSE" || exch === "BFO") return "BSE";
   return "NSE";
+}
+
+/** Detailed alert message shown when an order is attempted while the market is closed. */
+export function getMarketClosedMessage(
+  segmentType?: string | null,
+  exchange?: string | null,
+): string {
+  const label = marketLabel(segmentType, exchange);
+  const cfg = getMarketHourConfig(segmentType, exchange);
+  if (!cfg.enabled) {
+    return `${label} market is currently closed by admin. Orders are not accepted right now.`;
+  }
+  if (muhuratOpen(cfg.key) !== null) {
+    return `${label}: today only the Muhurat session trades, 14:20 – 15:40 IST.`;
+  }
+  return `${label} market is closed. Trading hours: ${cfg.start} – ${cfg.end} IST (${cfg.days}).`;
 }

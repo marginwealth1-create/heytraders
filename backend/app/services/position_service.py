@@ -7,6 +7,8 @@ and for CNC trades writes/updates the long-term Holding record.
 
 from __future__ import annotations
 
+from bisect import bisect_left
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -14,23 +16,47 @@ from beanie import PydanticObjectId
 from bson import Decimal128
 from pymongo.errors import DuplicateKeyError
 
+from app.core.exceptions import ConflictError
 from app.models._base import OrderAction, ProductType
 from app.models.holding import Holding
-from app.models.order import InstrumentRef
+from app.models.order import InstrumentRef, Order, OrderStatus
 from app.models.position import Position, PositionStatus, UserPositionTracker
+from app.models.position_settlement import PositionSettlement
+from app.models.trade import LIVE_FILL, Trade
 from app.utils.decimal_utils import (
     ZERO,
     add,
+    quantize_basis,
     quantize_money,
     sub,
     to_decimal,
     to_decimal128,
 )
-from app.utils.time_utils import now_utc
+from app.utils.time_utils import UTC, is_weekend, now_utc
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def basis_override(pos: Position, closed_qty: Any, override: Decimal | None) -> Decimal | None:
+    """The specific-lot basis a close of `pos` may realize against — None
+    means the position average.
+
+    Only a PARTIAL close honours it: the survivors' average is re-derived as
+    (avg·Q − basis·q) / (Q − q), so the cycle still books exactly what the
+    lots cost. A close that takes the whole position leaves no survivor to
+    carry (avg − basis), so it books at the average — exiting the Active
+    tab's last lot after an average-price close lost that difference for
+    good. A basis that would drive the survivors' average below zero is
+    refused too (it was floored at 0 and the money dropped)."""
+    if override is None:
+        return None
+    held = to_decimal(abs(pos.quantity))
+    q = to_decimal(closed_qty)
+    if q >= held or to_decimal(pos.avg_price) * held < override * q:
+        return None
+    return override
 
 
 async def apply_fill(
@@ -163,7 +189,7 @@ async def apply_fill(
             # Same side (pyramiding): weighted avg, ADD the new leg's margin.
             total = to_decimal(abs(cur_qty) + abs(signed_qty))
             pos.avg_price = Decimal128(
-                str(quantize_money((cur_avg * to_decimal(abs(cur_qty)) + price * to_decimal(abs(signed_qty))) / total))
+                str(quantize_basis((cur_avg * to_decimal(abs(cur_qty)) + price * to_decimal(abs(signed_qty))) / total))
             )
             pos.quantity = new_qty
             pos.opening_quantity = max(float(pos.opening_quantity or 0), abs(new_qty))
@@ -178,6 +204,7 @@ async def apply_fill(
             # tapped fill's entry price, else the position average. Kept in
             # lockstep with matching_engine's raw_realized so Trade.pnl, the
             # wallet PNL move and pos.realized_pnl all agree.
+            cost_basis_override = basis_override(pos, closed_qty, cost_basis_override)
             basis = cost_basis_override if cost_basis_override is not None else cur_avg
             realized = (price - basis) * to_decimal(closed_qty) * sign
             pos.realized_pnl = Decimal128(str(quantize_money(to_decimal(pos.realized_pnl) + realized)))
@@ -249,9 +276,7 @@ async def apply_fill(
                         cur_avg * to_decimal(abs(cur_qty))
                         - basis * to_decimal(closed_qty)
                     ) / rem
-                    if new_basis < 0:
-                        new_basis = to_decimal(0)
-                    pos.avg_price = Decimal128(str(quantize_money(new_basis)))
+                    pos.avg_price = Decimal128(str(quantize_basis(new_basis)))
                 # apply_brackets stays False — the surviving position is in
                 # its original direction with its original avg, so existing
                 # SL/TP remain valid (if any). The closing order's bracket
@@ -390,18 +415,19 @@ async def settle_expired_position(
     token = pos.instrument.token
 
     # ── Resolve a non-zero settlement price ──────────────────────────
+    # A price, not a money amount: forex / metals quote past 2 dp.
     settle = (
-        quantize_money(to_decimal(settlement_price))
+        quantize_basis(to_decimal(settlement_price))
         if settlement_price is not None
         else ZERO
     )
     if settle <= ZERO:
         try:
-            settle = quantize_money(to_decimal(await market_data_service.get_ltp(token)))
+            settle = quantize_basis(to_decimal(await market_data_service.get_ltp(token)))
         except Exception:  # noqa: BLE001
             settle = ZERO
     if settle <= ZERO:
-        settle = quantize_money(to_decimal(pos.ltp))
+        settle = quantize_basis(to_decimal(pos.ltp))
     if settle <= ZERO:
         # No usable price anywhere — never settle at 0. Leave OPEN so a
         # later run (with an admin-supplied price) can settle it.
@@ -475,7 +501,9 @@ async def settle_expired_position(
             str(quantize_money(to_decimal(pos.realized_pnl) + realized_native))
         )
         pos.unrealized_pnl = Decimal128("0")
-        pos.quantity = 0.0
+        # quantity stays: the units this settlement closed (as a weekly
+        # settlement leaves it). Zeroed, every reader fell back to the peak
+        # opening_quantity and settled units already sold.
         pos.margin_used = Decimal128("0")
         if (
             is_usd
@@ -790,7 +818,7 @@ async def _apply_holding(
     if action == OrderAction.BUY:
         new_qty = h.quantity + quantity
         denom = to_decimal(max(1.0, new_qty))
-        new_avg = quantize_money(
+        new_avg = quantize_basis(
             (to_decimal(h.avg_price) * to_decimal(h.quantity) + price * qty_dec) / denom
         )
         h.quantity = new_qty
@@ -997,74 +1025,338 @@ async def list_closed_trade_events(
     return events[:limit]
 
 
-async def resync_closed_position_fills(position: Position) -> int:
-    """Push an admin-edited CLOSED position's prices/P&L back onto its
-    underlying Trade fills so the user-facing Closed blotter reflects it.
+async def position_fills_query(p: Position) -> dict[str, Any]:
+    """The fills that are `p`'s — each fill has ONE owner (`own_fills`), the
+    one its Positions row bills — taken-back ones included, so a delete also
+    reaches the closes a reopen undid; a reader rebuilding the book splices
+    LIVE_FILL."""
+    return {"_id": {"$in": [t.id for t in (await own_fills([p], live=False))[p.id]]}}
 
-    WHY: the user "Closed" tab is rebuilt FIFO from `Trade` documents
-    (entry = opening fill price, close = closing fill price, realised =
-    (close-entry)*qty). `admin_edit_position` only rewrites the `Position`
-    doc + a wallet REVERSAL — it never touched the fills, so an admin's
-    open/close-price correction showed on the admin Position view but the
-    user's history kept the OLD price/P&L. This syncs the fills.
 
-    Targeting (no Position→Trade FK exists): fills for the same
-    (user, token, product_type) executed inside the position's
-    [opened_at, closed_at] window (±10s slack). Opening fills (pnl_inr is
-    None) take the new avg_price; closing fills (pnl_inr set) take the new
-    close price and a recomputed pnl_inr so P&L-based consumers (reports,
-    reopen unwind) stay aligned. Best-effort — returns the number of fills
-    updated; the caller logs and never lets a miss fail the edit.
-    """
-    from datetime import timedelta
-    from app.models.trade import Trade
-    from app.services import market_data_service as _mds
+def in_reopen_gap(p: Position, ts: datetime) -> bool:
+    return any(lo < ts < hi for lo, hi in p.reopen_gaps or [])
 
-    if position.opened_at is None or position.closed_at is None:
-        return 0
 
-    lo = position.opened_at - timedelta(seconds=10)
-    hi = position.closed_at + timedelta(seconds=10)
-    trades = await Trade.find(
-        {
-            "user_id": position.user_id,
-            "instrument.token": position.instrument.token,
-            "product_type": position.product_type.value,
-            "executed_at": {"$gte": lo, "$lte": hi},
-        }
-    ).to_list()
-    if not trades:
-        return 0
+_OWN_SLACK = timedelta(seconds=5)
 
-    new_avg = to_decimal(position.avg_price)
-    new_close = to_decimal(position.ltp)
-    opened_side = str(getattr(position, "opened_side", None) or "BUY").upper()
-    sign = Decimal(1) if opened_side == "BUY" else Decimal(-1)
 
-    # Mirror the admin recalc's FX basis: USD-quoted segments book P&L in
-    # INR using the rate snapshotted at open (fallback to the live rate).
-    is_usd = _mds.position_is_usd(position)
-    fx = position_fx_rate(position)  # the rate the wallet moved at (close → open → current)
+def _own_rank(p: Position, t: Trade) -> tuple[bool, bool, timedelta, float] | None:
+    """How strongly `p` claims fill `t` (lower wins); None when it can't."""
+    carried = t.product_type == ProductType.MIS and p.product_type in (ProductType.NRML, ProductType.CNC)
+    if (p.product_type != t.product_type and not carried) or in_reopen_gap(p, t.executed_at):
+        return None
+    at, zero = t.executed_at, timedelta(0)
+    off = max(p.opened_at - at if p.opened_at else zero, at - p.closed_at if p.closed_at else zero, zero)
+    if off > _OWN_SLACK:
+        return None
+    newest = -p.opened_at.timestamp() if p.opened_at else float("inf")
+    return (off > timedelta(seconds=1), carried, off, newest)
 
-    updated = 0
-    for t in trades:
-        qty = abs(to_decimal(t.quantity))
-        if t.pnl_inr is None:
-            # Opening fill → new entry price.
-            t.price = to_decimal128(new_avg)
-            t.value = to_decimal128(new_avg * to_decimal(t.quantity))
-        else:
-            # Closing fill → new close price + recomputed realised. Keep the
-            # fill's own brokerage; pnl_inr stays net of the close leg to
-            # match the matching-engine convention.
-            gross = (new_close - new_avg) * qty * sign * fx
-            close_brk = to_decimal(t.total_charges or t.brokerage or 0)
-            t.price = to_decimal128(new_close)
-            t.value = to_decimal128(new_close * to_decimal(t.quantity))
-            t.pnl_inr = to_decimal128(quantize_money(gross - close_brk))
+
+async def own_fills(rows: list[Position], *, live: bool = True) -> dict[Any, list[Trade]]:
+    """Each live fill on the rows' (user, token) books, given to exactly ONE
+    position — the one that held the book when it executed — so overlapping
+    same-token positions (a scalper's re-entry, a reopened row, a carried
+    NRML row beside MIS round trips) never bill a fill twice. Every position
+    of the book competes, the closed neighbours a page doesn't list included.
+    Of the spans (less reopen gaps) within 5 s of the fill: inside one (to
+    1 s — the engine stamps the Trade just before apply_fill stamps the
+    Position) beats the slack; the fill's own product beats a carried
+    NRML / CNC row opened as MIS (the rollover flips only the doc); then the
+    nearer span, then the newer position. {row id: its fills, oldest first}.
+    `live=False` hands out the fills a delete / reopen took back as well."""
+    # ponytail: time spans, not ownership — a Trade carries no position id; a
+    # link stamped by apply_fill would make this exact. Re-entries < 1 s
+    # apart can swap a fill between two of the client's rows (never twice).
+    if not rows:
+        return {}
+    book: dict[str, Any] = {
+        "user_id": {"$in": list({r.user_id for r in rows})},
+        "instrument.token": {"$in": list({r.instrument.token for r in rows})},
+    }
+    opens = [r.opened_at for r in rows if r.opened_at]
+    ends = [r.closed_at for r in rows if r.closed_at]
+    fill_q: dict[str, Any] = {**book, **(LIVE_FILL if live else {})}
+    pos_q = dict(book)
+    if len(opens) == len(rows):  # else a row's start is unknown: the whole book
+        fill_q["executed_at"] = {"$gte": min(opens) - _OWN_SLACK}
+        # a neighbour closed up to 5 s before the first fill still competes
+        pos_q["$or"] = [{"closed_at": None}, {"closed_at": {"$gte": min(opens) - 2 * _OWN_SLACK}}]
+    if len(ends) == len(rows):  # all closed: nothing after the last close counts
+        fill_q.setdefault("executed_at", {})["$lte"] = max(ends) + _OWN_SLACK
+        pos_q["opened_at"] = {"$lte": max(ends) + 2 * _OWN_SLACK}
+    held = {p.id: p for p in await Position.find(pos_q).to_list()} | {r.id: r for r in rows}
+    books: dict[tuple[Any, str], list[Position]] = {}
+    for p in sorted(held.values(), key=lambda p: (p.opened_at is not None, p.opened_at)):
+        books.setdefault((p.user_id, p.instrument.token), []).append(p)
+    fills: dict[tuple[Any, str], list[Trade]] = {}
+    for t in await Trade.find(fill_q).sort("+executed_at").to_list():
+        fills.setdefault((t.user_id, t.instrument.token), []).append(t)
+
+    owned: dict[Any, list[Trade]] = {}
+    for key, ts in fills.items():  # one sweep per book: positions join as they open
+        ps, i, near = books.get(key, []), 0, []
+        for t in ts:
+            while i < len(ps) and ((o := ps[i].opened_at) is None or o - _OWN_SLACK <= t.executed_at):
+                near.append(ps[i])
+                i += 1
+            near = [p for p in near if p.closed_at is None or p.closed_at + _OWN_SLACK >= t.executed_at]
+            ranked = [(r, n) for n, p in enumerate(near) if (r := _own_rank(p, t)) is not None]
+            if ranked:
+                owned.setdefault(near[min(ranked)[1]].id, []).append(t)
+    return {r.id: owned.get(r.id, []) for r in rows}
+
+
+_QTY = Decimal("1e-8")
+_OPEN_ORDER = [OrderStatus.OPEN.value, OrderStatus.PENDING.value, OrderStatus.PARTIAL.value]
+
+
+def _restate(t: Any, qty: Decimal, price: Decimal) -> None:
+    """Fill `t` as `qty` @ `price`; its value and net amount follow."""
+    t.quantity = float(qty)
+    t.price = Decimal128(str(quantize_basis(price)))
+    t.value = to_decimal128(price * qty)
+    chg = to_decimal(t.total_charges)
+    t.net_amount = to_decimal128(to_decimal(t.value) + (chg if t.action == OrderAction.SELL else -chg))
+
+
+def _shifted(v: Any, by: Decimal) -> Decimal128:
+    return Decimal128(str(quantize_basis(to_decimal(v) + by)))
+
+
+async def _split_off_consumed(t: Any, keep: Decimal) -> None:
+    """Cut the units of fill `t` that closes already took into a fill of their
+    own, so the statement rows that billed them keep their price and charge
+    share. It lands 1 ms earlier so FIFO still takes it first; `t` keeps its id
+    (a per-fill SL/TP points at it), the `keep` units and the rest of the
+    charges."""
+    from app.services.matching_engine import _trade_number  # imports this module
+
+    total = abs(to_decimal(t.quantity))
+    used = total - keep
+    piece = Trade(**t.model_dump(exclude={"id", "revision_id"}))
+    piece.trade_number = _trade_number()
+    piece.executed_at = t.executed_at - timedelta(milliseconds=1)
+    for f in ("brokerage", "total_charges"):
+        share = quantize_money(to_decimal(getattr(t, f)) * used / total)
+        setattr(piece, f, to_decimal128(share))
+        setattr(t, f, to_decimal128(to_decimal(getattr(t, f)) - share))
+    _restate(piece, used, to_decimal(t.price))
+    _restate(t, keep, to_decimal(t.price))
+    await piece.insert()
+
+
+async def _orders_follow_fills(added: dict[Any, Decimal]) -> None:
+    """Each order's size moves by the units `added` to its fills, and its
+    average price follows them."""
+    for oid, more in added.items():
+        o = await Order.get(oid)
+        fills = await Trade.find(Trade.order_id == oid).to_list()
+        units = sum((abs(to_decimal(f.quantity)) for f in fills), ZERO)
+        if o is None or units <= 0:
+            continue
+        if more and o.filled_quantity:
+            r = (to_decimal(o.filled_quantity) + more) / to_decimal(o.filled_quantity)
+            o.quantity = float(to_decimal(o.quantity) + more)
+            o.filled_quantity = float(to_decimal(o.filled_quantity) + more)
+            o.lots = float(to_decimal(o.lots) * r)
+            o.margin_blocked = to_decimal128(to_decimal(o.margin_blocked) * r)
+        value = sum((to_decimal(f.price) * abs(to_decimal(f.quantity)) for f in fills), ZERO)
+        o.average_price = Decimal128(str(quantize_basis(value / units)))
+        await o.save()
+
+
+async def resync_position_fills(old: Position, new: Position) -> Decimal:
+    """Carry an admin edit (`old` → `new`, not yet saved) onto the fills that
+    every report is rebuilt from, so the statement says what the wallet does.
+    Returns the rupees the wallet must move (0 for an OPEN position).
+
+    OPEN — a quantity and/or entry-price edit reaches the lots the FIFO walk
+    still holds for the position: each is scaled by new/old units (a pyramid
+    keeps its ratio) and shifted by one amount (spacing kept) so they cost
+    what they did + new avg × new qty − old avg × old qty.
+    Units closes already took are cut off first and keep their price, so a
+    statement already sent does not move; closing fills are never touched.
+    opening_quantity moves with the units. When the walk holds none of the
+    position's units as lots (a reopen whose undone closes still drained them
+    — the re-close then bills off its own stamp —, a reversal's leg, a weekly
+    re-seed) the fills are left as they are.
+
+    CLOSED — every live close of the cycle is re-booked at its OWN close
+    price and fx: pnl_inr moves by sign × (Δclose − Δavg) × units × fx, and
+    the opening lots shift by Δavg (a specific-lot or pyramid history keeps its
+    shape). A close price can only be set when the cycle has exactly one
+    close (ConflictError otherwise, or when no close is found)."""
+    side = old.opened_side or (OrderAction.BUY if old.quantity >= 0 else OrderAction.SELL)
+    d_avg = to_decimal(new.avg_price) - to_decimal(old.avg_price)
+    if new.status == PositionStatus.OPEN:
+        await _resync_open_lots(old, new, side, d_avg)
+        return ZERO
+    return await _rebook_closed(old, new, side, d_avg)
+
+
+async def _resync_open_lots(old: Position, new: Position, side: OrderAction, d_avg: Decimal) -> None:
+    dq = abs(new.quantity) - abs(old.quantity)
+    if dq:
+        new.opening_quantity = float(old.opening_quantity or abs(old.quantity)) + dq
+    if not dq and not d_avg:
+        return
+    mine = {
+        t.id: t
+        for t in await Trade.find(
+            {**await position_fills_query(old), "action": side.value, "pnl_inr": None, **LIVE_FILL}
+        ).to_list()
+    }
+    lots: list[dict[str, Any]] = []
+    await list_closed_trade_events_fifo(old.user_id, limit=0, lots=lots)
+    held = [(mine[f["tid"]], to_decimal(round(f["qty"], 8))) for f in lots if f.get("tid") in mine]
+    units = sum((u for _, u in held), ZERO)
+    if not held or abs(units - to_decimal(abs(old.quantity))) > _QTY:
+        logger.warning(
+            "position_fills_not_resynced",
+            extra={"pos_id": str(old.id), "lot_units": str(units), "qty": old.quantity},
+        )
+        return
+    k = to_decimal(abs(new.quantity)) / units
+    # The held lots can cost more or less than avg × qty: an average-priced
+    # partial close booked against the average while FIFO took a front lot.
+    # That difference carries over unscaled, so the lots end up costing
+    # held + new_avg·new_qty − old_avg·old_qty and the fills still net to
+    # what the wallet booked.
+    held_avg = sum((to_decimal(t.price) * u for t, u in held), ZERO) / units
+    shift = d_avg - (held_avg - to_decimal(old.avg_price)) * to_decimal(dq) / to_decimal(abs(new.quantity))
+    left = to_decimal(abs(new.quantity))
+    added: dict[Any, Decimal] = {}  # order id → units added to its fills
+    for i, (t, u) in enumerate(held):
+        size = left if i == len(held) - 1 else (u * k).quantize(_QTY)
+        left -= size
+        if abs(to_decimal(t.quantity)) - u > _QTY:
+            await _split_off_consumed(t, u)
+        _restate(t, size, to_decimal(t.price) + shift)
         await t.save()
-        updated += 1
-    return updated
+        added[t.order_id] = added.get(t.order_id, ZERO) + size - u
+        # A per-fill SL/TP parked on this lot exits what it now holds.
+        for o in await Order.find({"sl_tp_source_trade_id": t.id, "status": {"$in": _OPEN_ORDER}}).to_list():
+            r = size / u
+            o.quantity = float(to_decimal(o.quantity) * r)
+            o.pending_quantity = float(to_decimal(o.pending_quantity) * r)
+            o.lots = float(to_decimal(o.lots) * r)
+            if o.cost_basis_override is not None:
+                o.cost_basis_override = _shifted(o.cost_basis_override, shift)
+            await o.save()
+    await _orders_follow_fills(added)
+
+
+SETTLE_REASONS = ("WEEKLY_SETTLEMENT", "EXPIRY_SETTLED")
+
+
+async def cycle_closes(p: Position, side: OrderAction) -> list[Trade]:
+    """The live closes of `p`'s current cycle (since its last reopen): its own
+    fills (`position_fills_query`) against the `side` it holds, with a booked
+    P&L. What a reopen undoes and a CLOSED edit re-books — one set for both."""
+    q = await position_fills_query(p)
+    if cycle := p.reopened_at or p.opened_at:
+        q["executed_at"] = {"$gte": cycle - timedelta(seconds=1)}
+    return await Trade.find(
+        {**q, "action": {"$ne": side.value}, "pnl_inr": {"$ne": None}, **LIVE_FILL}
+    ).to_list()
+
+
+async def _rebook_closed(old: Position, new: Position, side: OrderAction, d_avg: Decimal) -> Decimal:
+    sign = Decimal(1) if side == OrderAction.BUY else Decimal(-1)
+    new_close = to_decimal(new.ltp)
+    set_close = new_close != to_decimal(old.ltp)
+    if not d_avg and not set_close:
+        return ZERO
+    q = await position_fills_query(old)
+    closes = await cycle_closes(old, side)
+    settled = old.close_reason in SETTLE_REASONS  # a close with no fill
+    legs = len(closes) + int(settled)
+    if not legs:
+        raise ConflictError(
+            "No closing fill found for this position, so the statement cannot follow a price edit."
+        )
+    if set_close and legs != 1:
+        raise ConflictError(
+            f"This position closed in {legs} parts; a close price belongs to one close. "
+            "Edit the entry price instead."
+        )
+    native = inr = ZERO
+    touched: dict[Any, Decimal] = {}
+    for t in closes:
+        units = abs(to_decimal(t.quantity))
+        if t.closed_quantity is not None:
+            units = min(units, to_decimal(t.closed_quantity))
+        d = sign * ((new_close - to_decimal(t.price) if set_close else ZERO) - d_avg) * units
+        fx = to_decimal(t.fx_rate) if t.fx_rate is not None else ZERO  # None: booked 1:1
+        di = quantize_money(d * (fx if fx > 0 else Decimal(1)))
+        t.pnl_inr = to_decimal128(to_decimal(t.pnl_inr) + di)
+        if t.cost_basis_override is not None and d_avg:  # the lot it exited moved too
+            t.cost_basis_override = _shifted(t.cost_basis_override, d_avg)
+        if set_close:
+            _restate(t, abs(to_decimal(t.quantity)), new_close)
+        await t.save()
+        touched[t.order_id] = ZERO
+        native += d
+        inr += di
+    if settled:  # the walk bills it off the doc's avg_price / ltp
+        units = to_decimal(abs(old.quantity) or old.opening_quantity or 0)
+        d = sign * ((new_close - to_decimal(old.ltp) if set_close else ZERO) - d_avg) * units
+        native += d
+        inr += quantize_money(d * position_fx_rate(old))
+    if d_avg:
+        for t in await Trade.find({**q, "action": side.value, "pnl_inr": None, **LIVE_FILL}).to_list():
+            _restate(t, abs(to_decimal(t.quantity)), to_decimal(t.price) + d_avg)
+            await t.save()
+            touched[t.order_id] = ZERO
+    await _orders_follow_fills(touched)
+    new.realized_pnl = to_decimal128(to_decimal(old.realized_pnl) + native)
+    return inr
+
+
+def _booked_gross(t: Any) -> Decimal | None:
+    """The native gross the engine booked on closing fill `t`, or None for an
+    unstamped fill. pnl_inr is that gross in rupees, net of the close
+    brokerage — whatever basis it was realized against (the position average,
+    a specific-lot override, an admin edit's resync)."""
+    if t.pnl_inr is None:
+        return None
+    gross = to_decimal(t.pnl_inr) + to_decimal(t.total_charges or t.brokerage or 0)
+    fx = to_decimal(t.fx_rate) if getattr(t, "fx_rate", None) is not None else ZERO
+    return gross / fx if fx > 0 else gross
+
+
+def _one_book_tokens(positions: list[Position]) -> set[str]:
+    """Tokens whose fills form ONE FIFO book whatever their product type.
+
+    The EOD carry flips a surviving MIS position to NRML and leaves its
+    opening fills stamped MIS, and every later order on that token adopts
+    NRML. Keyed on the FILL's product type, one position's lots sat in two
+    queues: a close after the flip paired against half its own book
+    (sign-flipped rows), units it could not pair were dropped, and the
+    stranded lot later priced a fresh round trip. Only a token that HELD
+    positions under two product types at the same time keeps them apart —
+    those are genuinely separate books.
+    """
+    spans: dict[str, list[tuple]] = {}
+    for p in positions:
+        spans.setdefault(p.instrument.token, []).append(
+            (
+                p.opened_at.replace(tzinfo=None) if p.opened_at else datetime.min,
+                p.closed_at.replace(tzinfo=None) if p.closed_at else datetime.max,
+                p.product_type.value,
+            )
+        )
+    out: set[str] = set()
+    for token, rows in spans.items():
+        ends: dict[str, Any] = {}  # product → latest close among those opened so far
+        for opened, closed, product in sorted(rows):
+            if any(end > opened for k, end in ends.items() if k != product):
+                break  # held at once with a position under another product type
+            ends[product] = max(ends.get(product, closed), closed)
+        else:
+            out.add(token)
+    return out
 
 
 async def list_closed_trade_events_fifo(
@@ -1072,6 +1364,8 @@ async def list_closed_trade_events_fifo(
     *,
     skip: int = 0,
     limit: int = 25,
+    lots: list[dict[str, Any]] | None = None,
+    until: datetime | None = None,
 ) -> tuple[list[dict], int]:
     """FIFO per-opening-fill closed blotter.
 
@@ -1083,23 +1377,40 @@ async def list_closed_trade_events_fifo(
     Example — user holds:
         Fill A: BUY 100 @ 4339.89
         Fill B: BUY 100 @ 4339.99
-    User sells 150 qty → two rows:
-        Row 1: 100 @ entry 4339.89 → close px
-        Row 2:  50 @ entry 4339.99 → close px
-
-    P&L per row = (close_price - entry_price) × qty  (for BUY positions).
+    User sells 150 qty → two rows: 100 against fill A, 50 against fill B.
+    The lots decide which fills survive, the rows' opened_at and the
+    brokerage split; a stamped close is PRICED at what the wallet booked (the
+    engine's average, or a specific-lot basis), so entry_price is that basis
+    and P&L per row = (close_price - entry_price) × qty (for BUY positions).
     Brokerage is split proportionally across the sub-rows that a single
     closing trade produces.
 
     Returns (page_events, total_count) — newest-close-first, paginated.
+    `lots`, when given, receives the lots still open at the end of the walk
+    (each with its opening fill's id as "tid" and its book as "key"). `until`
+    stops the walk there: the events up to it are unchanged and `lots` is the
+    book as it stood then; each lot's "avg" is its book's engine average then
+    (what Position.avg_price read at that instant — weighted on adds, kept on
+    a close, re-derived on a specific-lot close, the settle price on a weekly
+    re-open). Every event's "legs" are its brokerage as
+    (charged_at, amount) — the opening fills' shares and the close's own — so
+    a statement can bill only the legs charged inside its window; "brokerage"
+    is their sum.
     """
     from collections import deque
     from app.models.trade import Trade
 
+    # A deleted position's fills are out of the book, opening legs included,
+    # and so is a close a reopen undid from §2.6 on (superseded_at). The whole
+    # history: a newest-N cap left an older statement window with no rows and
+    # cut a close off from its open (open leg's brokerage lost).
+    # ponytail: every live fill of the user per call; project to the walk's
+    # fields if a heavy client's Closed tab gets slow.
     trades = await (
-        Trade.find(Trade.user_id == PydanticObjectId(user_id))
+        Trade.find(
+            {"user_id": PydanticObjectId(user_id), "fifo_deleted": {"$ne": True}, "superseded_at": None}
+        )
         .sort("-executed_at")
-        .limit(3000)
         .to_list()
     )
     trades.reverse()  # chronological for FIFO walk
@@ -1115,13 +1426,76 @@ async def list_closed_trade_events_fifo(
     from datetime import datetime as _datetime
     from app.models.position import Position, PositionStatus
 
-    closed_pos = await Position.find(
-        Position.user_id == PydanticObjectId(user_id),
-        Position.status == PositionStatus.CLOSED,
-    ).to_list()
+    _all_pos = await Position.find(Position.user_id == PydanticObjectId(user_id)).to_list()
+    closed_pos = [_p for _p in _all_pos if _p.status == PositionStatus.CLOSED]
 
     def _naive(dt: Any) -> Any:
         return dt.replace(tzinfo=None) if dt else _datetime.min
+
+    _one_book = _one_book_tokens(_all_pos)
+
+    def _bookkey(token: str, product: str) -> tuple[str, str]:
+        return (token, "") if token in _one_book else (token, product)
+
+    # When each position on a token opened: an unstamped fill that opened one
+    # is an open, never a close the engine forgot to stamp.
+    _opened: dict[str, list] = {}
+    for _p in _all_pos:
+        if _p.opened_at:
+            _opened.setdefault(_p.instrument.token, []).append(_naive(_p.opened_at))
+    for _v in _opened.values():
+        _v.sort()
+
+    def _opened_by(t: Any) -> bool:
+        ts = _naive(t.executed_at)
+        o = _opened.get(t.instrument.token, [])
+        i = bisect_left(o, ts - timedelta(seconds=2))
+        return i < len(o) and o[i] <= ts + timedelta(seconds=2)
+
+    def _against(lots: Any, side: str) -> bool:
+        """Does the book hold any lot a `side` fill can close?"""
+        return any(f["side"] != side for f in lots)
+
+    # A close a reopen undid with the flag alone (before superseded_at, or
+    # held back since) still takes its lots: the statements already sent pair
+    # that way. The units the reopen gave back are held here instead, so
+    # their open legs reach the re-close, a settlement or Carry Forward
+    # rather than no row at all; pairing and gross are unchanged.
+    _restored: dict[tuple[str, str], list[dict]] = {}
+    _spans: dict[str, list] = {}
+    for _p in _all_pos:
+        if _p.opened_at:
+            _spans.setdefault(_p.instrument.token, []).append(
+                (_naive(_p.opened_at), _naive(_p.closed_at) if _p.closed_at else _datetime.max)
+            )
+
+    def _reopened(t: Any) -> bool:
+        """A flag-only close a reopen undid: a position still spans it (a
+        delete took its position's doc away)."""
+        if not getattr(t, "superseded_by_reopen", False):
+            return False
+        ts = _naive(t.executed_at)
+        return any(o <= ts <= c for o, c in _spans.get(t.instrument.token, ()))
+
+    def _reclaim(token: str, side: str, qty: float) -> tuple[list[tuple[Any, float]], float]:
+        """Take up to `qty` restored `side` units on `token`: their open legs
+        and the units taken."""
+        legs: list[tuple[Any, float]] = []
+        want = qty
+        for k, held in _restored.items():
+            if k[0] != token:
+                continue
+            for f in held:
+                if qty <= 1e-9:
+                    break
+                if f["side"] != side:
+                    continue
+                take = min(f["qty"], qty)
+                legs.append((f["opened_at"], f["open_brk"] * take / f["original_qty"]))
+                f["qty"] -= take
+                qty -= take
+            _restored[k] = [f for f in held if f["qty"] > 1e-9]
+        return legs, want - qty
 
     # One boundary per settlement-style close (WEEKLY_SETTLEMENT or
     # EXPIRY_SETTLED), to be merged into the walk. Both close the position
@@ -1130,6 +1504,23 @@ async def list_closed_trade_events_fifo(
     # its own and the closed blotter / tradebook would miss them (they showed on
     # the admin's Position-based view but not the user's Trade-based one).
     _SETTLE_REASONS = ("WEEKLY_SETTLEMENT", "EXPIRY_SETTLED")
+    # Weekly closes whose re-opened successor an admin later deleted: nothing
+    # holds the re-seeded lot any more.
+    _weekly = [_p.id for _p in closed_pos if _p.close_reason == "WEEKLY_SETTLEMENT"]
+    _successor_gone = (
+        {
+            s.old_position_id
+            for s in await PositionSettlement.find(
+                {
+                    "user_id": PydanticObjectId(user_id),
+                    "old_position_id": {"$in": _weekly},
+                    "successor_deleted_at": {"$ne": None},
+                }
+            ).to_list()
+        }
+        if _weekly
+        else set()
+    )
     _settle_boundaries: list[dict] = []
     for _p in closed_pos:
         if _p.close_reason not in _SETTLE_REASONS or not _p.closed_at:
@@ -1148,7 +1539,7 @@ async def list_closed_trade_events_fifo(
         )
         _settle_boundaries.append({
             "ts": _p.closed_at,
-            "key": (_p.instrument.token, _p.product_type.value),
+            "key": _bookkey(_p.instrument.token, _p.product_type.value),
             "entry_price": float(str(_p.avg_price)),  # this cycle's entry
             "settle_price": float(str(_p.ltp)),       # settlement LTP = new avg
             "qty": _sq,
@@ -1156,7 +1547,13 @@ async def list_closed_trade_events_fifo(
             "instrument": _p.instrument,
             "product_type": _p.product_type,
             "pid": _p.id,
+            # The row's open leg: when this position opened, not the
+            # settlement instant.
+            "opened_at": _p.opened_at or _p.closed_at,
             "close_reason": _p.close_reason,
+            # The rate the settlement moved the wallet at (1 for INR and for
+            # USD positions booked before the conversion).
+            "fx_rate": float(position_fx_rate(_p)),
         })
 
     def _charge(tr: Any) -> float:
@@ -1170,6 +1567,10 @@ async def list_closed_trade_events_fifo(
     # Per (token, product_type): deque of open fills (front = oldest = next to close).
     # Each fill: {"price": float, "qty": float, "opened_at": datetime, "side": "BUY"|"SELL"}
     open_queues: dict[tuple[str, str], deque] = {}
+    # The engine's average per book, replayed with apply_fill's rules: a
+    # statement's Brought / Carry Forward prices a position as it stood at
+    # its boundary, not at today's avg_price (a later add rewrote both).
+    _avg: dict[tuple[str, str], Decimal] = {}
     events: list[dict] = []
 
     # Merge real trades with settlement boundaries into ONE chronological
@@ -1188,30 +1589,15 @@ async def list_closed_trade_events_fifo(
         _timeline.append((_naive(b["ts"]), 1, _i, "settle", b))
     _timeline.sort(key=lambda x: (x[0], x[1], x[2]))
 
+    _until = None
+    if until is not None:
+        _until = (until.astimezone(UTC) if until.tzinfo else until).replace(tzinfo=None)
     for _ts, _ord, _idx, _kind, _obj in _timeline:
+        if _until is not None and _ts > _until:
+            break
         if _kind == "settle":
             b = _obj
             sign = 1.0 if b["side"] == "BUY" else -1.0
-            # Same gross formula the trade-FIFO path uses (no FX — closed
-            # rows render P&L raw, matching the rest of this blotter).
-            gross = (b["settle_price"] - b["entry_price"]) * b["qty"] * sign
-            events.append({
-                "_row_id": f"wsettle_{b['pid']}",
-                "_closed_at": b["ts"],
-                "_superseded": False,
-                "instrument": b["instrument"],
-                "product_type": b["product_type"],
-                "opened_side": b["side"],
-                "entry_price": b["entry_price"],
-                "close_price": b["settle_price"],
-                "qty": b["qty"],
-                "gross_pnl": gross,
-                "brokerage": 0.0,  # weekly settlement charges no brokerage
-                "opened_at": b["ts"],
-                "closed_at": b["ts"],
-                "instrument_token": b["key"][0],
-                "close_reason": b.get("close_reason", "WEEKLY_SETTLEMENT"),
-            })
             # The original opening fills are now closed out by this settlement.
             # A settlement closes the ENTIRE position for this token at the
             # settle price, so we must drain its opening fills before reseeding.
@@ -1242,20 +1628,51 @@ async def list_closed_trade_events_fifo(
                 ),
                 key=lambda k: _naive(open_queues[k][0]["opened_at"]),
             )
+            # Only the settled side's lots: the position held one side. The
+            # settlement charges nothing itself; its row carries the opening
+            # legs of the units it takes off the book (they were lost).
+            _legs: list[tuple[Any, float]] = []
             for _bk in _drain_keys:
                 _bq = open_queues[_bk]
-                while _bq and _remaining > 1e-9:
-                    _f = _bq[0]
+                for _f in _bq:
+                    if _remaining <= 1e-9:
+                        break
+                    if _f["side"] != b["side"]:
+                        continue
                     _take = min(float(_f["qty"]), _remaining)
+                    if _f.get("original_qty"):
+                        _legs.append((_f["opened_at"], _f.get("open_brk", 0.0) * _take / _f["original_qty"]))
                     _f["qty"] = float(_f["qty"]) - _take
                     _remaining -= _take
-                    if _f["qty"] <= 1e-9:
-                        _bq.popleft()
+                open_queues[_bk] = deque(_f for _f in _bq if _f["qty"] > 1e-9)
+            if _remaining > 1e-9:
+                _legs += _reclaim(_token, b["side"], _remaining)[0]
+            # Native gross like every row here; fx_rate converts it to what
+            # the wallet booked.
+            events.append({
+                "_row_id": f"wsettle_{b['pid']}",
+                "_closed_at": b["ts"],
+                "_superseded": False,
+                "instrument": b["instrument"],
+                "product_type": b["product_type"],
+                "opened_side": b["side"],
+                "entry_price": b["entry_price"],
+                "close_price": b["settle_price"],
+                "qty": b["qty"],
+                "gross_pnl": (b["settle_price"] - b["entry_price"]) * b["qty"] * sign,
+                "fx_rate": b["fx_rate"],
+                "brokerage": sum(a for _, a in _legs),
+                "legs": _legs,
+                "opened_at": b["opened_at"],
+                "closed_at": b["ts"],
+                "instrument_token": b["key"][0],
+                "close_reason": b.get("close_reason", "WEEKLY_SETTLEMENT"),
+            })
             # WEEKLY re-opens at the settlement price (reseed one fill under the
             # settled key so the next close prices off it); EXPIRY is terminal
             # (contract dead) — leave the queues empty, no reseed.
             _sq = open_queues.setdefault(b["key"], deque())
-            if b.get("close_reason") == "WEEKLY_SETTLEMENT":
+            if b.get("close_reason") == "WEEKLY_SETTLEMENT" and b["pid"] not in _successor_gone:
                 _sq.append({
                     "price": b["settle_price"],
                     "qty": b["qty"],
@@ -1264,10 +1681,11 @@ async def list_closed_trade_events_fifo(
                     "open_brk": 0.0,
                     "original_qty": b["qty"],
                 })
+                _avg[b["key"]] = to_decimal(b["settle_price"])
             continue
 
         t = _obj
-        key = (t.instrument.token, t.product_type.value)
+        key = _bookkey(t.instrument.token, t.product_type.value)
         qty = abs(float(t.quantity))
         if qty <= 0:
             continue
@@ -1275,31 +1693,41 @@ async def list_closed_trade_events_fifo(
         is_buy = t.action == OrderAction.BUY
         side_str = "BUY" if is_buy else "SELL"
 
-        q = open_queues.setdefault(key, deque())
+        q = own_q = open_queues.setdefault(key, deque())
+        qkey = key
 
         # Cross-product-type fallback: admin force-closes sometimes record
         # the closing fill with a different product_type than the opening fill
         # (e.g. MIS open closed as NRML). The exact (token, product_type) queue
-        # is empty, but another queue for the same token has the open position.
+        # holds nothing to close, but another queue for the same token does.
         # Only kick in when pnl_inr is set (definitive closing signal).
-        if not q and t.pnl_inr is not None:
+        if t.pnl_inr is not None and not _against(q, side_str):
             alt_key = next(
-                (k for k in open_queues if k[0] == t.instrument.token and open_queues[k]),
+                (k for k in open_queues if k[0] == t.instrument.token and _against(open_queues[k], side_str)),
                 None,
             )
             if alt_key:
-                q = open_queues[alt_key]
+                q, qkey = open_queues[alt_key], alt_key
 
         # Primary signal: pnl_inr set = closing fill; None = opening fill.
-        # Fallback: if pnl_inr is None but queue has the OPPOSITE side,
-        # treat as a closing fill whose pnl_inr the matching engine missed
-        # (e.g. partial close recorded without pnl_inr due to an engine bug).
-        queue_side = q[0]["side"] if q else None
+        # Legacy fallback: fills booked before pnl_inr existed carry none, so
+        # an unstamped fill facing a book that holds only the OPPOSITE side is
+        # read as a close — unless it opened a position (a fresh open after a
+        # deleted position left stale lots behind, which drained them and
+        # billed the round trip twice), or the book also holds its own side
+        # (an add).
         is_closing = t.pnl_inr is not None or (
-            queue_side is not None and queue_side != side_str
+            bool(q) and all(f["side"] != side_str for f in q) and not _opened_by(t)
         )
 
         if not is_closing:
+            _held = to_decimal(sum(f["qty"] for f in q if f["side"] == side_str))
+            _px = to_decimal(t.price)
+            _avg[key] = (
+                quantize_basis((_avg[key] * _held + _px * to_decimal(qty)) / (_held + to_decimal(qty)))
+                if _held > 0 and key in _avg
+                else _px
+            )
             q.append({
                 "price": price,
                 "qty": qty,
@@ -1307,11 +1735,32 @@ async def list_closed_trade_events_fifo(
                 "side": side_str,
                 "open_brk": _charge(t),  # stored for pro-rata allocation on close
                 "original_qty": qty,     # original fill qty for correct pro-rata on partial closes
+                "live": not getattr(t, "superseded_by_reopen", False),
+                "tid": t.id,
             })
             continue
 
         # ── Closing fill: consume from queue ─────────────────────────────
-        if not q:
+        # A reversal closes `closed_quantity` units and opens the rest on its
+        # own side, carrying that share of the fill's brokerage. Closes booked
+        # before the engine stamped closed_quantity close the whole fill.
+        _closed = qty
+        if getattr(t, "closed_quantity", None) is not None:
+            _closed = min(qty, float(t.closed_quantity))
+            _excess = qty - _closed
+            if _excess > 1e-9:
+                _avg[key] = to_decimal(t.price)  # the flip opens the other side here
+                own_q.append({
+                    "price": price,
+                    "qty": _excess,
+                    "opened_at": t.executed_at,
+                    "side": side_str,
+                    "open_brk": _charge(t) * _excess / qty,
+                    "original_qty": _excess,
+                    "live": not getattr(t, "superseded_by_reopen", False),
+                })
+
+        if not _against(q, side_str):
             # Queue is empty — no opening fill to pair against. This is the
             # EXPECTED state after an admin REOPEN: reopen flips the position
             # back to OPEN reusing the original entry but writes NO new
@@ -1330,21 +1779,18 @@ async def list_closed_trade_events_fifo(
             #   raw_gross = (entry - close) * qty   for a short (closed by BUY)
             # so `entry` falls straight out. price>0 guards the phantom
             # zero-priced fills the matching engine sometimes writes.
-            if t.pnl_inr is not None and qty > 0 and price > 0:
-                close_brk = _charge(t)
-                gross = float(str(t.pnl_inr)) + close_brk  # back out brokerage → raw gross
-                # pnl_inr is rupees; entry recovery needs the native gross.
-                _fx = getattr(t, "fx_rate", None)
-                if _fx is not None:
-                    _fx_v = float(str(_fx))
-                    if _fx_v > 0:
-                        gross /= _fx_v
+            if t.pnl_inr is not None and _closed > 0 and price > 0:
+                close_brk = _charge(t) * _closed / qty
+                gross = float(_booked_gross(t))  # pnl_inr in native units, brokerage backed out
                 # The closing action is the OPPOSITE of the opening side.
                 opened_side = "SELL" if is_buy else "BUY"
                 if opened_side == "BUY":
-                    entry_price = price - (gross / qty)
+                    entry_price = price - (gross / _closed)
                 else:
-                    entry_price = price + (gross / qty)
+                    entry_price = price + (gross / _closed)
+                _legs_ac = [(t.executed_at, close_brk)]
+                if not getattr(t, "superseded_by_reopen", False):
+                    _legs_ac = _reclaim(t.instrument.token, opened_side, _closed)[0] + _legs_ac
                 events.append({
                     "_row_id": f"fifo_{t.id}_0",
                     "_closed_at": t.executed_at,
@@ -1354,11 +1800,12 @@ async def list_closed_trade_events_fifo(
                     "opened_side": opened_side,
                     "entry_price": entry_price,
                     "close_price": price,
-                    "qty": qty,
+                    "qty": _closed,
                     "_order_id": t.order_id,
                     "gross_pnl": gross,
                     "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
-                    "brokerage": close_brk,
+                    "brokerage": sum(a for _, a in _legs_ac),
+                    "legs": _legs_ac,
                     # No surviving opening fill — the position's own
                     # opened_at is filled in below; close time is the last resort.
                     "opened_at": t.executed_at,
@@ -1369,8 +1816,20 @@ async def list_closed_trade_events_fifo(
             continue
 
         close_brk = _charge(t)
-        remaining = qty
+        remaining = _closed
         sub_idx = 0
+        # Bill the close at what the wallet was charged. The engine books
+        # (close − Position.avg_price) × qty — or against a specific-lot basis,
+        # whose cost the re-derived average then releases — and stamps it on
+        # pnl_inr. Pricing off each lot's own price billed the same trade a
+        # second way: a partly closed pyramid printed a different week, and
+        # across a weekly settlement (booked off the engine average) the gap
+        # never washed out. The lots still decide which fills survive, the
+        # opened_at and the brokerage split; the stamp is shared pro rata over
+        # the units this close takes off the book. Unstamped (legacy) closes
+        # keep the lot price.
+        _booked = _booked_gross(t)
+        _units = to_decimal(min(_closed, sum(f["qty"] for f in q if f["side"] != side_str)))
         # Specific-lot close (Active-tab Exit): this closing trade was booked
         # against a SPECIFIC tapped fill (cost_basis_override), not the FIFO
         # front — so pair it with the queued opening fill whose entry price
@@ -1382,14 +1841,19 @@ async def list_closed_trade_events_fifo(
                 _basis = float(str(t.cost_basis_override))
         except Exception:
             _basis = None
+        _before = to_decimal(sum(f["qty"] for f in q if f["side"] != side_str))
+        _undone = _reopened(t)
 
-        while remaining > 1e-9 and q:
-            idx = 0
-            if _basis is not None:
-                for j in range(len(q)):
-                    if abs(q[j]["price"] - _basis) < 1e-6:
-                        idx = j
-                        break
+        while remaining > 1e-9:
+            # A close takes only lots of the OTHER side: a book holding both
+            # (a reversal's new leg, a stale lot) priced a sell against a short.
+            _opp = [j for j in range(len(q)) if q[j]["side"] != side_str]
+            if not _opp:
+                break
+            idx = next(
+                (j for j in _opp if _basis is not None and abs(q[j]["price"] - _basis) < 1e-6),
+                _opp[0],
+            )
             front = q[idx]
             consume = min(front["qty"], remaining)
 
@@ -1404,7 +1868,12 @@ async def list_closed_trade_events_fifo(
             eff_basis = _basis if _basis is not None else front["price"]
 
             # Gross P&L for this (opening-fill × closing-fill) pairing
-            if front["side"] == "BUY":
+            if _booked is not None and _units > 0:
+                gross = float(_booked * to_decimal(consume) / _units)
+                _per_unit = _booked / _units
+                _px = to_decimal(t.price)
+                eff_basis = float(_px - _per_unit if front["side"] == "BUY" else _px + _per_unit)
+            elif front["side"] == "BUY":
                 gross = (price - eff_basis) * consume   # long close
             else:
                 gross = (eff_basis - price) * consume   # short close
@@ -1429,11 +1898,21 @@ async def list_closed_trade_events_fifo(
                 "gross_pnl": gross,
                 "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
                 "brokerage": brk_alloc,
+                "legs": [(front["opened_at"], open_brk_alloc), (t.executed_at, close_brk_alloc)],
                 "opened_at": front["opened_at"],
                 "closed_at": t.executed_at,
                 "instrument_token": t.instrument.token,
             })
 
+            if _undone and front.get("live", True):
+                _restored.setdefault(qkey, []).append({
+                    "price": front["price"],
+                    "qty": consume,
+                    "opened_at": front["opened_at"],
+                    "side": front["side"],
+                    "open_brk": open_brk_alloc,
+                    "original_qty": consume,
+                })
             front["qty"] -= consume
             remaining -= consume
             sub_idx += 1
@@ -1441,13 +1920,39 @@ async def list_closed_trade_events_fifo(
             if front["qty"] < 1e-9:
                 del q[idx]
 
+        if remaining > 1e-9 and sub_idx and not getattr(t, "superseded_by_reopen", False):
+            # The units it took past the book: their open legs and their share
+            # of this close's own charge.
+            _more, _took_r = _reclaim(t.instrument.token, events[-1]["opened_side"], remaining)
+            if _took_r > 1e-9:
+                _more.append((t.executed_at, close_brk * _took_r / qty))
+            events[-1]["legs"] = events[-1]["legs"] + _more
+            events[-1]["brokerage"] += sum(a for _, a in _more)
+
+        # A specific-lot close of part of the book re-derives the survivors'
+        # average as the engine does (basis_override); any other close keeps it.
+        _took = to_decimal(_closed - remaining)
+        if _basis is not None and qkey in _avg and _before - _took > 0:
+            _b = to_decimal(t.cost_basis_override)
+            if _avg[qkey] * _before >= _b * _took:
+                _avg[qkey] = quantize_basis((_avg[qkey] * _before - _b * _took) / (_before - _took))
+
+    if lots is not None:
+        lots.extend({**f, "key": _k, "avg": _avg.get(_k)} for _k, _q in open_queues.items() for f in _q)
+        lots.extend(
+            {**f, "key": _k, "avg": _avg.get(_k), "restored": True}
+            for _k, _held in _restored.items()
+            for f in _held
+        )
+
     # Drop closing fills an admin REOPEN/DELETE later undid. They stay in the
     # collection (audit) and were processed above so the FIFO pairing of the
     # SURVIVING fills stayed correct (each undone close still consumed its
     # opening fill in order) — but they must not render, otherwise a
     # reopened-then-reclosed position shows every intermediate close instead
     # of just its final one. This makes the user Closed blotter match the
-    # admin Position-doc view.
+    # admin Position-doc view. (A delete that stamped `fifo_deleted` took its
+    # fills out before the walk; only older deletes still reach here.)
     events = [e for e in events if not e.get("_superseded")]
 
     # Enrich events with close_reason from Position documents so the user
@@ -1456,24 +1961,26 @@ async def list_closed_trade_events_fifo(
     # (Settlement events were already stamped WEEKLY_SETTLEMENT inline above;
     # the 30s match below leaves them untouched.)
     if events:
-        # (token, product_type) → [(closed_at, close_reason), ...]
+        # (token, product_type) → [(closed_at, close_reason), ...] by closed_at;
+        # the nearest close is one of the two around the row's (bisect — a
+        # scan per row was quadratic in a long history on one script).
         _pos_map: dict[tuple, list] = {}
         for _p in closed_pos:
-            _k = (_p.instrument.token, _p.product_type.value)
+            _k = _bookkey(_p.instrument.token, _p.product_type.value)
             if _p.closed_at:
-                _pos_map.setdefault(_k, []).append((_p.closed_at, _p.close_reason or "USER"))
+                _pos_map.setdefault(_k, []).append((_naive(_p.closed_at), _p.close_reason or "USER"))
+        for _v in _pos_map.values():
+            _v.sort(key=lambda x: x[0])
         for ev in events:
             if ev.get("close_reason"):
                 continue  # already set (e.g. inline settlement rows)
-            _k = (ev["instrument_token"], ev["product_type"].value)
+            _k = _bookkey(ev["instrument_token"], ev["product_type"].value)
             _entries = _pos_map.get(_k)
             if _entries:
-                _cat = ev["closed_at"]
-                _best = min(
-                    _entries,
-                    key=lambda x: abs((x[0].replace(tzinfo=None) - _cat.replace(tzinfo=None)).total_seconds()),
-                )
-                if abs((_best[0].replace(tzinfo=None) - _cat.replace(tzinfo=None)).total_seconds()) < 30:
+                _cat = _naive(ev["closed_at"])
+                _i = bisect_left(_entries, _cat, key=lambda x: x[0])
+                _best = min(_entries[max(_i - 1, 0) : _i + 1], key=lambda x: abs((x[0] - _cat).total_seconds()))
+                if abs((_best[0] - _cat).total_seconds()) < 30:
                     ev["close_reason"] = _best[1]
 
         # A PARTIAL close leaves the position open, so no Position doc carries
@@ -1497,10 +2004,6 @@ async def list_closed_trade_events_fifo(
     # position that was open on that instrument when the close happened.
     _unknown = [ev for ev in events if ev.get("_open_unknown")]
     if _unknown:
-        _all_pos = closed_pos + await Position.find(
-            Position.user_id == PydanticObjectId(user_id),
-            Position.status == PositionStatus.OPEN,
-        ).to_list()
         for ev in _unknown:
             _cat = _naive(ev["closed_at"])
             _cands = [
@@ -1701,7 +2204,8 @@ async def position_required_margin(p: Position) -> Decimal:
         q = {}
     mark = exit_mark(p.quantity, q, q.get("ltp"), p.ltp, p.avg_price)
     qty = abs(to_decimal(p.quantity))
-    if p.product_type != _PT.MIS:
+    # MIS and NRML both lock the intraday tier (a carry never re-margins).
+    if p.product_type not in (_PT.MIS, _PT.NRML):
         return overnight_margin(s, qty, mark, p.instrument.lot_size, position_is_usd(p))
     fixed = to_decimal(s.get("fixed_margin_per_lot") or 0)
     if s.get("margin_calc_mode") == "fixed" and fixed > 0:
@@ -1714,10 +2218,12 @@ async def position_required_margin(p: Position) -> Decimal:
 
 
 def carry_step(min_lot: Any, lot_size: Any) -> Decimal:
-    """Smallest quantity the rollover trims to: one min-lot when that is a
-    fraction of a unit (crypto / forex), otherwise one whole unit."""
+    """Smallest quantity the rollover trims to: one min-lot in units
+    (min_lot × lot_size — 1,250 for a NATURALGAS lot, 65 for NIFTY, 0.01 for
+    crypto), one share where lots don't apply (min_lot 0). Trimming in single
+    units left carried F&O/MCX at odd sizes (11-Nov: COPPER 369 of a 2,500 lot)."""
     m = to_decimal(min_lot or 0) * to_decimal(lot_size or 1)
-    return m if 0 < m < 1 else Decimal(1)
+    return m if m > 0 else Decimal(1)
 
 
 def floor_to_step(x: Decimal, step: Decimal) -> Decimal:
@@ -1771,6 +2277,17 @@ def affordable_carry(qty: Decimal, cash: Decimal, locked: Decimal, full_margin: 
         return qty
     keep = floor_to_step(qty * (cash + locked) / full_margin, step) - step
     return max(min(keep, qty - step), Decimal(0))
+
+
+def rollover_fire_at(group: str, fire_at: Any, day: Any, muhurat_close: Any = None) -> Any:
+    """When `group` rolls on the IST `day`: `fire_at`, a Muhurat session's
+    close + 1 min, or None when it doesn't roll that day. Forex closes its
+    Mon-Fri sessions on Tue-Sat mornings and keeps no Indian calendar."""
+    if group == "FOREX":
+        return fire_at if day.weekday() in (1, 2, 3, 4, 5) else None
+    if muhurat_close is not None:
+        return rollover_fire_time(muhurat_close, 1)
+    return None if is_weekend(day) else fire_at
 
 
 def rollover_fire_time(close: Any, delay_min: int) -> Any:
@@ -1890,7 +2407,6 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
 
     Returns {converted, force_closed, trimmed, skipped, charged, left_in_mis}.
     """
-    from app.core.exceptions import InsufficientFundsError
     from app.core.redis_client import cache_delete_pattern
     from app.models._base import OrderType as _OT, ProductType as _PT
     from app.models.audit_log import AuditAction
@@ -1976,21 +2492,13 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
         out["skipped"] += 1
 
     async def _carry(pos: Position, s: dict, mark: Decimal) -> bool:
-        """Flip a carried MIS position to NRML at its overnight margin
-        (block / release the delta) and charge the carry fee once. False =
-        the margin delta couldn't be funded (yet)."""
+        """Flip a carried MIS position to NRML — its locked (intraday) margin
+        is unchanged — and charge the carry fee once."""
         if pos.product_type == _PT.MIS:
-            new_margin = overnight_margin(s, pos.quantity, mark, pos.instrument.lot_size, position_is_usd(pos))
-            old_margin = to_decimal(pos.margin_used)
-            delta = new_margin - old_margin
-            if delta > 0:
-                try:
-                    await wallet_service.block_margin(pos.user_id, delta)
-                except InsufficientFundsError:
-                    return False
-            elif delta < 0:
-                await wallet_service.release_margin(pos.user_id, -delta)
-            pos.margin_used = Decimal128(str(new_margin))
+            # Operator 2026-11-11: the carry keeps the INTRADAY margin locked at
+            # entry — used margin never changes overnight. The overnight tier is
+            # only the funds check in plan_carry that sizes what carries.
+            old_margin = new_margin = to_decimal(pos.margin_used)
             pos.product_type = _PT.NRML
             await pos.save()
             await _recompute_tracker(
@@ -2302,9 +2810,11 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
 
         • NSE/BSE/F&O → 15:41, the platform's NSE close (operator-set)
         • MCX         → close + 1 min
-        • Forex / crypto / international → no daily close, never rolled
+        • Forex       → 03:30, Tue-Sat (the Mon-Fri sessions' close)
+        • Crypto / other international → no daily close, never rolled
 
-    Weekends and the exchange's full-day holidays are skipped. The "done
+    Weekends and the exchange's full-day holidays are skipped (not for
+    forex, which has neither). The "done
     today" marker is persisted in Redis as well as memory, so a restart
     after the close never sweeps the same book a second time.
     """
@@ -2316,11 +2826,12 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     from app.models._base import Exchange as _Exchange
     from app.models.holiday import TradingHoliday as _TradingHoliday
     from app.utils.time_utils import (
+        FOREX_ROLLOVER,
+        FOREX_SEGMENTS,
         INDIAN_EQUITY_FNO_SEGMENTS,
         MCX_CLOSE,
         NSE_BSE_CLOSE,
         MCX_SEGMENTS,
-        is_weekend,
         now_ist,
     )
 
@@ -2331,6 +2842,7 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     groups = (
         ("INDIAN_EQUITY_FNO", INDIAN_EQUITY_FNO_SEGMENTS, rollover_fire_time(NSE_BSE_CLOSE, 0)),
         ("MCX", MCX_SEGMENTS, rollover_fire_time(MCX_CLOSE, 1)),
+        ("FOREX", FOREX_SEGMENTS, FOREX_ROLLOVER),
     )
 
     async def _done(group: str, day: str) -> bool:
@@ -2359,54 +2871,57 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     while not _intraday_loop_stop:
         try:
             now = now_ist()
-            if not is_weekend(now.date()):
-                day_key = now.strftime("%Y%m%d")
-                for group_name, group_set, fire_at in groups:
-                    if now.time() < fire_at or await _done(group_name, day_key):
-                        continue
-                    # Full-day exchange holiday → market never opened, so
-                    # nothing should roll or be squared off today. Mark the
-                    # day done so we don't re-check every minute. FAIL-OPEN:
-                    # any lookup error proceeds with the rollover so a guard
-                    # bug can never suppress a real EOD sweep.
+            from app.utils.time_utils import muhurat_window as _mw
+
+            _mu = _mw(now.date())  # Muhurat day: roll at the session close
+            day_key = now.strftime("%Y%m%d")
+            for group_name, group_set, close_at in groups:
+                fire_at = rollover_fire_at(group_name, close_at, now.date(), _mu[1] if _mu else None)
+                if fire_at is None or now.time() < fire_at or await _done(group_name, day_key):
+                    continue
+                # Full-day exchange holiday → market never opened, so
+                # nothing should roll or be squared off today. Mark the
+                # day done so we don't re-check every minute. FAIL-OPEN:
+                # any lookup error proceeds with the rollover so a guard
+                # bug can never suppress a real EOD sweep.
+                holiday = None
+                try:
+                    _exch = _group_exchange.get(group_name)
+                    if _exch is not None:
+                        holiday = await _TradingHoliday.find_one(
+                            _TradingHoliday.holiday_date == now.date(),
+                            _TradingHoliday.exchange == _exch,
+                            _TradingHoliday.is_full_day == True,  # noqa: E712
+                        )
+                except Exception:  # noqa: BLE001
                     holiday = None
-                    try:
-                        _exch = _group_exchange.get(group_name)
-                        if _exch is not None:
-                            holiday = await _TradingHoliday.find_one(
-                                _TradingHoliday.holiday_date == now.date(),
-                                _TradingHoliday.exchange == _exch,
-                                _TradingHoliday.is_full_day == True,  # noqa: E712
-                            )
-                    except Exception:  # noqa: BLE001
-                        holiday = None
-                    if holiday is not None:
-                        await _mark_done(group_name, day_key)
-                        _log.info(
-                            "intraday_to_carry_skipped_holiday",
-                            extra={"group": group_name, "date": day_key},
-                        )
-                        continue
-                    # Expiry-day settlement FIRST — close every open position
-                    # on an instrument expiring TODAY at its close/clearing
-                    # price, so an expiring contract is never carried forward.
-                    try:
-                        exp_summary = await settle_expiring_today(group_set)
-                        if exp_summary.get("settled"):
-                            _log.info(
-                                "expiry_day_settled_group",
-                                extra={"group": group_name, **exp_summary},
-                            )
-                    except Exception:  # noqa: BLE001
-                        _log.exception(
-                            "expiry_day_settle_failed", extra={"group": group_name}
-                        )
-                    summary = await convert_intraday_to_carry(group_set)
+                if holiday is not None:
                     await _mark_done(group_name, day_key)
                     _log.info(
-                        "intraday_to_carry_rolled",
-                        extra={"group": group_name, **summary},
+                        "intraday_to_carry_skipped_holiday",
+                        extra={"group": group_name, "date": day_key},
                     )
+                    continue
+                # Expiry-day settlement FIRST — close every open position
+                # on an instrument expiring TODAY at its close/clearing
+                # price, so an expiring contract is never carried forward.
+                try:
+                    exp_summary = await settle_expiring_today(group_set)
+                    if exp_summary.get("settled"):
+                        _log.info(
+                            "expiry_day_settled_group",
+                            extra={"group": group_name, **exp_summary},
+                        )
+                except Exception:  # noqa: BLE001
+                    _log.exception(
+                        "expiry_day_settle_failed", extra={"group": group_name}
+                    )
+                summary = await convert_intraday_to_carry(group_set)
+                await _mark_done(group_name, day_key)
+                _log.info(
+                    "intraday_to_carry_rolled",
+                    extra={"group": group_name, **summary},
+                )
         except Exception:  # noqa: BLE001
             _log.exception("intraday_to_carry_loop_failed")
         try:
@@ -2464,8 +2979,8 @@ async def consolidate_open_positions(user_id: PydanticObjectId | str) -> int:
         if buy_qty <= 0 and sell_qty <= 0:
             continue
 
-        buy_avg = quantize_money(_wavg(buys, buy_qty))
-        sell_avg = quantize_money(_wavg(sells, sell_qty))
+        buy_avg = quantize_basis(_wavg(buys, buy_qty))
+        sell_avg = quantize_basis(_wavg(sells, sell_qty))
         offset = min(buy_qty, sell_qty)
         realized = (
             quantize_money((sell_avg - buy_avg) * to_decimal(offset)) if offset > 0 else ZERO

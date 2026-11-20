@@ -1,184 +1,253 @@
-"""Market trading hours configuration service.
+"""Configurable market trading hours service (IST).
 
-Provides market-wise (NSE, BSE, MCX, FOREX, CRYPTO) start and end time
-configuration stored in PlatformSetting ("trading.market_hours").
-
-Used by:
-  - Admin Platform Settings (/settings/platform) to view and set market hours
-  - User instruments/market-hours endpoint to supply hours to frontend-user
-  - Order validator to verify trades at submission time
+Backed by `PlatformSetting` (`setting_key = "trading.market_hours"`) with a
+short in-memory TTL cache per worker so order validation reads it in O(1)
+without hitting MongoDB on every order.
 """
 
 from __future__ import annotations
 
-import logging
-import time as _sys_time
-from datetime import datetime, time
+import copy
+import time as _time
+from datetime import datetime
 from typing import Any
 
 from app.models.platform_setting import PlatformSetting, SettingType
-from app.utils.time_utils import IST, now_ist, parse_hhmm, to_ist
+from app.utils.time_utils import now_ist, to_ist
 
-logger = logging.getLogger(__name__)
+MARKET_HOURS_SETTING_KEY = "trading.market_hours"
+_CACHE_TTL_SEC = 10.0
 
-SETTING_KEY = "trading.market_hours"
+MARKET_KEYS = ("NSE", "BSE", "MCX", "FOREX", "CRYPTO")
 
 DEFAULT_MARKET_HOURS: dict[str, dict[str, Any]] = {
     "NSE": {
-        "name": "NSE (Equity & F&O)",
-        "start_time": "09:15",
-        "end_time": "15:30",
-        "is_enabled": True,
-        "days": [1, 2, 3, 4, 5],  # 1=Mon .. 5=Fri (0=Sun, 6=Sat)
-        "description": "National Stock Exchange equity, futures, and options",
+        "enabled": True,
+        "start": "09:15",
+        "end": "15:30",
+        "days": "Mon - Fri",
     },
     "BSE": {
-        "name": "BSE (Equity & F&O)",
-        "start_time": "09:15",
-        "end_time": "15:30",
-        "is_enabled": True,
-        "days": [1, 2, 3, 4, 5],
-        "description": "Bombay Stock Exchange equity, Sensex futures, and options",
+        "enabled": True,
+        "start": "09:15",
+        "end": "15:30",
+        "days": "Mon - Fri",
     },
     "MCX": {
-        "name": "MCX (Commodities)",
-        "start_time": "09:00",
-        "end_time": "23:55",
-        "is_enabled": True,
-        "days": [1, 2, 3, 4, 5],
-        "description": "Multi Commodity Exchange: Gold, Silver, Crude Oil, Natural Gas",
+        "enabled": True,
+        "start": "09:00",
+        "end": "23:55",
+        "days": "Mon - Fri",
     },
     "FOREX": {
-        "name": "Forex & Global (24/5)",
-        "start_time": "00:00",
-        "end_time": "23:59",
-        "is_enabled": True,
-        "days": [1, 2, 3, 4, 5],
-        "description": "Foreign exchange currencies, global indices, and commodities",
+        "enabled": True,
+        "start": "00:00",
+        "end": "23:59",
+        "days": "Mon - Fri",
     },
     "CRYPTO": {
-        "name": "Crypto (24/7)",
-        "start_time": "00:00",
-        "end_time": "23:59",
-        "is_enabled": True,
-        "days": [0, 1, 2, 3, 4, 5, 6],
-        "description": "Cryptocurrency 24/7 spot and futures markets",
+        "enabled": True,
+        "start": "00:00",
+        "end": "23:59",
+        "days": "24/7 (Mon - Sun)",
     },
 }
 
-# In-memory cached market hours config with TTL to prevent DB hammering
-_cached_config: dict[str, dict[str, Any]] | None = None
-_cache_timestamp: float = 0.0
-_CACHE_TTL_SEC: float = 15.0
+_cached_hours: dict[str, dict[str, Any]] | None = None
+_cached_at: float = 0.0
 
 
-def resolve_market(exchange: str | None, segment: str | None) -> str:
-    """Resolve an instrument's exchange and segment to a canonical market key."""
-    seg = (segment or "").upper()
-    ex = (exchange or "").upper()
+def _valid_hhmm(val: Any, fallback: str) -> str:
+    if not isinstance(val, str):
+        return fallback
+    s = val.strip()
+    parts = s.split(":")
+    if len(parts) < 2:
+        return fallback
+    try:
+        h = int(parts[0])
+        m = int(parts[1])
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return f"{h:02d}:{m:02d}"
+    except ValueError:
+        pass
+    return fallback
 
-    if "CRYPTO" in seg or ex in ("CRYPTO", "BINANCE"):
-        return "CRYPTO"
-    if seg.startswith("MCX") or ex == "MCX" or seg == "COMMODITIES":
-        return "MCX"
-    if seg.startswith(("BSE", "BFO")) or ex in ("BSE", "BFO"):
-        return "BSE"
+
+def normalize_market_hours(raw: Any) -> dict[str, dict[str, Any]]:
+    """Merge arbitrary stored/input dict onto `DEFAULT_MARKET_HOURS`."""
+    out = copy.deepcopy(DEFAULT_MARKET_HOURS)
+    if not isinstance(raw, dict):
+        return out
+    for key in MARKET_KEYS:
+        item = raw.get(key)
+        if not isinstance(item, dict):
+            continue
+        default_item = DEFAULT_MARKET_HOURS[key]
+        out[key] = {
+            "enabled": bool(item.get("enabled", default_item["enabled"])),
+            "start": _valid_hhmm(item.get("start"), default_item["start"]),
+            "end": _valid_hhmm(item.get("end"), default_item["end"]),
+            "days": str(item.get("days") or default_item["days"]),
+        }
+    return out
+
+
+async def get_market_hours(*, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    """Return the active market hours dict (cached for `_CACHE_TTL_SEC`)."""
+    global _cached_hours, _cached_at
+    now_mono = _time.monotonic()
     if (
-        seg in ("FOREX", "STOCKS", "INDICES")
-        or "FOREX" in seg
-        or "FX" in seg
-        or ex == "CDS"
-        or seg.startswith("CDS")
+        not force_refresh
+        and _cached_hours is not None
+        and (now_mono - _cached_at) < _CACHE_TTL_SEC
     ):
-        return "FOREX"
-    return "NSE"
-
-
-async def get_market_hours(force_refresh: bool = False) -> dict[str, dict[str, Any]]:
-    """Retrieve the current market hours configuration, merging with defaults."""
-    global _cached_config, _cache_timestamp
-
-    now = _sys_time.time()
-    if not force_refresh and _cached_config is not None and (now - _cache_timestamp < _CACHE_TTL_SEC):
-        return _cached_config
+        return _cached_hours
 
     try:
-        setting = await PlatformSetting.find_one(PlatformSetting.setting_key == SETTING_KEY)
-    except Exception as e:
-        logger.warning(f"Could not load market hours from PlatformSetting: {e}")
-        setting = None
-
-    result: dict[str, dict[str, Any]] = {}
-    stored_val = setting.setting_value if setting and isinstance(setting.setting_value, dict) else {}
-
-    for market_key, default_info in DEFAULT_MARKET_HOURS.items():
-        market_data = dict(default_info)
-        if market_key in stored_val and isinstance(stored_val[market_key], dict):
-            user_val = stored_val[market_key]
-            if "start_time" in user_val and isinstance(user_val["start_time"], str):
-                market_data["start_time"] = user_val["start_time"].strip()
-            if "end_time" in user_val and isinstance(user_val["end_time"], str):
-                market_data["end_time"] = user_val["end_time"].strip()
-            if "is_enabled" in user_val:
-                market_data["is_enabled"] = bool(user_val["is_enabled"])
-            if "days" in user_val and isinstance(user_val["days"], list):
-                market_data["days"] = [int(d) for d in user_val["days"] if isinstance(d, (int, str)) and str(d).isdigit()]
-        result[market_key] = market_data
-
-    _cached_config = result
-    _cache_timestamp = now
-    return result
+        row = await PlatformSetting.find_one(
+            PlatformSetting.setting_key == MARKET_HOURS_SETTING_KEY
+        )
+        raw = row.setting_value if row is not None else None
+        _cached_hours = normalize_market_hours(raw)
+        _cached_at = now_mono
+        return _cached_hours
+    except Exception:
+        if _cached_hours is not None:
+            return _cached_hours
+        return copy.deepcopy(DEFAULT_MARKET_HOURS)
 
 
-async def update_market_hours(new_config: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Update and persist market hours configuration."""
-    global _cached_config, _cache_timestamp
-
-    current = await get_market_hours(force_refresh=True)
-
-    for market_key, updates in new_config.items():
-        if market_key not in current or not isinstance(updates, dict):
-            continue
-        entry = current[market_key]
-        if "start_time" in updates:
-            st = str(updates["start_time"]).strip()
-            # Validate HH:MM format
-            try:
-                parse_hhmm(st)
-                entry["start_time"] = st
-            except Exception:
-                pass
-        if "end_time" in updates:
-            et = str(updates["end_time"]).strip()
-            try:
-                parse_hhmm(et)
-                entry["end_time"] = et
-            except Exception:
-                pass
-        if "is_enabled" in updates:
-            entry["is_enabled"] = bool(updates["is_enabled"])
-        if "days" in updates and isinstance(updates["days"], list):
-            entry["days"] = [int(d) for d in updates["days"] if str(d).isdigit()]
-
-    setting = await PlatformSetting.find_one(PlatformSetting.setting_key == SETTING_KEY)
-    if setting is None:
-        setting = PlatformSetting(
-            setting_key=SETTING_KEY,
-            setting_value=current,
+async def save_market_hours(payload: Any) -> dict[str, dict[str, Any]]:
+    """Validate and persist market hours into `PlatformSetting`."""
+    global _cached_hours, _cached_at
+    normalized = normalize_market_hours(payload)
+    row = await PlatformSetting.find_one(
+        PlatformSetting.setting_key == MARKET_HOURS_SETTING_KEY
+    )
+    if row is None:
+        row = PlatformSetting(
+            setting_key=MARKET_HOURS_SETTING_KEY,
+            setting_value=normalized,
             setting_type=SettingType.JSON,
             category="trading",
             is_public=True,
-            description="Market-wise start and end trading hours configuration",
+            description="Configurable market-wise trading hours (IST).",
         )
-        await setting.insert()
+        await row.insert()
     else:
-        setting.setting_value = current
-        setting.is_public = True
-        await setting.save()
+        row.setting_value = normalized
+        row.setting_type = SettingType.JSON
+        row.is_public = True
+        await row.save()
 
-    _cached_config = current
-    _cache_timestamp = _sys_time.time()
-    return current
+    _cached_hours = normalized
+    _cached_at = _time.monotonic()
+    return normalized
+
+
+def resolve_market_key(
+    segment_type: str | None = None,
+    exchange: str | None = None,
+) -> str:
+    """Map an instrument's `(segment_type, exchange)` to one of the 5 market keys:
+    `CRYPTO`, `FOREX`, `MCX`, `BSE`, or `NSE`.
+    """
+    seg = (segment_type or "").upper()
+    exch = (exchange or "").upper()
+    if "CRYPTO" in seg or "CRYPTO" in exch or exch in ("CRYPTO", "BINANCE") or seg in ("CRYPTO", "BINANCE"):
+        return "CRYPTO"
+    if (
+        seg in ("FOREX", "STOCKS", "INDICES", "COMMODITIES")
+        or "FOREX" in seg
+        or "FX" in seg
+        or seg.startswith("CDS")
+        or exch == "CDS"
+        or "FOREX" in exch
+    ):
+        return "FOREX"
+    if seg.startswith("MCX") or exch == "MCX" or exch.startswith("MCX") or seg == "COMMODITIES":
+        return "MCX"
+    if seg.startswith(("BSE", "BFO")) or exch in ("BSE", "BFO"):
+        return "BSE"
+    return "NSE"
+
+
+def _hhmm_to_minutes(hhmm: str) -> int:
+    parts = hhmm.split(":")
+    return int(parts[0]) * 60 + int(parts[1])
+
+
+def is_market_open_by_config(
+    hours_map: dict[str, dict[str, Any]],
+    segment_type: str | None = None,
+    exchange: str | None = None,
+    at: datetime | None = None,
+) -> tuple[bool, str]:
+    """Evaluate whether the resolved market is currently open in IST.
+
+    Returns `(is_open, rejection_message)`.
+    """
+    key = resolve_market_key(segment_type, exchange)
+    cfg = hours_map.get(key) or DEFAULT_MARKET_HOURS[key]
+    enabled = bool(cfg.get("enabled", True))
+    start_str = str(cfg.get("start") or DEFAULT_MARKET_HOURS[key]["start"])
+    end_str = str(cfg.get("end") or DEFAULT_MARKET_HOURS[key]["end"])
+    days_str = str(cfg.get("days") or DEFAULT_MARKET_HOURS[key]["days"])
+
+    if not enabled:
+        return (
+            False,
+            f"{key} market is currently closed by admin. Orders are not accepted right now.",
+        )
+
+    ist = to_ist(at) if at is not None else now_ist()
+    from app.utils.time_utils import muhurat_open, muhurat_window
+
+    mu = muhurat_open(key, ist)
+    if mu is not None:
+        if mu:
+            return True, ""
+        o, c = muhurat_window(ist.date()) or (ist.time(), ist.time())
+        return False, f"{key}: today only the Muhurat session trades, {o:%H:%M} – {c:%H:%M} IST."
+    wd = ist.weekday()  # Mon=0 .. Fri=4, Sat=5, Sun=6
+    cur_min = ist.hour * 60 + ist.minute
+    start_min = _hhmm_to_minutes(start_str)
+    end_min = _hhmm_to_minutes(end_str)
+
+    is_24x7_days = key == "CRYPTO" or "24/7" in days_str or "Sun" in days_str
+
+    if start_min <= end_min:
+        # Normal same-day session (e.g. 09:15 -> 15:30 or 00:00 -> 23:59)
+        if not is_24x7_days and wd >= 5:
+            return (
+                False,
+                f"{key} market is closed for the weekend ({days_str}, {start_str} – {end_str} IST).",
+            )
+        if start_min <= cur_min <= end_min:
+            return True, ""
+        return (
+            False,
+            f"{key} market is closed. Trading hours: {start_str} – {end_str} IST ({days_str}).",
+        )
+    else:
+        # Overnight session crossing midnight (e.g. 03:30 -> 02:30 IST)
+        if is_24x7_days:
+            if cur_min >= start_min or cur_min <= end_min:
+                return True, ""
+        else:
+            # Mon-Fri overnight:
+            # - Mon..Fri (wd 0..4): open from start_min..23:59
+            # - Tue..Sat (wd 1..5): open from 00:00..end_min (tail of previous weekday)
+            if (0 <= wd <= 4 and cur_min >= start_min) or (1 <= wd <= 5 and cur_min <= end_min):
+                return True, ""
+        return (
+            False,
+            f"{key} market is closed. Trading hours: {start_str} – {end_str} IST ({days_str}).",
+        )
+
+# Backward-compatibility aliases
+resolve_market = resolve_market_key
 
 
 async def is_market_open_now(
@@ -186,59 +255,7 @@ async def is_market_open_now(
     segment: str | None,
     at: datetime | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Check if the market for the given exchange/segment is currently open.
-
-    Returns:
-        (is_open: bool, message: str, config: dict)
-    """
-    ist = to_ist(at) if at else now_ist()
-    market = resolve_market(exchange, segment)
-    all_hours = await get_market_hours()
-    m_cfg = all_hours.get(market, DEFAULT_MARKET_HOURS.get(market, DEFAULT_MARKET_HOURS["NSE"]))
-
-    market_name = m_cfg.get("name", market)
-
-    # 1. Master enable flag
-    if not m_cfg.get("is_enabled", True):
-        return False, f"{market_name} market is currently disabled by administrator.", m_cfg
-
-    # 2. Day of week check (0=Sunday, 1=Monday, ..., 6=Saturday)
-    allowed_days = m_cfg.get("days", [1, 2, 3, 4, 5])
-    # Convert Python weekday (0=Mon..6=Sun) to JS/standard weekday (0=Sun..6=Sat)
-    js_day = (ist.weekday() + 1) % 7
-    if allowed_days and js_day not in allowed_days:
-        day_name = ist.strftime("%A")
-        return False, f"{market_name} market is closed today ({day_name}).", m_cfg
-
-    # 3. Start time and end time window
-    start_str = m_cfg.get("start_time", "09:15")
-    end_str = m_cfg.get("end_time", "15:30")
-
-    try:
-        start_t = parse_hhmm(start_str)
-        end_t = parse_hhmm(end_str)
-    except Exception:
-        # Fallback to standard times if parse fails
-        start_t = time(9, 15)
-        end_t = time(15, 30)
-
-    cur_t = ist.time()
-
-    if start_t <= end_t:
-        # Same-day session (e.g. 09:15 to 15:30)
-        if not (start_t <= cur_t <= end_t):
-            return (
-                False,
-                f"{market_name} market is closed. Trading hours: {start_str} - {end_str} IST.",
-                m_cfg,
-            )
-    else:
-        # Overnight session (e.g. 17:00 to 02:30)
-        if not (cur_t >= start_t or cur_t <= end_t):
-            return (
-                False,
-                f"{market_name} market is closed. Trading hours: {start_str} - {end_str} IST.",
-                m_cfg,
-            )
-
-    return True, "", m_cfg
+    """Backward-compatible helper returning (is_open, msg, hours_map)."""
+    hours = await get_market_hours()
+    is_open, msg = is_market_open_by_config(hours, segment, exchange, at)
+    return is_open, msg, hours

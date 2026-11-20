@@ -39,6 +39,7 @@ from app.services import (
     wallet_service,
 )
 from app.utils.decimal_utils import to_decimal
+from app.utils.time_utils import epoch
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,12 @@ _OUTLIER_CONFIRM_TICKS = 3            # consecutive ticks before a suspect is ac
 _close_brk_cache: dict[str, tuple[float, float, Decimal]] = {}
 _last_good_ltp: dict[str, float] = {}              # token -> last accepted LTP
 _outlier_pending: dict[str, tuple[float, int]] = {}  # token -> (suspect price, count)
+
+# A quote from before a position opened is no price for it
+# (market_data_service.drop_quotes_predating); its token is re-asked of the feed
+# once a minute, not every tick, until a fresh packet arrives.
+_STALE_RESUB_SEC = 60
+_stale_resub_at: dict[str, float] = {}  # token -> when its stale quote last asked
 
 # Grace window (seconds) after a segment's daily open during which stop-out /
 # SL / TP are suppressed — the feed may still be on the stale overnight tick
@@ -218,10 +225,9 @@ async def _squareoff_position(
     or `target`) so the realised close price equals what the user set,
     not the live LTP at the moment the enforcer ticked — eliminates
     the 1-5 point slippage the poll-interval gap used to introduce.
-    The matching engine treats this as `expected_price` and clamps it
-    to ±1% of live bid/ask anyway, so an absurd value can't sneak
-    through; SL/TP triggers by definition fire at the current LTP, so
-    they always land well inside that cap."""
+    The matching engine treats this as `expected_price`: an SL/TP
+    trigger books exactly, any other mark (stop-out) only within ±1% of
+    the live bid/ask, so a stale mark can't book an absurd price."""
     if p.quantity == 0:
         return
     action = OrderAction.SELL if p.quantity > 0 else OrderAction.BUY
@@ -318,6 +324,11 @@ async def _enforce_for_user(
     def _segment_closed(seg: str | None) -> bool:
         if not seg:
             return False
+        from app.utils.time_utils import muhurat_open
+
+        _mu = muhurat_open(seg, now_now, _OPEN_GRACE_SEC)
+        if _mu is not None:
+            return not _mu
         if is_weekend_now:
             # Indian exchanges + MCX are closed Sat/Sun. is_after_close
             # only handles weekday close-of-day, so OR with a prefix
@@ -1079,6 +1090,7 @@ def _prune_stale_state(active_users: set[str], active_tokens: set[str]) -> None:
     _prune(_ltp_warn_last, active_tokens)
     _prune(_rest_ltp_cache, active_tokens)
     _prune(_rest_ltp_fail_ts, active_tokens)
+    _prune(_stale_resub_at, active_tokens)
 
 
 async def enforce_once(shard_id: int = 0, num_shards: int = 1) -> int:
@@ -1284,10 +1296,34 @@ async def enforce_once(shard_id: int = 0, num_shards: int = 1) -> int:
 
     _t2 = asyncio.get_event_loop().time()
 
+    # A quote from before a position on its token opened (or was reopened) is
+    # no price for the token: no SL / TP / stop-out acts on it, and its
+    # positions sit out the stop-out closes, until a fresh packet arrives. The
+    # token joins the resubscribe below at most once a minute.
+    # A held token stays on the feed (the WS pool's eviction and trim skip it,
+    # a watchlist removal leaves it), so an add to an open position meets a
+    # live quote; with no price at all the engine refuses the entry.
+    _opened: dict[str, float] = {}
+    for ps in positions_by_user.values():
+        for p in ps:
+            tok = str(p.instrument.token)
+            for at in (p.opened_at, p.reopened_at):
+                if at is not None:
+                    _opened[tok] = max(_opened.get(tok, 0.0), epoch(at))
+    _now_wall = time.time()
+    _stale = market_data_service.drop_quotes_predating(shared_ltp, shared_quotes, _opened)
+    _resub_wait = {t for t in _stale if _now_wall - _stale_resub_at.get(t, 0) < _STALE_RESUB_SEC}
+    _resub_now = [t for t in _stale if t not in _resub_wait]
+    if _resub_now:
+        _stale_resub_at.update((t, _now_wall) for t in _resub_now)
+        logger.info("risk_stale_quotes_skipped", extra={"tokens": _resub_now})
+
     # Trigger WS subscription for zero-LTP numeric tokens so next tick has a price.
     zero_numeric = [
         t for t, v in shared_ltp.items()
-        if (v is None or float(str(v or 0)) <= 0) and str(t).lstrip("-").isdigit()
+        if (v is None or float(str(v or 0)) <= 0)
+        and str(t).lstrip("-").isdigit()
+        and t not in _resub_wait
     ]
     if zero_numeric:
         try:

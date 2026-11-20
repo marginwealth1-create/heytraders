@@ -2515,7 +2515,9 @@ function ActiveMobileCard({
               </span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">LTP</span>
+              {/* The close side (liveLtpFor): what this position exits at
+                  and its M2M is marked to — not the last traded price. */}
+              <span className="text-xs text-muted-foreground">{side === "BUY" ? "Bid" : "Ask"}</span>
               <span
                 className={cn(
                   "font-tabular text-sm font-bold tabular-nums",

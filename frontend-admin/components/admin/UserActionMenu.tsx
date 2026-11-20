@@ -67,6 +67,12 @@ export function UserActionMenu({ user, onChange }: Props) {
   const canAddFund = !isBroker || canSee(me, "deposits");
   const canDeductFund = !isBroker || canSee(me, "withdrawals");
   const canResetPw = !isBroker || canSee(me, "user_password");
+  // Super-admin (and its staff) can VIEW every pool but write only to its own
+  // unassigned users (backend `read_only`, mirrors assert_user_in_scope). On
+  // a sub-admin's user only the views stay, plus Transfer for the super-admin
+  // itself — reassigning to its pool is how it gets write access.
+  const readOnly = !!user.read_only;
+  const canTransfer = !readOnly || me?.role === "SUPER_ADMIN";
   const [menuOpen, setMenuOpen] = useState(false);
   const [action, setAction] = useState<ActionKind>(null);
   const [transferOpen, setTransferOpen] = useState(false);
@@ -100,10 +106,6 @@ export function UserActionMenu({ user, onChange }: Props) {
     const num = Number(amount);
     if (!num || num <= 0) {
       toast.error("Enter a positive amount");
-      return;
-    }
-    if (!note.trim()) {
-      toast.error("Reason is mandatory");
       return;
     }
     setBusy(true);
@@ -259,6 +261,13 @@ export function UserActionMenu({ user, onChange }: Props) {
                 </span>
               ) : null}
             </DialogTitle>
+            {readOnly && (
+              <DialogDescription className="text-xs">
+                View only — this user belongs to{" "}
+                {user.assigned_admin_name || "a sub-admin"}.
+                {canTransfer && " Transfer them to your pool to make changes."}
+              </DialogDescription>
+            )}
           </DialogHeader>
           <div className="max-h-[70vh] overflow-y-auto px-1 pb-3">
             <MenuButton
@@ -266,59 +275,66 @@ export function UserActionMenu({ user, onChange }: Props) {
               label="View Profile"
               onClick={() => pick(() => router.push(`/users/${user.id}`))}
             />
-            <MenuButton
-              icon={<Settings2 className="size-4" />}
-              label="Segment Overrides"
-              onClick={() =>
-                pick(() =>
-                  router.push(`/segment-settings?tab=users&user=${user.id}`),
-                )
-              }
-            />
-            <MenuButton
-              icon={<ShieldCheck className="size-4" />}
-              label="Risk Settings"
-              onClick={() =>
-                pick(() => router.push(`/risk-management?user=${user.id}`))
-              }
-            />
+            {!readOnly && (
+              <>
+                <MenuButton
+                  icon={<Settings2 className="size-4" />}
+                  label="Segment Overrides"
+                  onClick={() =>
+                    pick(() =>
+                      router.push(`/segment-settings?tab=users&user=${user.id}`),
+                    )
+                  }
+                />
+                <MenuButton
+                  icon={<ShieldCheck className="size-4" />}
+                  label="Risk Settings"
+                  onClick={() =>
+                    pick(() => router.push(`/risk-management?user=${user.id}`))
+                  }
+                />
+              </>
+            )}
             <MenuButton
               icon={<Activity className="size-4" />}
               label="Live Trade Stats"
               onClick={() => pick(() => setAction("stats"))}
             />
 
-            <MenuSeparator />
-
-            {canAddFund && (
-              <MenuButton
-                icon={<PlusCircle className="size-4" />}
-                label="Add Fund"
-                onClick={() => pick(() => setAction("addFund"))}
-              />
-            )}
-            {canDeductFund && (
-              <MenuButton
-                icon={<MinusCircle className="size-4" />}
-                label="Deduct Fund"
-                onClick={() => pick(() => setAction("deductFund"))}
-              />
-            )}
-            {canBonus && (
+            {!readOnly && (
               <>
-                <MenuButton
-                  icon={<Gift className="size-4" />}
-                  label="Add Bonus"
-                  onClick={() => pick(() => setAction("addBonus"))}
-                />
-                <MenuButton
-                  icon={<Gift className="size-4" />}
-                  label="Deduct Bonus"
-                  onClick={() => pick(() => setAction("deductBonus"))}
-                />
+                <MenuSeparator />
+
+                {canAddFund && (
+                  <MenuButton
+                    icon={<PlusCircle className="size-4" />}
+                    label="Add Fund"
+                    onClick={() => pick(() => setAction("addFund"))}
+                  />
+                )}
+                {canDeductFund && (
+                  <MenuButton
+                    icon={<MinusCircle className="size-4" />}
+                    label="Deduct Fund"
+                    onClick={() => pick(() => setAction("deductFund"))}
+                  />
+                )}
+                {canBonus && (
+                  <>
+                    <MenuButton
+                      icon={<Gift className="size-4" />}
+                      label="Add Bonus"
+                      onClick={() => pick(() => setAction("addBonus"))}
+                    />
+                    <MenuButton
+                      icon={<Gift className="size-4" />}
+                      label="Deduct Bonus"
+                      onClick={() => pick(() => setAction("deductBonus"))}
+                    />
+                  </>
+                )}
               </>
             )}
-            <MenuSeparator />
 
             {/* Transfer User — opens the role-aware destination picker.
                 Super-admin sees admins, admin sees their brokers, broker
@@ -326,46 +342,55 @@ export function UserActionMenu({ user, onChange }: Props) {
                 history travels with the user automatically (scoped via
                 User.assigned_admin_id / broker_ancestry in
                 `core/dependencies.py:scoped_user_ids`). */}
-            <MenuButton
-              icon={<ArrowRightLeft className="size-4" />}
-              label="Transfer User"
-              onClick={() => pick(() => setTransferOpen(true))}
-            />
+            {canTransfer && (
+              <>
+                <MenuSeparator />
+                <MenuButton
+                  icon={<ArrowRightLeft className="size-4" />}
+                  label="Transfer User"
+                  onClick={() => pick(() => setTransferOpen(true))}
+                />
+              </>
+            )}
 
-            <MenuSeparator />
+            {!readOnly && (
+              <>
+                <MenuSeparator />
 
-            <MenuButton
-              icon={
-                user.status === "BLOCKED" ? (
-                  <CheckCircle2 className="size-4" />
-                ) : (
-                  <Ban className="size-4" />
-                )
-              }
-              label={user.status === "BLOCKED" ? "Unblock User" : "Ban User"}
-              destructive
-              onClick={() => pick(() => setAction("ban"))}
-            />
-            <MenuButton
-              icon={<Power className="size-4" />}
-              label="Kill Switch"
-              destructive
-              onClick={() => pick(() => setAction("kill"))}
-            />
+                <MenuButton
+                  icon={
+                    user.status === "BLOCKED" ? (
+                      <CheckCircle2 className="size-4" />
+                    ) : (
+                      <Ban className="size-4" />
+                    )
+                  }
+                  label={user.status === "BLOCKED" ? "Unblock User" : "Ban User"}
+                  destructive
+                  onClick={() => pick(() => setAction("ban"))}
+                />
+                <MenuButton
+                  icon={<Power className="size-4" />}
+                  label="Kill Switch"
+                  destructive
+                  onClick={() => pick(() => setAction("kill"))}
+                />
 
-            <MenuSeparator />
+                <MenuSeparator />
 
-            <MenuButton
-              icon={<LogIn className="size-4" />}
-              label="Login As User"
-              onClick={() => pick(runLoginAs)}
-            />
-            <MenuButton
-              icon={<Trash2 className="size-4" />}
-              label="Delete User"
-              destructive
-              onClick={() => pick(() => setAction("delete"))}
-            />
+                <MenuButton
+                  icon={<LogIn className="size-4" />}
+                  label="Login As User"
+                  onClick={() => pick(runLoginAs)}
+                />
+                <MenuButton
+                  icon={<Trash2 className="size-4" />}
+                  label="Delete User"
+                  destructive
+                  onClick={() => pick(() => setAction("delete"))}
+                />
+              </>
+            )}
           </div>
         </DialogContent>
       </Dialog>
@@ -380,6 +405,7 @@ export function UserActionMenu({ user, onChange }: Props) {
         setAmount={setAmount}
         note={note}
         setNote={setNote}
+        showNote={false}
         busy={busy}
         onCancel={close}
         onSubmit={() => runWalletAdjust("addFund")}
@@ -576,6 +602,7 @@ function AmountDialog({
   setAmount,
   note,
   setNote,
+  showNote = true,
   busy,
   onCancel,
   onSubmit,
@@ -589,6 +616,7 @@ function AmountDialog({
   setAmount: (v: string) => void;
   note: string;
   setNote: (v: string) => void;
+  showNote?: boolean;
   busy: boolean;
   onCancel: () => void;
   onSubmit: () => void;
@@ -613,14 +641,16 @@ function AmountDialog({
               autoFocus
             />
           </div>
-          <div className="space-y-1.5">
-            <Label>Reason / narration</Label>
-            <Input
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              placeholder="Mandatory for audit trail"
-            />
-          </div>
+          {showNote && (
+            <div className="space-y-1.5">
+              <Label>Reason / narration</Label>
+              <Input
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="Optional"
+              />
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onCancel}>
@@ -808,7 +838,7 @@ export function LiveTradeStatsDialog({
             </Section>
 
             {/* ── Realized P/L ───────────────────────────────────── */}
-            <Section title="Realized P/L" hint="closed positions">
+            <Section title="Realized P/L" hint="weekly net: billing statement, Mon → now IST">
               <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
                 <StatCard
                   label="Weekly Net P/L"

@@ -19,6 +19,7 @@ from app.core.dependencies import (
     CurrentAdmin,
     SuperAdmin,
     assert_user_in_scope,
+    is_effective_super_admin,
     require_perm,
     scoped_user_ids,
     super_admin_direct_user_ids,
@@ -29,10 +30,10 @@ from app.models.audit_log import AuditAction
 from app.models.holding import Holding
 from app.models.order import Order, order_reason_code
 from app.models.position import Position, PositionStatus
-from app.models.trade import Trade
+from app.models.trade import LIVE_FILL, Trade
 from app.models.user import User, UserRole
 from app.schemas.common import APIResponse
-from app.services import market_data_service, order_service, position_service
+from app.services import market_data_service, order_service, position_service, tradebook_builder
 from app.services.audit_service import log_event
 
 
@@ -418,7 +419,9 @@ async def orders_stats(
     scope = await scoped_user_ids(admin)
     demo_ids = {u.id async for u in User.find(User.is_demo == True)}  # noqa: E712
 
-    trade_match: dict[str, Any] = {"executed_at": {"$gte": start, "$lt": end}}
+    # A deleted position's fills lost their orders, so they leave the count. A
+    # reopen-undone close keeps its order on the table, so it stays (not LIVE_FILL).
+    trade_match: dict[str, Any] = {"executed_at": {"$gte": start, "$lt": end}, "fifo_deleted": {"$ne": True}}
     pending_match: dict[str, Any] = {
         "status": {"$in": ["PENDING", "OPEN", "PARTIAL"]},
         "$or": [{"is_demo": {"$ne": True}}, {"is_demo": {"$exists": False}}],
@@ -537,22 +540,11 @@ async def force_cancel(
 # model would reject the dict with a 500 (which then loses CORS headers and
 # surfaces in the browser as a misleading "blocked by CORS / ERR_FAILED").
 def _last_week_start_utc() -> datetime:
-    """Start (UTC) of LAST week — the most recent IST-Sunday 00:00 minus 7
-    days. The admin Closed-Trades view uses this as a lower bound so it shows
-    only LAST week + the CURRENT week (the same window as the two Net-P&L
-    cards), instead of the entire all-time closed history the admin asked to
-    stop scrolling through."""
-    from datetime import timedelta as _td, timezone as _tz
-
-    IST = _tz(_td(hours=5, minutes=30))
-    now_ist = datetime.now(IST)
-    today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Monday-anchored week (Mon=0 … Sun=6) — matches the Net-P&L cards and the
-    # Accounts dashboard so the Closed tab spans the same current+last week.
-    days_back = now_ist.weekday()
-    week_start_ist = today_start_ist - _td(days=days_back)
-    last_week_start_ist = week_start_ist - _td(days=7)
-    return last_week_start_ist.astimezone(_tz.utc)
+    """Start (UTC) of LAST week — Monday 00:00 IST, the P&L cards' and the
+    Accounts dashboard's week. The admin Closed-Trades view uses it as a lower
+    bound so it shows only LAST week + the CURRENT week instead of the entire
+    all-time closed history the admin asked to stop scrolling through."""
+    return tradebook_builder.periods()["last_week"][0]
 
 
 def _format_closed_fifo_rows(fifo_events: list[dict], user_id: str) -> list[dict]:
@@ -663,7 +655,8 @@ async def house_exposure(
         "status": PositionStatus.OPEN.value,
         "$or": [{"is_demo": {"$ne": True}}, {"is_demo": {"$exists": False}}],
     }
-    scope = await scoped_user_ids(admin)
+    # The house book is every pool's positions for the super-admin.
+    scope = await scoped_user_ids(admin, all_pools=True)
     if scope is not None:
         if not scope:
             return APIResponse(data={"rows": [], "totals": {}})
@@ -954,118 +947,33 @@ async def list_positions(
             except Exception:
                 ltp_map[tok] = 0.0
 
-    # Bulk-fetch every trade that touches these positions so we can attach
-    # a per-position `charges` total without an N+1 query. Mirrors the
-    # bucketing user-facing /positions/closed uses (start − slack ≤
-    # executed_at ≤ end + slack) so charges land on the right position
-    # lifecycle even when two CLOSED rows share (user, token, product).
-    # Same key the user endpoint uses keeps the math aligned across views.
-    from datetime import timedelta as _td_charges
+    # Each live fill on these rows' books, given to exactly ONE position (the
+    # one holding the book when it executed; closed neighbours off this page
+    # claim theirs), so overlapping same-token rows never bill a fill twice
+    # and Σ Charges is what the client was charged. Undone fills are out.
+    from decimal import Decimal  # noqa: PLC0415
 
-    by_charges_key: dict[tuple[str, str, str], list[Trade]] = {}
+    from app.utils.decimal_utils import to_decimal  # noqa: PLC0415
+
+    fills_of = await position_service.own_fills(rows)
     # Map order_id → order_type (MARKET / LIMIT / SL_M) so each position row
     # can show HOW it was opened. The Position has no order_type (it's an
     # order property); we recover it from the opening fill's order below.
     order_type_by_id: dict[Any, str] = {}
-    if rows:
-        user_ids_for_trades = list({r.user_id for r in rows})
-        trade_q: dict[str, Any] = {
-            "user_id": {"$in": user_ids_for_trades},
-            "instrument.token": {"$in": unique_tokens},
-        }
-        oldest_open = min((r.opened_at for r in rows if r.opened_at), default=None)
-        if oldest_open is not None:
-            trade_q["executed_at"] = {"$gte": oldest_open - _td_charges(seconds=5)}
-        trade_rows = await Trade.find(trade_q).sort("+executed_at").to_list()
-        for t in trade_rows:
-            key = (str(t.user_id), t.instrument.token, t.product_type.value)
-            by_charges_key.setdefault(key, []).append(t)
-        # One bulk lookup of the orders behind those trades → order_type.
-        _oid_list = list({t.order_id for t in trade_rows if getattr(t, "order_id", None)})
-        if _oid_list:
-            _orders = await Order.find({"_id": {"$in": _oid_list}}).to_list()
-            order_type_by_id = {o.id: o.order_type.value for o in _orders}
+    _oid_list = list({t.order_id for fills in fills_of.values() for t in fills})
+    if _oid_list:
+        _orders = await Order.find({"_id": {"$in": _oid_list}}).to_list()
+        order_type_by_id = {o.id: o.order_type.value for o in _orders}
 
-    def _bucket_for(p: Position) -> list[Trade]:
-        """Trades belonging to this position's lifecycle.
-
-        A position carried overnight is converted MIS→NRML (or MIS→CNC) by
-        `convert_intraday_to_carry`, which flips ONLY the Position doc — the
-        opening Trade rows keep their original MIS `product_type`. So a
-        carried NRML/CNC position's `(user, token, NRML)` bucket misses its
-        own opening fills, leaving the admin blotter's Order-Type column
-        blank and its Charges column under-counted. For carry product types
-        we therefore merge in the MIS bucket (re-sorted by executed_at so the
-        earliest opening fill still wins) to recover the opening order.
-        """
-        key = (str(p.user_id), p.instrument.token, p.product_type.value)
-        bucket = list(by_charges_key.get(key, []))
-        if p.product_type.value in ("NRML", "CNC"):
-            mis_key = (str(p.user_id), p.instrument.token, "MIS")
-            mis_bucket = by_charges_key.get(mis_key)
-            if mis_bucket:
-                bucket = sorted(bucket + list(mis_bucket), key=lambda t: t.executed_at)
-        return bucket
-
-    def _charges_for(p: Position) -> float:
-        bucket = _bucket_for(p)
-        if not bucket:
-            return 0.0
-        if not p.opened_at:
-            return sum(
-                float(str(getattr(t, "total_charges", None) or t.brokerage or 0))
-                for t in bucket
-            )
-        # Opening fills (pnl_inr=None): count from opened_at onwards.
-        #   Upper bound = closed_at for CLOSED positions (so later same-token
-        #   positions don't bleed in). No upper bound for OPEN positions
-        #   (more lots can be added at any time).
-        # Closing fills (pnl_inr set): only count from the current reopen
-        #   cycle (>= reopened_at) so stale closing rows don't accumulate.
-        cycle_start = p.reopened_at or p.opened_at
-        pos_open = p.opened_at
-        pos_end = p.closed_at  # None when OPEN — means no upper bound
-        slack = _td_charges(seconds=5)
-        total = 0.0
-        for t in bucket:
-            charge = float(str(getattr(t, "total_charges", None) or t.brokerage or 0))
-            if getattr(t, "pnl_inr", None) is not None:
-                # closing fill — must be in current lifecycle window.
-                # Upper bound: pos_end (closed_at) prevents later same-token
-                # positions' closing fills from bleeding into this row.
-                if t.executed_at < cycle_start - slack:
-                    continue
-                if pos_end is not None and t.executed_at > pos_end + slack:
-                    continue
-                total += charge
-            else:
-                # opening fill — lower bound: opened_at; upper bound: closed_at or none
-                if t.executed_at < pos_open - slack:
-                    continue
-                if pos_end is not None and t.executed_at > pos_end + slack:
-                    continue
-                total += charge
-        return total
+    def _charges_for(p: Position) -> Decimal:
+        return sum((to_decimal(t.total_charges or t.brokerage or 0) for t in fills_of[p.id]), Decimal(0))
 
     def _order_type_for(p: Position) -> str | None:
         """Order type (MARKET / LIMIT / SL_M) of the order that OPENED this
-        position — recovered from the earliest opening fill's order. Returns
-        None if the linking order isn't found."""
-        bucket = _bucket_for(p)
-        if not bucket:
-            return None
-        slack = _td_charges(seconds=5)
-        pos_open = p.opened_at
-        pos_end = p.closed_at
-        for t in bucket:  # already sorted +executed_at → first opening fill wins
-            if getattr(t, "pnl_inr", None) is not None:
-                continue  # closing fill, skip
-            if pos_open is not None and t.executed_at < pos_open - slack:
-                continue
-            if pos_end is not None and t.executed_at > pos_end + slack:
-                continue
-            ot = order_type_by_id.get(getattr(t, "order_id", None))
-            if ot:
+        position — its earliest opening fill's order (a carried NRML row's is
+        MIS-stamped). None if the linking order isn't found."""
+        for t in fills_of[p.id]:  # oldest first
+            if t.pnl_inr is None and (ot := order_type_by_id.get(t.order_id)):
                 return ot
         return None
 
@@ -1249,31 +1157,6 @@ async def list_positions(
     return APIResponse(data=out)
 
 
-async def _fill_products(p: Position, lo: datetime, hi: datetime) -> list[str]:
-    """Product books whose fills belong to `p` over [lo, hi]. A carried
-    position was opened as MIS and flipped to NRML at the EOD rollover, so its
-    opening (and pre-rollover partial-close) fills are MIS while the doc says
-    NRML — count those too, unless a separate MIS position on the same token
-    overlaps the window (then they're that position's fills)."""
-    from app.models._base import ProductType as _PT
-
-    products = [p.product_type.value]
-    if p.product_type == _PT.NRML:
-        other = await Position.find_one(
-            {
-                "_id": {"$ne": p.id},
-                "user_id": p.user_id,
-                "instrument.token": p.instrument.token,
-                "product_type": _PT.MIS.value,
-                "opened_at": {"$lte": hi},
-                "$or": [{"closed_at": None}, {"closed_at": {"$gte": lo}}],
-            }
-        )
-        if other is None:
-            products.append(_PT.MIS.value)
-    return products
-
-
 async def _supersede_settlement_pnl(p: Position) -> None:
     """A WEEKLY_SETTLEMENT close books its P&L as a wallet PNL row (no Trade
     row), which the P&L card sums directly. Reopen / delete reverse that P&L
@@ -1290,6 +1173,10 @@ async def _supersede_settlement_pnl(p: Position) -> None:
             {"reference_type": "POSITION_SETTLEMENT", "reference_id": {"$in": [str(r.id) for r in recs]}},
             {"$set": {"superseded_by_reopen": True}},
         )
+
+
+# The fills a delete of `p` takes back (the position's own fills).
+_delete_window = position_service.position_fills_query
 
 
 async def _net_delete_outstanding(user_id: PydanticObjectId) -> None:
@@ -1425,12 +1312,17 @@ async def admin_edit_position(
 
     OPEN-position fields:
         avg_price, quantity, opened_at, stop_loss, target
+        (quantity / avg_price also resize / reprice the open lots' fills;
+        a quantity may not flip or flatten the position)
 
     CLOSED-position fields (admin correction of a bad close):
+        avg_price, close_price — re-book each close on its fill; the
+                        difference is posted as a REVERSAL. close_price
+                        needs a single close (409 otherwise).
         realized_pnl  — override the booked realised. Difference vs
                         the previous value is posted to the user's
-                        wallet as a REVERSAL transaction so the
-                        ledger always reconciles.
+                        wallet as a REVERSAL transaction. Wallet-only:
+                        the fills, and so the statement, keep theirs.
         close_reason  — relabel (USER / SL_HIT / STOP_OUT / ADMIN).
                         Cosmetic, no money movement.
 
@@ -1441,6 +1333,13 @@ async def admin_edit_position(
     if p is None:
         raise HTTPException(status_code=404, detail="Position not found")
     await assert_user_in_scope(admin, p.user_id)
+    before = p.model_copy(deep=True)
+    if p.status == PositionStatus.CLOSED:
+        # Units, open time and brackets belong to an open position; a closed
+        # one's units are its fills.
+        bad = [k for k in ("quantity", "opened_at", "stop_loss", "target") if payload.get(k) is not None]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"Cannot edit {', '.join(bad)} on a closed position")
 
     old_values: dict[str, Any] = {
         "avg_price": str(p.avg_price),
@@ -1468,6 +1367,11 @@ async def admin_edit_position(
             p.quantity = float(payload["quantity"])
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid quantity: {e}")
+        if before.quantity and (not p.quantity or (p.quantity > 0) != (before.quantity > 0)):
+            raise HTTPException(
+                status_code=400,
+                detail="A quantity edit cannot flip or flatten the position — square it off instead.",
+            )
     if "opened_at" in payload and payload["opened_at"] is not None:
         try:
             p.opened_at = datetime.fromisoformat(str(payload["opened_at"]).replace("Z", "+00:00"))
@@ -1482,28 +1386,19 @@ async def admin_edit_position(
 
     # ── CLOSED-row corrections ────────────────────────────────────────
     # Allow admin to edit avg_price (open price) and ltp (close price)
-    # on CLOSED rows. When either changes, realized_pnl is recalculated
-    # automatically so the delta flows through the REVERSAL wallet path.
-    # Also supports direct realized_pnl override for edge cases.
+    # on CLOSED rows. When either changes, the closes are re-booked on their
+    # fills (position_service.resync_position_fills) and the delta flows
+    # through the REVERSAL wallet path. A direct realized_pnl override is a
+    # wallet-only adjustment: the fills, and so the statement, keep theirs.
     realized_delta: Decimal | None = None
-    # Set when a CLOSED position's open/close PRICE is edited — drives the
-    # post-save resync that pushes the new prices onto the underlying Trade
-    # fills so the user's FIFO Closed blotter reflects the correction (the
-    # blotter derives entry/close/P&L from trades, not the Position doc).
-    resync_closed_fills = False
+    recalc_pnl = False
+    override_note: str | None = None
 
     if p.status == PositionStatus.CLOSED:
-        from decimal import Decimal as _Decimal
         from app.utils.decimal_utils import to_decimal as _td
-        from app.services import market_data_service as _mds
 
-        recalc_pnl = False
         if "avg_price" in payload and payload["avg_price"] is not None:
-            try:
-                p.avg_price = Decimal128(str(payload["avg_price"]))
-                recalc_pnl = True
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Invalid avg_price: {e}")
+            recalc_pnl = True
         if "close_price" in payload and payload["close_price"] is not None:
             try:
                 p.ltp = Decimal128(str(payload["close_price"]))
@@ -1511,29 +1406,7 @@ async def admin_edit_position(
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid close_price: {e}")
 
-        if recalc_pnl:
-            # Recompute realized_pnl from the new open/close prices.
-            # sign = +1 for long (BUY), -1 for short (SELL).
-            try:
-                open_px = _td(p.avg_price)
-                close_px = _td(p.ltp)
-                abs_qty = _td(abs(p.opening_quantity or p.quantity or 0))
-                sign = _Decimal(1) if str(getattr(p, "opened_side", None) or "BUY").upper() == "BUY" else _Decimal(-1)
-                raw = (close_px - open_px) * abs_qty * sign
-                from app.services.position_service import position_fx_rate as _pfx
-                from app.utils.decimal_utils import quantize_money as _qm
-
-                # realized_pnl stays NATIVE; the wallet delta is in rupees.
-                fx = _pfx(p)
-                old_realized = _td(p.realized_pnl or 0)
-                new_realized = _qm(raw)
-                realized_delta = _qm((new_realized - old_realized) * fx)
-                p.realized_pnl = Decimal128(str(new_realized))
-                resync_closed_fills = True
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"PnL recalc failed: {e}")
-
-        # Direct realized_pnl override (takes precedence over recalc if both sent)
+        # Direct realized_pnl override (a price edit takes precedence if both sent)
         if (
             "realized_pnl" in payload
             and payload["realized_pnl"] is not None
@@ -1550,11 +1423,10 @@ async def admin_edit_position(
                 old_realized_inr = _qm(_td(p.realized_pnl or 0) * fx)
                 realized_delta = new_realized_inr - old_realized_inr
                 p.realized_pnl = Decimal128(str(_qm(new_realized_inr / fx)))
-                # Also push the correction onto the underlying fills so the
-                # user's FIFO Closed blotter matches the wallet, not just a
-                # price edit. (Was: only price edits resynced → a realized
-                # override left the user view stale, mismatching the wallet.)
-                resync_closed_fills = True
+                override_note = (
+                    f"Realized P&L override: wallet-only adjustment of ₹{realized_delta}; "
+                    "the fills, and so the FIFO statement, are not changed."
+                )
             except Exception as e:
                 raise HTTPException(
                     status_code=400, detail=f"Invalid realized_pnl: {e}"
@@ -1658,28 +1530,38 @@ async def admin_edit_position(
                 )
         p.margin_used = Decimal128(str(new_margin))
 
-    await p.save()
+    # Claim: the edit takes the doc from the state it was worked out against,
+    # so a double submit (or a fill landing meanwhile) gets 409 instead of
+    # moving the fills, margin and wallet twice. Undone if the resync refuses.
+    # An OPEN row's ltp moves with every tick, so it is not part of the claim.
+    _claim = ("quantity", "avg_price", "realized_pnl")
+    if p.status == PositionStatus.CLOSED:
+        _claim += ("ltp",)
+    _was = {f: getattr(before, f) for f in _claim}
+    _now = {f: getattr(p, f) for f in _claim}
+    _pos_coll = Position.get_motor_collection()
+    if _now != _was:
+        claimed = await _pos_coll.update_one(
+            {"_id": p.id, "status": before.status.value, **_was}, {"$set": _now}
+        )
+        if claimed.modified_count != 1:
+            raise HTTPException(
+                status_code=409, detail="This position has changed since it was loaded — refresh and retry."
+            )
 
-    # ── Sync underlying Trade fills on a CLOSED price edit ────────────
-    # The user's Closed blotter is rebuilt FIFO from Trade fills, so an
-    # admin open/close-price correction on the Position doc alone never
-    # reached the user's history (admin view changed, user view didn't —
-    # operator-flagged). Push the new prices + recomputed P&L onto the
-    # matching fills. Best-effort: a targeting miss must not fail the edit
-    # (the Position + wallet REVERSAL are already correct), so log + go on.
-    if resync_closed_fills:
-        from app.services import position_service as _ps_fills
-
+    # Everything that reports the position is rebuilt from its fills: carry
+    # the quantity / price edit onto them before the doc changes.
+    if recalc_pnl or p.status == PositionStatus.OPEN:
         try:
-            n = await _ps_fills.resync_closed_position_fills(p)
-            logger.info(
-                "admin_edit_position_fills_resynced",
-                extra={"pos_id": str(p.id), "fills_updated": n},
-            )
+            _fills_delta = await position_service.resync_position_fills(before, p)
         except Exception:
-            logger.exception(
-                "admin_edit_position_fills_resync_failed", extra={"pos_id": str(p.id)}
-            )
+            if _now != _was:
+                await _pos_coll.update_one({"_id": p.id}, {"$set": _was})
+            raise
+        if recalc_pnl:
+            realized_delta = _fills_delta
+
+    await p.save()
 
     # ── Re-balance the wallet + resync derived state on an OPEN qty/avg edit
     # Move the margin delta on the wallet (block when the requirement grew,
@@ -1735,6 +1617,7 @@ async def admin_edit_position(
                 narration=(
                     f"Admin {admin.user_code} corrected realised P&L on "
                     f"{p.instrument.symbol} (delta {realized_delta})"
+                    + (" — wallet-only, fills unchanged" if override_note else "")
                 ),
                 reference_type="Position",
                 reference_id=str(p.id),
@@ -1775,6 +1658,8 @@ async def admin_edit_position(
         "opening_quantity": p.opening_quantity if p.opening_quantity is not None else abs(p.quantity or 0),
         "lot_size": getattr(p.instrument, "lot_size", None),
     }
+    if override_note:
+        edit_metadata["narration"] = override_note
     await log_event(
         action=AuditAction.POSITION_EDIT,
         entity_type="Position",
@@ -1800,19 +1685,18 @@ async def admin_reopen_position(
     Used when a close was triggered by mistake (false stop-out, user
     misclicked, bracket fired on a phantom tick). The endpoint:
 
-      1) Reverses the cumulative `realized_pnl` against the user's
-         wallet via a REVERSAL transaction. A profit close that's
-         being undone debits the wallet; a loss close credits it
-         back. Either way, the running wallet balance ends at what
-         it was just before the close fill landed.
+      1) Resolves the cycle's closes ONCE (position_service.cycle_closes)
+         and reverses exactly those against the wallet via a REVERSAL
+         transaction: their P&L at the rate each was booked at, plus every
+         one of their charges. The same set is flagged off the statement.
 
       2) Rehydrates the position to its OPEN state:
             status        = OPEN
             quantity      = ±opening_quantity (sign from opened_side)
             closed_at     = None
             close_reason  = None
-            realized_pnl  = 0
-            margin_used   = abs(qty) × avg_price  (re-block)
+            realized_pnl  = what the closes still standing booked
+            margin_used   = the opening orders' margin  (re-block)
 
       3) Re-blocks the now-required margin on the wallet so used_margin
          reflects the reopened exposure.
@@ -1855,224 +1739,227 @@ async def admin_reopen_position(
             ),
         )
 
+    from datetime import timedelta as _td_delta
     from decimal import Decimal as _Decimal
 
-    from app.models.transaction import TransactionType
+    from app.models.trade import Trade as _TradeSup
+    from app.models.transaction import TransactionStatus, TransactionType, WalletTransaction
     from app.services import position_service as _ps
     from app.services import wallet_service as _ws
-    from app.utils.decimal_utils import to_decimal as _td
+    from app.utils.decimal_utils import quantize_basis, quantize_money, to_decimal as _td
     from app.utils.time_utils import now_utc as _now_utc
 
-    # ── 1) Wallet reversal of the realised P&L ──────────────────────
-    # When the original close booked into `settlement_outstanding`
-    # (because the user's wallet didn't have enough to cover the full
-    # loss — auto_settlement=ON flow in wallet_service.adjust), the
-    # original deduction was SPLIT: cash portion drained `available_
-    # balance`, shortfall went to `settlement_outstanding`. A naive
-    # reverse-the-full-realized restored ONLY the available leg and
-    # left the settlement debt hanging, double-counting the shortfall
-    # against the user. Operator-flagged 22-May: CL35171433 closed at
-    # ₹20,200 loss (₹12,617 cash + ₹7,583 settlement) → reopen credited
-    # full ₹20,200 to wallet but settlement stayed at ₹7,583 — user
-    # got the shortfall amount as a hidden second refund.
-    #
-    # Fix: look up the SETTLEMENT_OUTSTANDING_BOOKED transaction(s)
-    # that were written when this position's close path ran. Sum the
-    # booked amounts, reduce settlement_outstanding by that total,
-    # and reverse only the (realized - booked) portion back into
-    # available_balance.
-    from app.services.position_service import realized_pnl_inr as _realized_inr_rev
-
-    realized = _realized_inr_rev(p)  # rupees — realized_pnl itself is native
-    if realized != _Decimal("0"):
-        from app.models.transaction import WalletTransaction, TransactionStatus
-        from app.models.wallet import Wallet as _Wallet
-        from bson import Decimal128 as _Dec128
-
-        booked_total = _Decimal("0")
-        # Find SETTLEMENT_OUTSTANDING_BOOKED txns that match this
-        # position's close. The booking inherits reference_type="ORDER"
-        # (the close order id) — we don't have a direct Position link,
-        # so match by user + time window around closed_at + symbol in
-        # narration. Tolerant of small clock skew (±10s).
-        from datetime import timedelta as _td_delta
-        try:
-            if p.closed_at is not None:
-                lo = p.closed_at - _td_delta(seconds=10)
-                hi = p.closed_at + _td_delta(seconds=10)
-                booked_rows = await WalletTransaction.find(
-                    WalletTransaction.user_id == p.user_id,
-                    WalletTransaction.transaction_type == TransactionType.SETTLEMENT_OUTSTANDING_BOOKED,
-                    WalletTransaction.status == TransactionStatus.COMPLETED,
-                    WalletTransaction.created_at >= lo,
-                    WalletTransaction.created_at <= hi,
-                ).to_list()
-                sym = p.instrument.symbol
-                for r in booked_rows:
-                    narr = (r.narration or "")
-                    if sym not in narr:
-                        continue
-                    # Stored amount is negative (debit-style for the user).
-                    # We add the magnitude back when computing the unwind.
-                    booked_total += abs(_td(r.amount or 0))
-        except Exception:
-            logger.exception("reopen_lookup_settlement_failed", extra={"pos_id": str(p.id)})
-            booked_total = _Decimal("0")
-
-        # Reduce settlement_outstanding first (atomic-ish — wallet save
-        # before the cash reversal so a mid-flow crash never doubles
-        # the user's available_balance).
-        if booked_total > _Decimal("0"):
-            try:
-                wallet_doc = await _ws.get_or_create(p.user_id)
-                cur_settle = _td(wallet_doc.settlement_outstanding or 0)
-                new_settle = max(_Decimal("0"), cur_settle - booked_total)
-                wallet_doc.settlement_outstanding = _Dec128(str(new_settle))
-                wallet_doc.version = (wallet_doc.version or 0) + 1
-                await wallet_doc.save()
-                # Audit-bearing ledger row so the trail explains why
-                # settlement_outstanding dropped without a deposit
-                # arriving. balance_before == balance_after — this
-                # transaction only touches the settlement field.
-                avail_str = str(wallet_doc.available_balance)
-                await WalletTransaction(
-                    user_id=p.user_id,
-                    transaction_type=TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY,
-                    amount=_Dec128(str(booked_total)),
-                    balance_before=_Dec128(avail_str),
-                    balance_after=_Dec128(avail_str),
-                    reference_type="Position",
-                    reference_id=str(p.id),
-                    narration=(
-                        f"Reopen {p.instrument.symbol} — settlement unbooked "
-                        f"(₹{booked_total} was originally shortfall on the "
-                        f"closing leg; reversing back so the cash refund "
-                        f"doesn't double-credit the user)"
-                    ),
-                    status=TransactionStatus.COMPLETED,
-                    created_by=admin.id,
-                ).insert()
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Settlement-outstanding unwind failed; reopen aborted: {e}",
-                )
-
-        # Cash refund = full wallet impact of the closing trade, reversed.
-        # The close booked TWO wallet transactions:
-        #   1. CHARGES: -brokerage (always a debit regardless of P&L direction)
-        #   2. PNL:     raw_realized (negative = loss, positive = profit)
-        # For a loss-close the PNL debit may have been split between cash and
-        # settlement_outstanding (handled by booked_total above). So:
-        #   cash_refund = raw_realized + booked_total   (PNL cash portion)
-        #               - closing_brokerage             (brokerage refund)
-        # Negating cash_refund gives the wallet credit:
-        #   e.g. realized=-392, booked=0, brokerage=210
-        #        cash_refund = -392 + 0 - 210 = -602 → -(-602) = +602 ✓
-        # Brokerage MUST be included: pnl_summary._realised_in sums
-        # Trade.pnl_inr (already NET of brokerage) and offsets it with
-        # the REVERSAL amount — if REVERSAL = only raw_pnl, brokerage
-        # stays counted in the weekly card even after the trade is undone.
-        closing_brokerage = _Decimal("0")
-        try:
-            from app.models.trade import Trade as _TradeModel
-            ct = await _TradeModel.find_one(
-                {
-                    "user_id": p.user_id,
-                    "instrument.token": p.instrument.token,
-                    "pnl_inr": {"$ne": None},
-                    "executed_at": {
-                        "$gte": p.closed_at - _td_delta(seconds=15),
-                        "$lte": p.closed_at + _td_delta(seconds=15),
-                    },
-                }
-            )
-            if ct is not None:
-                closing_brokerage = _td(ct.total_charges or ct.brokerage or 0)
-        except Exception:
-            pass
-
-        cash_refund = (realized + booked_total if realized < 0 else realized) - closing_brokerage
-        if cash_refund != _Decimal("0"):
-            try:
-                await _ws.adjust(
-                    p.user_id,
-                    -cash_refund,
-                    transaction_type=TransactionType.REVERSAL,
-                    narration=(
-                        f"Reopen {p.instrument.symbol} — reverse close P&L + brokerage "
-                        f"(closed by {p.close_reason or 'unknown'}; reopened by "
-                        f"{admin.user_code})"
-                        + (f" [PnL cash ₹{abs(realized + booked_total if realized < 0 else realized)}"
-                           f", brokerage ₹{closing_brokerage}"
-                           + (f", settlement ₹{booked_total} unwound separately" if booked_total > _Decimal("0") else "")
-                           + "]")
-                    ),
-                    reference_type="Position",
-                    reference_id=str(p.id),
-                    actor_id=admin.id,
-                )
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Wallet reversal failed; reopen aborted: {e}",
-                )
-
-    # ── 2) Restore the position to OPEN state ───────────────────────
     # Reconstruct quantity from the snapshot we took at open. If
-    # `opened_side` is missing (legacy rows), infer from the sign of
-    # the last non-zero quantity by reading the latest Trade row.
+    # `opened_side` is missing (legacy rows), the position was a long.
     opening_qty = float(p.opening_quantity or 0) or abs(float(p.quantity or 0))
     if opening_qty <= 0:
         raise HTTPException(
             status_code=400,
             detail="Cannot reopen — original opening quantity is unknown",
         )
-    sign = 1
-    if p.opened_side is not None:
-        sign = 1 if str(p.opened_side.value).upper() == "BUY" else -1
+    if p.closed_at is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot reopen — the close time is unknown, so its closes cannot be found",
+        )
+    side = p.opened_side or OrderAction.BUY
+    sign = 1 if side == OrderAction.BUY else -1
 
-    # ── Supersede the closing fills this reopen undoes ──────────────────
-    # The user Closed blotter is rebuilt from Trade rows, so the closes of
-    # the cycle we're about to undo must be flagged or they'd keep showing
-    # (operator: "reopen karta hu fir bhi user history me dikhta rehta hai").
-    # Window = THIS cycle only: [cycle_start, closed_at]. cycle_start is the
-    # previous reopen (or the open), so the span is tight — a different
-    # position on the SAME token that closed later (e.g. a parallel stop-out)
-    # falls outside and keeps its row. Only closing legs (pnl_inr set) are
-    # flagged; opening fills stay valid for FIFO pairing. The +3s upper slack
-    # absorbs the tiny skew between Trade.executed_at and Position.closed_at
-    # without reaching the next same-token close.
-    try:
-        from datetime import timedelta as _td_sup
-        from app.models.trade import Trade as _TradeSup
-        _cyc_start = p.reopened_at or p.opened_at
-        if p.closed_at is not None:
-            _sup_q: dict[str, Any] = {
+    # ── The cycle this reopen undoes — resolved ONCE ────────────────────
+    # The live closes of this cycle against the side the position holds
+    # (position_service.cycle_closes; a carried position's MIS-stamped
+    # pre-rollover closes included). The cash refund, the brokerage refund,
+    # the supersede and the P&L the position keeps all come from this one
+    # set: each close comes back at the rate it was booked at, every undone
+    # close's charge is refunded (not one found near closed_at), and a flip's
+    # first leg — same side as the units coming back — stands, P&L and all.
+    def _units(t: Any) -> float:
+        return abs(t.quantity) if t.closed_quantity is None else min(abs(t.quantity), t.closed_quantity)
+
+    # Only the closes that took the units coming back are undone, newest
+    # first (a settlement's own leg is the newest): a partial close the
+    # position was topped up after stands, P&L and all. When the next close
+    # would overshoot, what comes back is what the undone closes took.
+    settled = p.close_reason in _ps.SETTLE_REASONS
+    leg_units = float(abs(p.quantity or 0) or opening_qty) if settled else 0.0
+    took, closes = leg_units, []
+    for t in sorted(await _ps.cycle_closes(p, side), key=lambda t: t.executed_at, reverse=True):
+        if took and took + _units(t) > opening_qty + 1e-9:
+            opening_qty = took
+            break
+        closes.append(t)
+        took += _units(t)
+
+    def _charge(t: Any) -> _Decimal:
+        return _td(t.total_charges or t.brokerage or 0)
+
+    brokerage = sum((_charge(t) for t in closes), _Decimal(0))
+    undone = sum((_td(t.pnl_inr) + _charge(t) for t in closes), _Decimal(0))  # rupees, gross
+    native = sum((quantize_money(_ps._booked_gross(t) or _Decimal(0)) for t in closes), _Decimal(0))
+    if settled:
+        # A settlement close wrote no fill; it is billed off the doc.
+        leg = sign * (_td(p.ltp) - _td(p.avg_price)) * _td(leg_units)
+        native += quantize_money(leg)
+        undone += quantize_money(leg * _ps.position_fx_rate(p))
+
+    # The undone closes took exactly the units coming back: those units cost
+    # what the closes released (close value ∓ the gross each booked) — a
+    # specific-lot Exit had re-derived the average off the survivors. And if
+    # nothing has traded on the script since, the closes also leave the FIFO
+    # walk (superseded_at), so their lots are back for the re-close. Otherwise
+    # they keep the flag alone (walked, rows hidden), as before.
+    _set: dict[str, Any] = {"superseded_by_reopen": True}
+    restore_avg: Decimal128 | None = None
+    _undone = [(t, _units(t)) for t in closes]
+    if abs(sum(q for _, q in _undone) - opening_qty) < 1e-9:
+        _cost = sum(
+            (_td(t.price) * _td(q) - sign * _ps._booked_gross(t) for t, q in _undone),
+            _Decimal(0),
+        )
+        restore_avg = Decimal128(str(quantize_basis(_cost / _td(opening_qty))))
+        _since = await _TradeSup.find_one(
+            {
                 "user_id": p.user_id,
                 "instrument.token": p.instrument.token,
-                "product_type": p.product_type.value,
-                "pnl_inr": {"$ne": None},
-                "executed_at": {"$lte": p.closed_at + _td_sup(seconds=3)},
+                "executed_at": {"$gt": p.closed_at + _td_delta(seconds=3)},
+                "fifo_deleted": {"$ne": True},
+                "superseded_at": None,
             }
-            if _cyc_start is not None:
-                _sup_q["executed_at"]["$gte"] = _cyc_start - _td_sup(seconds=1)
-            await _TradeSup.get_motor_collection().update_many(
-                _sup_q, {"$set": {"superseded_by_reopen": True}}
+        )
+        if _since is None:
+            _set["superseded_at"] = _now_utc()
+    # While it sat closed the position owned nothing: record the span, so a
+    # position traded in it stays out of this one's windows (opened_at keeps
+    # the first open).
+    gap_from = max([p.closed_at, *(t.executed_at for t in closes)])
+
+    # ── Settlement-outstanding part of a loss close ─────────────────────
+    # When the close booked into `settlement_outstanding` (the wallet could
+    # not cover the full loss — auto_settlement=ON flow in
+    # wallet_service.adjust), the debit was SPLIT: cash drained
+    # `available_balance`, the shortfall went to `settlement_outstanding`.
+    # Reversing the full loss into cash would hand the shortfall back twice
+    # (22-May CL35171433: ₹20,200 loss = ₹12,617 cash + ₹7,583 settlement).
+    # Matched by user + ±10s of closed_at + symbol in narration — the
+    # booking carries the close order, not the position.
+    booked_total = _Decimal("0")
+    if undone != 0:
+        try:
+            booked_rows = await WalletTransaction.find(
+                WalletTransaction.user_id == p.user_id,
+                WalletTransaction.transaction_type == TransactionType.SETTLEMENT_OUTSTANDING_BOOKED,
+                WalletTransaction.status == TransactionStatus.COMPLETED,
+                WalletTransaction.created_at >= p.closed_at - _td_delta(seconds=10),
+                WalletTransaction.created_at <= p.closed_at + _td_delta(seconds=10),
+            ).to_list()
+            for r in booked_rows:
+                if p.instrument.symbol in (r.narration or ""):
+                    # Stored amount is negative (debit-style for the user).
+                    booked_total += abs(_td(r.amount or 0))
+        except Exception:
+            logger.exception("reopen_lookup_settlement_failed", extra={"pos_id": str(p.id)})
+            booked_total = _Decimal("0")
+
+    # ── Claim: one reopen per close ─────────────────────────────────────
+    # Two submits both passed the status check and both refunded. Taking the
+    # close time off the doc (status stays CLOSED, so nothing treats it as
+    # open yet) is the atomic claim; the loser gets 409. Undone if a later
+    # step fails.
+    _pos_coll = Position.get_motor_collection()
+    claimed = await _pos_coll.update_one(
+        {"_id": p.id, "status": PositionStatus.CLOSED.value, "closed_at": p.closed_at},
+        {"$set": {"closed_at": None}},
+    )
+    if claimed.modified_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="This position is already being reopened or has changed — refresh and retry.",
+        )
+    _ids = [t.id for t in closes]
+    _fills = _TradeSup.get_motor_collection()
+    try:
+        # The closes leave the statement first; the wallet follows them.
+        if _ids:
+            await _fills.update_many({"_id": {"$in": _ids}}, {"$set": _set})
+        if booked_total > _Decimal("0"):
+            wallet_doc = await _ws.get_or_create(p.user_id)
+            cur_settle = _td(wallet_doc.settlement_outstanding or 0)
+            # A due netting already took out of cash is owed no more: it comes
+            # back with the cash refund below; only the rest is unbooked.
+            booked_total = min(booked_total, cur_settle)
+        if booked_total > _Decimal("0"):
+            wallet_doc.settlement_outstanding = Decimal128(str(cur_settle - booked_total))
+            wallet_doc.version = (wallet_doc.version or 0) + 1
+            await wallet_doc.save()
+            # balance_before == balance_after — only the settlement field moved.
+            avail_str = str(wallet_doc.available_balance)
+            await WalletTransaction(
+                user_id=p.user_id,
+                transaction_type=TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY,
+                amount=Decimal128(str(booked_total)),
+                balance_before=Decimal128(avail_str),
+                balance_after=Decimal128(avail_str),
+                reference_type="Position",
+                reference_id=str(p.id),
+                narration=(
+                    f"Reopen {p.instrument.symbol} — settlement unbooked "
+                    f"(₹{booked_total} was originally shortfall on the "
+                    f"closing leg; reversing back so the cash refund "
+                    f"doesn't double-credit the user)"
+                ),
+                status=TransactionStatus.COMPLETED,
+                created_by=admin.id,
+            ).insert()
+        # Reverse the undone closes' PNL (cash part) and refund their CHARGES.
+        # A debit past free cash comes out of the margin other open positions
+        # lock, as a close loss does — floored to a due, it never left the
+        # week's P&L.
+        pnl_cash = undone + booked_total if undone < 0 else undone
+        cash_refund = pnl_cash - brokerage
+        if cash_refund != _Decimal("0"):
+            await _ws.adjust(
+                p.user_id,
+                -cash_refund,
+                transaction_type=TransactionType.REVERSAL,
+                narration=(
+                    f"Reopen {p.instrument.symbol} — reverse close P&L + brokerage "
+                    f"(closed by {p.close_reason or 'unknown'}; reopened by "
+                    f"{admin.user_code}) [PnL cash ₹{abs(pnl_cash)}, brokerage ₹{brokerage}"
+                    + (f", settlement ₹{booked_total} unwound separately" if booked_total else "")
+                    + "]"
+                ),
+                reference_type="Position",
+                reference_id=str(p.id),
+                actor_id=admin.id,
+                draw_margin=True,
             )
-    except Exception:
-        logger.exception("reopen_supersede_trades_failed", extra={"pos_id": str(p.id)})
+    except Exception as e:
+        # ponytail: a settlement unwind that landed before a failed REVERSAL
+        # stays; the claim and the supersede are undone.
+        if _ids:
+            await _fills.update_many(
+                {"_id": {"$in": _ids}},
+                {"$set": {"superseded_by_reopen": False}, "$unset": {"superseded_at": ""}},
+            )
+        await _pos_coll.update_one({"_id": p.id}, {"$set": {"closed_at": p.closed_at}})
+        raise HTTPException(status_code=500, detail=f"Wallet reversal failed; reopen aborted: {e}")
 
     try:
         await _supersede_settlement_pnl(p)
     except Exception:
         logger.exception("reopen_supersede_settlement_failed", extra={"pos_id": str(p.id)})
 
+    # ── Restore the position to OPEN state ──────────────────────────────
+    # It keeps the P&L of the closes still standing (a flip's first leg, a
+    # realized override) — never zeroed.
     p.status = PositionStatus.OPEN
     p.quantity = opening_qty * sign
+    p.opening_quantity = opening_qty  # the next reopen restores this cycle's size
     p.closed_at = None
     p.close_reason = None
-    p.realized_pnl = Decimal128("0")
+    p.realized_pnl = Decimal128(str(quantize_money(_td(p.realized_pnl) - native)))
+    if restore_avg is not None:
+        p.avg_price = restore_avg
     if p.close_usd_inr_rate is not None:
         p.close_usd_inr_rate = None
 
@@ -2142,10 +2029,10 @@ async def admin_reopen_position(
         # reopen itself. The next reconcile pass cleans up.
         p.margin_used = Decimal128("0")
 
-    # Stamp reopened_at so _charges_for uses this as the Trade window
-    # start instead of opened_at — prevents brokerage from accumulating
-    # across multiple close/reopen/close cycles.
+    # Stamp reopened_at — cycle_closes starts this cycle's closes there — and
+    # the gap, whose fills are another position's (position_service.own_fills).
     p.reopened_at = _now_utc()
+    p.reopen_gaps = [*p.reopen_gaps, (gap_from, p.reopened_at)]
 
     await p.save()
 
@@ -2157,7 +2044,13 @@ async def admin_reopen_position(
     try:
         await _ws.block_margin(p.user_id, _td(p.margin_used or 0))
     except Exception:
-        pass
+        # Short of free cash (an undo drawn from margin leaves none): lock it
+        # anyway, so used_margin stays Σ open margin_used and the shortfall
+        # shows as negative cash — not as another position's margin freed.
+        try:
+            await _ws.recompute_used_margin(p.user_id)
+        except Exception:
+            logger.exception("reopen_margin_recompute_failed", extra={"pos_id": str(p.id)})
 
     # Tracker recompute (intraday / holding lots).
     try:
@@ -2176,7 +2069,9 @@ async def admin_reopen_position(
         actor_id=admin.id,
         target_user_id=p.user_id,
         metadata={
-            "reversed_realized_pnl": str(realized),
+            "reversed_realized_pnl": str(undone),
+            "brokerage_refunded_inr": str(brokerage),
+            "undone_fills": [str(i) for i in _ids],
             "restored_quantity": opening_qty * sign,
         },
     )
@@ -2193,7 +2088,7 @@ async def admin_reopen_position(
             "id": str(p.id),
             "status": p.status.value,
             "quantity": p.quantity,
-            "realized_pnl_reversed": str(realized),
+            "realized_pnl_reversed": str(undone),
         }
     )
 
@@ -2221,10 +2116,13 @@ async def positions_pnl_summary(
 ):
     """Aggregate PnL windows for the admin dashboard cards.
 
-    today_pnl    — sum of realised P&L from trades + unrealised on open
-                   positions, since IST midnight.
-    week_pnl     — same, since the most recent IST Sunday 00:00.
-    last_week_pnl — total realised P&L of the previous Sun→Sat window.
+    today_pnl / week_pnl / last_week_pnl (and the ``*_realised`` twins) — the
+    pool's Billing statement Net P&L (Gross − Brokerage, tradebook_builder.booked)
+    over the IST day, this IST week (Mon 00:00 → now) and last week (Mon →
+    Sun). ``week_*`` / ``last_week_*`` net_client_pnl / brokerage /
+    total_of_both are the same windows' Gross, Brokerage and broker view —
+    the Accounts dashboard's figures. Floating M2M is ``open_unrealised``
+    only.
 
     `user_id` (optional) narrows the aggregate to a single user's
     positions only — passed by the admin Positions page when a user
@@ -2236,238 +2134,72 @@ async def positions_pnl_summary(
     if _hit is not None and _hit[0] > _admin_pnl_time.monotonic():
         return APIResponse(data=_hit[1])
 
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from app.utils.time_utils import to_ist
 
-    IST = _tz(_td(hours=5, minutes=30))
-    now_ist = _dt.now(IST)
-    today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Monday-anchored week — MUST match the Accounts dashboard / P&L-sharing
-    # report (both use `now - weekday`, Mon=0). Sunday-anchoring here made the
-    # Positions cards span a different 7-day window than Accounts, so the two
-    # pages showed different "This Week" numbers for the same book.
-    days_back = now_ist.weekday()
-    week_start_ist = today_start_ist - _td(days=days_back)
-    last_week_start_ist = week_start_ist - _td(days=7)
-    last_week_end_ist = week_start_ist  # exclusive
-    # Full Mon→Sun span for the card label (data still runs only to `now`, but
-    # the header shows the whole week like Accounts' "17 Aug – 23 Aug").
-    week_end_ist = week_start_ist + _td(days=6)
-    last_week_end_disp_ist = last_week_start_ist + _td(days=6)
+    windows = tradebook_builder.periods()
 
-    def _fmt_range(a: _dt, b: _dt) -> str:
+    def _fmt_range(a: datetime, b: datetime) -> str:
+        a, b = to_ist(a), to_ist(b)
         return f"{a.day} {a.strftime('%b')} – {b.day} {b.strftime('%b')}"
 
-    today_start = today_start_ist.astimezone(_tz.utc)
-    week_start = week_start_ist.astimezone(_tz.utc)
-    last_week_start = last_week_start_ist.astimezone(_tz.utc)
-    last_week_end = last_week_end_ist.astimezone(_tz.utc)
-
-    # Realised P&L lives on each Position (set on SELL closes/flips). We sum
-    # across positions whose closed_at OR updated_at falls in the window —
-    # covers fully-closed and partially-closed-but-still-open positions in
-    # one query (positions that closed in window have closed_at set; ones
-    # still open with realised slices booked have updated_at in window).
-    #
-    # FX: realized_pnl + unrealized_pnl are stored in NATIVE currency. For
-    # USD-quoted (crypto/forex) we convert to INR via the locked open rate
-    # (realised) or live rate (unrealised) — same logic as _pos() view.
+    # FX: unrealized_pnl is stored in NATIVE currency; USD-quoted
+    # (crypto/forex) open positions convert at the live rate.
     current_usd_inr = market_data_service.get_usd_inr_rate()
 
     def _is_usd(p: Position) -> bool:
         return market_data_service.position_is_usd(p)
 
-    def _realised_inr(p: Position) -> float:
-        raw = float(str(p.realized_pnl))
-        if not _is_usd(p):
-            return raw
-        rate = (
-            float(str(p.open_usd_inr_rate))
-            if p.open_usd_inr_rate is not None
-            else current_usd_inr
-        )
-        return raw * rate
-
-    # Scope user pool for sub-admins. None for SUPER_ADMIN = no filter.
-    # own_scope (super-admin Positions page): the super-admin's OWN direct
-    # users only — never any sub-admin's clients. A per-user drill-down
-    # (user_id) still takes precedence over own_scope below.
-    if own_scope and admin.role == UserRole.SUPER_ADMIN and not user_id:
-        scope = await super_admin_direct_user_ids()
-    else:
-        scope = await scoped_user_ids(admin)
-
     # Optional per-user narrowing — used by the admin Positions page when
     # a user filter is active so the dashboard cards match the table.
-    # We intersect with `scope` so a sub-admin can't query users outside
-    # their pool by guessing the user_id.
+    # We intersect with the caller's pool so a sub-admin can't query users
+    # outside it by guessing the user_id.
     user_filter_oid: PydanticObjectId | None = None
     if user_id:
         try:
             user_filter_oid = PydanticObjectId(user_id)
         except Exception:
             user_filter_oid = None
-        if user_filter_oid is not None:
-            if scope is not None and user_filter_oid not in scope:
-                # Out of scope → empty tile data (sub-admin probing
-                # a user_id outside their pool). Shape matches the
-                # normal return so the frontend never sees `undefined`.
-                return APIResponse(
-                    data={
-                        "today_pnl": 0.0,
-                        "today_realised": 0.0,
-                        "open_unrealised": 0.0,
-                        "week_pnl": 0.0,
-                        "week_realised": 0.0,
-                        "last_week_pnl": 0.0,
-                    }
-                )
-            scope = [user_filter_oid]
+        if user_filter_oid is not None and user_filter_oid not in await scoped_user_ids(admin):
+            # Out of scope → empty tile data (sub-admin probing
+            # a user_id outside their pool). Shape matches the
+            # normal return so the frontend never sees `undefined`.
+            return APIResponse(
+                data={
+                    "today_pnl": 0.0,
+                    "today_realised": 0.0,
+                    "open_unrealised": 0.0,
+                    "week_pnl": 0.0,
+                    "week_realised": 0.0,
+                    "last_week_pnl": 0.0,
+                }
+            )
 
-    # Sum charges (brokerage + other) across all trades that belong to a
-    # given position. Mirrors the per-row attribution in the /positions
-    # endpoint so the aggregate tile and the per-row table never disagree.
-    # Without this, the dashboard's "This Week's Closed PNL" stayed at
-    # gross while every trade card on the APK showed net — the difference
-    # equalled the brokerage bill for the week.
-    from datetime import timedelta as _td_sum
+    # ── Accounts-dashboard parity ───────────────────────────────────────
+    # The two Net-P&L cards must show the SAME Net Client PNL / Brokerage /
+    # Total-of-Both as /accounts-dashboard for the identical Mon→Sun window.
+    # Reuse the dashboard's own aggregator over its own pool resolver so the
+    # numbers can't drift: whole-book uses `_entity_pool_ids(admin)` (exactly
+    # what the "All Users" KPI card queries via compute_broker_totals); a
+    # user-filtered view narrows to that single client. Both pools are
+    # demo-free + non-CLOSED, so no demo data leaks in. open_unrealised reads
+    # the same pool.
+    from app.services.accounts_dashboard_service import (  # noqa: PLC0415
+        client_totals_for_users as _client_totals,
+        _entity_pool_ids as _acct_pool,
+    )
 
-    async def _charges_for_positions(positions: list[Position]) -> dict[str, float]:
-        if not positions:
-            return {}
-        user_ids = list({p.user_id for p in positions})
-        tokens = list({p.instrument.token for p in positions})
-        oldest = min((p.opened_at for p in positions if p.opened_at), default=None)
-        tq: dict[str, Any] = {
-            "user_id": {"$in": user_ids},
-            "instrument.token": {"$in": tokens},
-        }
-        if oldest is not None:
-            tq["executed_at"] = {"$gte": oldest - _td_sum(seconds=5)}
-        trades = await Trade.find(tq).sort("+executed_at").to_list()
-        bucket: dict[tuple[str, str, str], list[Trade]] = {}
-        for t in trades:
-            bucket.setdefault(
-                (str(t.user_id), t.instrument.token, t.product_type.value), []
-            ).append(t)
-        slack = _td_sum(seconds=5)
-        out: dict[str, float] = {}
-        for p in positions:
-            key = (str(p.user_id), p.instrument.token, p.product_type.value)
-            ts = bucket.get(key, [])
-            if not ts:
-                out[str(p.id)] = 0.0
-                continue
-            if not p.opened_at:
-                out[str(p.id)] = sum(
-                    float(str(getattr(t, "total_charges", None) or t.brokerage or 0))
-                    for t in ts
-                )
-                continue
-            cycle_start = p.reopened_at or p.opened_at
-            pos_open = p.opened_at
-            pos_end = p.closed_at  # None = OPEN, no upper bound for opening fills
-            total = 0.0
-            for t in ts:
-                charge = float(str(getattr(t, "total_charges", None) or t.brokerage or 0))
-                if getattr(t, "pnl_inr", None) is not None:
-                    if t.executed_at < cycle_start - slack:
-                        continue
-                    if pos_end is not None and t.executed_at > pos_end + slack:
-                        continue
-                    total += charge
-                else:
-                    if t.executed_at < pos_open - slack:
-                        continue
-                    if pos_end is not None and t.executed_at > pos_end + slack:
-                        continue
-                    total += charge
-            out[str(p.id)] = total
-        return out
-
-    async def _realised_in(window_start, window_end=None):
-        # CORRECT source for window realized P&L = Trade.pnl_inr summed
-        # over Trade.executed_at in the window. Trade.pnl_inr is the
-        # per-fill closing P&L frozen at execution time (matching engine
-        # writes it on the closing leg), so it's a true DELTA per event.
-        #
-        # The earlier implementation queried Position rows where
-        # `closed_at OR updated_at` fell in the window and summed
-        # Position.realized_pnl. That cumulative field plus the
-        # updated_at branch caused massive over-counting: every open
-        # position's updated_at refreshes on every tick / risk-enforcer
-        # cycle / SL-TP edit, which dragged its FULL running realized
-        # (booked weeks earlier) into "This Week's Net P&L". A 67-open
-        # admin pool was showing ₹-17.7 lakh for a 2-day window.
-        rng: dict[str, Any] = {"$gte": window_start}
-        if window_end is not None:
-            rng["$lt"] = window_end
-        # Filter out bogus zero-priced fills.  Before the matching engine
-        # got the STALE_FEED guard, a stale Zerodha WS could push LTP = 0
-        # into get_ltp() and a market order would execute at ₹0.00, booking
-        # a phantom loss equal to the entire notional.  Those rows are
-        # still in `trades` for the audit trail but they MUST NOT
-        # contribute to the admin's headline P&L — they aren't real
-        # market activity.  Same exclusion keeps settlement_outstanding
-        # off the card too: settlement is tracked on Wallet, not Trade,
-        # so dropping zero-priced trades from the realised sum is the
-        # only filter needed here.
-        # Trade.pnl_inr is already NET of closing brokerage — matching_engine
-        # stores pnl_inr_dec = raw_realized - brokerage. Do NOT subtract
-        # total_charges again (that double-counts brokerage).
-        #
-        # REOPEN / DELETE handling — `superseded_by_reopen`:
-        # When an admin reopens or deletes a closed position, every fill of the
-        # undone close is flagged `superseded_by_reopen=True`. Excluding those
-        # fills here drops the reopened/deleted position's P&L **and** brokerage
-        # straight out of the card (pnl_inr is net of brokerage, so one filter
-        # removes both). This REPLACES the old `gross + REVERSAL/RECOVERY
-        # correction` approach, which over-corrected on CROSS-WEEK reopens — a
-        # position closed last week (loss in last week's gross) and reopened
-        # this week added a phantom +reversal to THIS week's card with no
-        # matching loss (operator: "card me se nahi hatta"). Superseded-
-        # exclusion nets reopens/deletes cleanly with no window mismatch, and
-        # it's the SAME rule reports.py + accounts_dashboard already use, so
-        # every page now agrees. The reopen/delete WALLET reversal is untouched.
-        query: dict[str, Any] = {
-            "executed_at": rng,
-            "pnl_inr": {"$ne": None},
-            "price": {"$gt": 0},
-            "superseded_by_reopen": {"$ne": True},
-        }
-        if scope is not None:
-            if not scope:
-                return 0.0
-            query["user_id"] = {"$in": scope}
-        trades = await Trade.find(query).to_list()
-        gross = sum(float(str(t.pnl_inr)) for t in trades if t.pnl_inr is not None)
-
-        from app.models.transaction import (  # noqa: PLC0415
-            WalletTransaction as _WT,
-            TransactionType as _TT,
-        )
-
-        # Settlement PnL — weekly settlement books directly to wallet via
-        # wallet_service.adjust(TransactionType.PNL, reference_type="POSITION_SETTLEMENT").
-        # No Trade record is created, so it never appears in `gross` above.
-        # Add it here so the card shows the TRUE net including settlement booking.
-        settle_q: dict[str, Any] = {
-            "transaction_type": _TT.PNL.value,
-            "reference_type": "POSITION_SETTLEMENT",
-            "created_at": {"$gte": window_start},
-            "superseded_by_reopen": {"$ne": True},
-        }
-        if window_end is not None:
-            settle_q["created_at"]["$lt"] = window_end
-        if scope is not None:
-            settle_q["user_id"] = {"$in": scope}
-        settle_txns = await _WT.find(settle_q).to_list()
-        settlement_pnl = sum(float(str(t.amount)) for t in settle_txns)
-
-        return gross + settlement_pnl
-
-    today_realised = await _realised_in(today_start)
-    week_realised = await _realised_in(week_start)
-    last_week_realised = await _realised_in(last_week_start, last_week_end)
+    if user_filter_oid is not None:
+        _acct_ids = [user_filter_oid]
+    elif (
+        own_scope or admin.role == UserRole.EMPLOYEE
+    ) and await is_effective_super_admin(admin):
+        # Super-admin Positions page: own direct users only (same pool as the
+        # table above), so the Total-of-Both cards match that filtered book.
+        # Its staff gets the same book (its table is the direct pool too; the
+        # page sends own_scope only for the SUPER_ADMIN role).
+        _acct_ids = await super_admin_direct_user_ids()
+    else:
+        _acct_ids = await _acct_pool(admin.id, admin.role.value)
 
     # Recompute unrealised LIVE per position rather than reading the stored
     # `p.unrealized_pnl` field — that field is only refreshed when the
@@ -2476,16 +2208,13 @@ async def positions_pnl_summary(
     # (often 0 on a freshly opened position), which is what made the
     # admin's "Open PNL" card stick at ₹0.00 while the per-row M2M column
     # showed the correct live number. Mirror the /positions list view's
-    # (ltp - avg) * qty math so both reads stay in lockstep.
-    open_q: dict[str, Any] = {"status": PositionStatus.OPEN.value}
-    if scope is not None:
-        if not scope:
-            open_positions: list[Position] = []
-        else:
-            open_q["user_id"] = {"$in": scope}
-            open_positions = await Position.find(open_q).to_list()
-    else:
-        open_positions = await Position.find(open_q).to_list()
+    # (ltp - avg) * qty math so both reads stay in lockstep. Over the same
+    # pool as the period figures, so the cards cover one set of clients.
+    open_positions = (
+        await Position.find({"status": PositionStatus.OPEN.value, "user_id": {"$in": _acct_ids}}).to_list()
+        if _acct_ids
+        else []
+    )
 
     # Parallel LTP fan-out (see /admin/positions for rationale). This
     # endpoint is hit by the Dashboard, Positions, and Orders pages every
@@ -2530,40 +2259,23 @@ async def positions_pnl_summary(
             raw *= current_usd_inr
         total_unrealised += raw
 
-    # ── Accounts-dashboard parity ───────────────────────────────────────
-    # The two Net-P&L cards must show the SAME Net Client PNL / Brokerage /
-    # Total-of-Both as /accounts-dashboard for the identical Mon→Sun window.
-    # Reuse the dashboard's own aggregator over its own pool resolver so the
-    # numbers can't drift: whole-book uses `_entity_pool_ids(admin)` (exactly
-    # what the "All Users" KPI card queries via compute_broker_totals); a
-    # user-filtered view narrows to that single client. Both pools are
-    # demo-free + non-CLOSED, so no demo data leaks in.
-    from app.services.accounts_dashboard_service import (  # noqa: PLC0415
-        client_totals_for_users as _client_totals,
-        _entity_pool_ids as _acct_pool,
+    _td_tot, _wk_tot, _lw_tot = await asyncio.gather(
+        *(_client_totals(_acct_ids, *windows[k]) for k in ("today", "week", "last_week"))
     )
-
-    if user_filter_oid is not None:
-        _acct_ids = [user_filter_oid]
-    elif own_scope and admin.role == UserRole.SUPER_ADMIN:
-        # Super-admin Positions page: own direct users only (same pool as the
-        # table above), so the Total-of-Both cards match that filtered book.
-        _acct_ids = await super_admin_direct_user_ids()
-    else:
-        _acct_ids = await _acct_pool(admin.id, admin.role.value)
-    _wk_tot = await _client_totals(_acct_ids, week_start, None)
-    _lw_tot = await _client_totals(_acct_ids, last_week_start, last_week_end)
 
     def _f(d) -> float:
         return round(float(d), 2)
 
+    def _net(t) -> float:
+        return _f(t["net_client_pnl"] - t["net_client_bkg"])
+
     _data = {
-        "today_pnl": round(today_realised + total_unrealised, 2),
-        "today_realised": round(today_realised, 2),
+        "today_pnl": _net(_td_tot),
+        "today_realised": _net(_td_tot),
         "open_unrealised": round(total_unrealised, 2),
-        "week_pnl": round(week_realised + total_unrealised, 2),
-        "week_realised": round(week_realised, 2),
-        "last_week_pnl": round(last_week_realised, 2),
+        "week_pnl": _net(_wk_tot),
+        "week_realised": _net(_wk_tot),
+        "last_week_pnl": _net(_lw_tot),
         # Accounts-parity trio (current + last week) — headline is Total-of-Both.
         "week_net_client_pnl": _f(_wk_tot["net_client_pnl"]),
         "week_brokerage": _f(_wk_tot["net_client_bkg"]),
@@ -2571,12 +2283,12 @@ async def positions_pnl_summary(
         "last_week_net_client_pnl": _f(_lw_tot["net_client_pnl"]),
         "last_week_brokerage": _f(_lw_tot["net_client_bkg"]),
         "last_week_total_of_both": _f(_lw_tot["total_of_both"]),
-        "today_start": today_start.isoformat(),
-        "week_start": week_start.isoformat(),
-        "last_week_start": last_week_start.isoformat(),
-        "last_week_end": last_week_end.isoformat(),
-        "week_label": _fmt_range(week_start_ist, week_end_ist),
-        "last_week_label": _fmt_range(last_week_start_ist, last_week_end_disp_ist),
+        "today_start": windows["today"][0].isoformat(),
+        "week_start": windows["week"][0].isoformat(),
+        "last_week_start": windows["last_week"][0].isoformat(),
+        "last_week_end": windows["last_week"][1].isoformat(),
+        "week_label": _fmt_range(*windows["week"]),
+        "last_week_label": _fmt_range(*windows["last_week"]),
         "usd_inr_rate": round(current_usd_inr, 4),
     }
     # Cache for the next 2 s so the Dashboard/Positions/Orders polls share it.
@@ -2691,10 +2403,8 @@ async def position_netting_entries(
 
     Used by the admin Positions blotter row-click to show the same view
     the user reported as the "Netting Entries — BSE (426450)" mockup.
-    Works for both OPEN and CLOSED positions:
-      - OPEN  → returns every fill from `opened_at` onward whose
-                (user, token, product_type) matches the position
-      - CLOSED → bounded by `[opened_at, closed_at]`
+    Works for both OPEN and CLOSED positions: the fills the row bills
+    (position_service.own_fills), oldest first.
     """
     from decimal import Decimal as _D
 
@@ -2706,59 +2416,12 @@ async def position_netting_entries(
         raise HTTPException(status_code=404, detail="Position not found")
     await assert_user_in_scope(admin, p.user_id)
 
-    # Find every Trade that contributed to this position. `position_id` is
-    # not stored on Trade, so we match by user + token + product_type +
-    # time window. For a re-opened position (close then open again on the
-    # same instrument) the time bounds keep us inside the CURRENT
-    # incarnation's fills.
-    #
-    # Grace window: position.opened_at is stamped AFTER the opening
-    # Trade.insert() in position_service.apply_fill, so a millisecond of
-    # clock-skew between the two writes makes `executed_at >= opened_at`
-    # silently drop the opening Trade — exactly the user-reported "sirf
-    # ek entry dikh raha hai (Exit), Entry missing" bug. A small grace
-    # absorbs that sub-second skew.
-    #
-    # The grace MUST stay tight: when a user closes a position and reopens
-    # the SAME instrument seconds later, a wide grace makes the two cycles'
-    # windows overlap, so each closed-position card bleeds in the adjacent
-    # cycle's legs (CL33333046 GOLD26AUGFUT, 2026-06-24: close 11:42:59 →
-    # reopen 11:43:14, only 15 s apart — the old 60 s grace pulled cycle-2's
-    # opening BUY into cycle-1's card and cycle-1's closing SELL into
-    # cycle-2's card, so both netting popups showed phantom extra legs even
-    # though the books were correct). The real clock-skew is milliseconds,
-    # so 2 s is ~1000× the worst case while no longer overlapping any
-    # realistic same-instrument re-entry.
-    from datetime import timedelta as _td
-
-    # A carried-forward position flips MIS→NRML at the EOD rollover, but its
-    # OPENING trades keep product_type=MIS — only the position row + the
-    # closing fill become NRML. A strict `product_type == p.product_type`
-    # filter then dropped every entry leg, so the dialog showed ONLY the exit
-    # (operator: "sirf exit dikh raha, saare entry missing" on a carried NFO
-    # position). Accept the position's product type PLUS its MIS intraday
-    # origin so a carried position lists all of its legs. The time window
-    # already isolates this incarnation, so this can't pull in a later cycle.
-    _pt = p.product_type.value if hasattr(p.product_type, "value") else str(p.product_type)
-    query: dict = {
-        "user_id": p.user_id,
-        "instrument.token": p.instrument.token,
-        "product_type": {"$in": list({_pt, "MIS"})},
-    }
-    time_q: dict = {}
-    if p.opened_at:
-        time_q["$gte"] = p.opened_at - _td(seconds=2)
-    if p.closed_at:
-        # Same grace on the upper bound so a closing trade whose
-        # executed_at lands a few milliseconds AFTER position.closed_at
-        # still shows up.
-        time_q["$lte"] = p.closed_at + _td(seconds=2)
-    if time_q:
-        query["executed_at"] = time_q
-
-    trades = (
-        await Trade.find(query).sort("+executed_at").to_list()
-    )
+    # The fills this row bills: each live fill belongs to exactly ONE
+    # position (position_service.own_fills) — a carried NRML row its
+    # MIS-stamped opening legs but no MIS round trip beside it, a re-entry
+    # seconds after a close or a reopened row none of a neighbour's legs, an
+    # undone close none at all.
+    trades = (await position_service.own_fills([p]))[p.id]
 
     # Build the per-row entries the dialog renders.
     open_side = (
@@ -2887,6 +2550,13 @@ async def delete_position(
         raise HTTPException(status_code=404, detail="Position not found")
     await assert_user_in_scope(admin, p.user_id)
     user_id = p.user_id
+    if p.status == PositionStatus.CLOSED and p.closed_at is None:
+        # A reopen holds it (its claim takes the close time off); a legacy
+        # row with no close time has no window to delete either.
+        raise HTTPException(
+            status_code=409,
+            detail="This position is being reopened or has no close time — refresh and retry.",
+        )
 
     # ── OPEN-position delete (admin-only escape hatch) ────────────────
     # Previously this endpoint refused to delete OPEN rows ("Square it
@@ -2919,7 +2589,7 @@ async def delete_position(
 
     from app.models.transaction import TransactionType
     from app.services import wallet_service
-    from app.utils.decimal_utils import to_decimal
+    from app.utils.decimal_utils import quantize_money, to_decimal
 
     is_open = p.status == PositionStatus.OPEN and abs(float(p.quantity or 0)) > 1e-9
     from app.services.position_service import realized_pnl_inr as _realized_inr_del
@@ -2928,6 +2598,41 @@ async def delete_position(
     reversed_amount = _Decimal("0")
     closing_brokerage = _Decimal("0")
     booked_total = _Decimal("0")
+
+    # One window for the brokerage refund, the supersede and the order wipe.
+    # A fill a reopen already undid was settled by that reopen.
+    from app.models.trade import Trade as _TradeDel
+
+    _win_fills = await _TradeDel.find(await _delete_window(p)).to_list()
+    _live = [t for t in _win_fills if not t.superseded_by_reopen]
+
+    def _charges(fills: list) -> _Decimal:
+        return sum((to_decimal(t.total_charges or t.brokerage or 0) for t in fills), _Decimal("0"))
+
+    # Each close comes back at the rate it was booked at; the rest of
+    # realized_pnl (a settlement leg, an override) at the position's rate.
+    _fx_del = position_service.position_fx_rate(p)
+    for t in _live:
+        if t.pnl_inr is not None:
+            at_fx = quantize_money(position_service._booked_gross(t) * _fx_del)
+            realized += to_decimal(t.pnl_inr) + _charges([t]) - at_fx
+
+    # Claim: the delete takes the doc first, so a second submit (admins retry
+    # on "Network Error") finds nothing and gets 409 instead of a second
+    # REVERSAL. Put back if the wallet reversal fails.
+    _pos_coll = Position.get_motor_collection()
+    _doc = await _pos_coll.find_one_and_delete(
+        {"_id": p.id, "status": p.status.value, "closed_at": p.closed_at}
+    )
+    if _doc is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This position was already deleted or has changed — refresh and retry.",
+        )
+
+    async def _abort(detail: str) -> HTTPException:
+        await _pos_coll.insert_one(_doc)
+        return HTTPException(status_code=500, detail=detail)
 
     if is_open:
         # Release the locked margin back to available_balance. Best-effort:
@@ -2946,23 +2651,7 @@ async def delete_position(
         # paid brokerage. A delete leaves no trace, so reverse those too
         # (31-Oct V548MQ: a deleted open KPITTECH kept its rollover partial
         # close's -₹6,519.82 and that closed row could never be deleted).
-        from datetime import timedelta as _td_open
-        from app.models.trade import Trade as _TradeOpenDel
-        from app.utils.time_utils import now_utc as _now_open
-
-        _olo = (p.opened_at or _now_open()) - _td_open(seconds=5)
-        _fills = await _TradeOpenDel.find(
-            {
-                "user_id": p.user_id,
-                "instrument.token": p.instrument.token,
-                "product_type": {"$in": await _fill_products(p, _olo, _now_open())},
-                "executed_at": {"$gte": _olo},
-                "superseded_by_reopen": {"$ne": True},
-            }
-        ).to_list()
-        open_charges = sum(
-            (to_decimal(t.total_charges or t.brokerage or 0) for t in _fills), _Decimal("0")
-        )
+        open_charges = _charges(_live)
         cash_refund = realized - open_charges
         if cash_refund != _Decimal("0"):
             try:
@@ -2977,13 +2666,11 @@ async def delete_position(
                     reference_type="Position",
                     reference_id=str(p.id),
                     actor_id=admin.id,
+                    draw_margin=True,
                 )
                 reversed_amount = realized
             except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Wallet reversal failed; position not deleted: {e}",
-                )
+                raise await _abort(f"Wallet reversal failed; position not deleted: {e}")
     else:
         # ── Full wallet reversal for closed position ─────────────────
         # The close booked up to THREE wallet debits that must all be
@@ -3013,34 +2700,41 @@ async def delete_position(
         # reversed the FULL ₹1,13,900 → ₹38,574 phantom cash + settlement never
         # cleared, because the old symbol-in-narration BOOKED scan missed it.
         #
-        # PRIMARY (reliable): derive booked_total from the close's own PNL
-        # ledger row — its amount IS the true available debit, so
-        #   booked_total = |realized| − |pnl_row_amount|.
-        # The PNL row always names the symbol ("Realized loss on {symbol}
-        # close"), so this resolves even when the separate BOOKED row's
-        # narration/window doesn't. FALLBACK: scan the explicit BOOKED rows.
+        # PRIMARY (reliable): derive booked_total per close from its own PNL
+        # ledger row (reference_id = the close's order id) — its amount IS the
+        # true available debit, so a close's shortfall is
+        #   |raw loss of the close| − |its PNL row amounts|.
+        # Comparing the WHOLE realized with only the nearest row (the old
+        # rule) read every earlier partial close of a loss as a shortfall: a
+        # phantom RECOVERY row and the client short in cash.
+        # FALLBACK: scan the explicit BOOKED rows.
         booked_total = _Decimal("0")
         if p.closed_at is not None:
             lo = p.closed_at - _td_delta(seconds=90)
             hi = p.closed_at + _td_delta(seconds=90)
             sym = p.instrument.symbol
-            # (1) Derive from the close's PNL row = the actual available debit.
+            # (1) Per close: raw loss vs the PNL row it actually debited.
             try:
+                raw_by_order: dict[str, _Decimal] = {}
+                for t in _live:
+                    if t.pnl_inr is not None:
+                        k = str(t.order_id)
+                        raw_by_order[k] = (
+                            raw_by_order.get(k, _Decimal("0")) + to_decimal(t.pnl_inr) + _charges([t])
+                        )
                 pnl_rows = await _WT.find(
                     _WT.user_id == p.user_id,
                     _WT.transaction_type == TransactionType.PNL,
-                    _WT.created_at >= lo,
-                    _WT.created_at <= hi,
+                    {"reference_id": {"$in": list(raw_by_order)}},
                 ).to_list()
-                cand = [r for r in pnl_rows if sym in (r.narration or "")]
-                if cand and realized < _Decimal("0"):
-                    cand.sort(
-                        key=lambda r: abs((r.created_at - p.closed_at).total_seconds())
+                debit_by_order: dict[str, _Decimal] = {}
+                for r in pnl_rows:
+                    debit_by_order[r.reference_id] = (
+                        debit_by_order.get(r.reference_id, _Decimal("0")) + abs(to_decimal(r.amount or 0))
                     )
-                    actual_debit = abs(to_decimal(cand[0].amount or 0))
-                    derived = abs(realized) - actual_debit
-                    if derived > _Decimal("0"):
-                        booked_total = derived
+                for k, raw in raw_by_order.items():
+                    if raw < 0 and k in debit_by_order:
+                        booked_total += max(_Decimal("0"), abs(raw) - debit_by_order[k])
             except Exception:
                 booked_total = _Decimal("0")
             # (2) Fallback: explicit BOOKED rows scanned by symbol + window.
@@ -3064,8 +2758,15 @@ async def delete_position(
                 from app.models.wallet import Wallet as _Wallet
                 wallet_doc = await wallet_service.get_or_create(user_id)
                 cur_settle = to_decimal(wallet_doc.settlement_outstanding or 0)
-                new_settle = max(_Decimal("0"), cur_settle - booked_total)
-                wallet_doc.settlement_outstanding = _Dec128(str(new_settle))
+                # A due netting already took out of cash is owed no more: it
+                # comes back with the cash refund (Step C); only the rest is
+                # unbooked here.
+                booked_total = min(booked_total, cur_settle)
+            except Exception as e:
+                raise await _abort(f"Settlement unwind failed; delete aborted: {e}") from e
+        if booked_total > _Decimal("0"):
+            try:
+                wallet_doc.settlement_outstanding = _Dec128(str(cur_settle - booked_total))
                 wallet_doc.version = (wallet_doc.version or 0) + 1
                 await wallet_doc.save()
                 avail_str = str(wallet_doc.available_balance)
@@ -3085,60 +2786,16 @@ async def delete_position(
                     created_by=admin.id,
                 ).insert()
             except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Settlement unwind failed; delete aborted: {e}",
-                )
+                raise await _abort(f"Settlement unwind failed; delete aborted: {e}")
 
-        # ── Step B: look up brokerage on the closing Trade row ────────
-        closing_brokerage = _Decimal("0")
-        if p.closed_at is not None:
-            try:
-                from app.models.trade import Trade as _TradeModel
-                ct = await _TradeModel.find_one(
-                    {
-                        "user_id": p.user_id,
-                        "instrument.token": p.instrument.token,
-                        "pnl_inr": {"$ne": None},
-                        "executed_at": {
-                            "$gte": p.closed_at - _td_delta(seconds=15),
-                            "$lte": p.closed_at + _td_delta(seconds=15),
-                        },
-                    }
-                )
-                if ct is not None:
-                    closing_brokerage = to_decimal(ct.total_charges or ct.brokerage or 0)
-            except Exception:
-                closing_brokerage = _Decimal("0")
-
-        # ── Step B2: opening-leg brokerage ────────────────────────────
-        # A DELETE removes the WHOLE position, so the brokerage paid to OPEN
-        # it (every opening BUY fill — pnl_inr is None) must be refunded too,
-        # not just the closing leg. Reopen deliberately leaves this charged
-        # (the position stays open, so the open brokerage still applies), but
-        # delete fully unwinds the position. Operator caught the leak: after a
-        # delete the user's balance was short by exactly the opening brokerage
-        # (₹321 + ₹320 across cycles). Sum every opening fill across the
-        # position's lifecycle [opened_at, closed_at].
-        opening_brokerage = _Decimal("0")
-        if p.closed_at is not None:
-            try:
-                from app.models.trade import Trade as _TradeOpen
-                _olo = (p.opened_at or p.closed_at) - _td_delta(seconds=15)
-                _ohi = p.closed_at + _td_delta(seconds=15)
-                opens = await _TradeOpen.find(
-                    {
-                        "user_id": p.user_id,
-                        "instrument.token": p.instrument.token,
-                        "product_type": {"$in": await _fill_products(p, _olo, _ohi)},
-                        "pnl_inr": None,  # opening fills carry no realized P&L
-                        "executed_at": {"$gte": _olo, "$lte": _ohi},
-                    }
-                ).to_list()
-                for ot in opens:
-                    opening_brokerage += to_decimal(ot.total_charges or ot.brokerage or 0)
-            except Exception:
-                opening_brokerage = _Decimal("0")
+        # ── Steps B / B2: brokerage of every fill the delete hides ────
+        # Every closing fill, partial closes included (one fill found near
+        # closed_at left the earlier partials charged while the supersede hid
+        # them), and every opening leg (pnl_inr None) — a DELETE unwinds the
+        # whole position. Same window as the supersede below, so a quick
+        # same-key re-entry keeps its own charges.
+        closing_brokerage = _charges([t for t in _live if t.pnl_inr is not None])
+        opening_brokerage = _charges([t for t in _live if t.pnl_inr is None])
 
         # ── Step C: cash reversal (PnL cash portion + brokerage) ──────
         # cash_refund = signed amount leaving wallet after this reversal
@@ -3168,66 +2825,54 @@ async def delete_position(
                     reference_type="Position",
                     reference_id=str(p.id),
                     actor_id=admin.id,
+                    # A debit past free cash comes out of the margin other
+                    # open positions lock, as a close loss does — floored to a
+                    # due, it never left the week's P&L.
+                    draw_margin=True,
                 )
                 reversed_amount = realized
             except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Wallet reversal failed; position not deleted: {e}",
-                )
+                raise await _abort(f"Wallet reversal failed; position not deleted: {e}")
 
     # Supersede ALL of this position's fills — opening AND closing — so a
     # DELETE wipes the trade out of every aggregation (P&L, brokerage, closed
     # blotter, ledger, admin cards). Unlike reopen (which only undoes the
     # closing leg), a delete removes the whole position, so its opening-leg
     # brokerage must drop too — operator: "delete karne par brokerage bhi har
-    # jagah se hat jaye". Window = the position's full life [opened_at,
-    # closed_at]; bounded by the doc's own timestamps so a parallel same-token
-    # position outside that span keeps its fills.
+    # jagah se hat jaye". The fills = the ones this row bills, each fill's
+    # one owner (`_delete_window`, position_service.own_fills).
+    #
+    # `fifo_deleted` also takes the fills out of the FIFO cost book: flagged
+    # only, the bare opening legs stayed queued and priced every later close
+    # on the script. A weekly settlement's re-seed of this position goes too.
     try:
-        from datetime import timedelta as _td_sup
-        from app.models.trade import Trade as _TradeSup
         from app.models.order import Order as _OrderSup
+        from app.models.position_settlement import PositionSettlement as _PSDel
         from app.utils.time_utils import now_utc as _now_sup
 
-        _lo = (p.opened_at or p.closed_at)
-        _hi = p.closed_at or _now_sup()  # OPEN delete: every fill up to now
         await _supersede_settlement_pnl(p)
-        if _lo is not None:
-            _sup_q: dict[str, Any] = {
-                "user_id": p.user_id,
-                "instrument.token": p.instrument.token,
-                "product_type": {"$in": await _fill_products(p, _lo - _td_sup(seconds=5), _hi)},
-                "executed_at": {
-                    "$gte": _lo - _td_sup(seconds=5),
-                    "$lte": _hi + _td_sup(seconds=3),
-                },
-            }
-            # Collect the fills' parent orders BEFORE flagging, so we can wipe
-            # them from the user's order blotter too.
-            _sup_trades = await _TradeSup.find(_sup_q).to_list()
-            _order_ids = list(
-                {t.order_id for t in _sup_trades if getattr(t, "order_id", None)}
-            )
-            await _TradeSup.get_motor_collection().update_many(
-                _sup_q, {"$set": {"superseded_by_reopen": True}}
-            )
-            # Bug: a deleted position's EXECUTED orders lingered in the user's
-            # Orders → Executed tab (the user list reads Order docs directly,
-            # which carry no superseded flag). Hard-remove them so a delete
-            # wipes the order everywhere, not just the trade/position/ledger.
-            # Operator: "trade delete karne par user side ke execute orders se
-            # bhi hat jaye."
-            if _order_ids:
-                await _OrderSup.get_motor_collection().delete_many(
-                    {"_id": {"$in": _order_ids}}
-                )
+        await _TradeDel.get_motor_collection().update_many(
+            {"_id": {"$in": [t.id for t in _win_fills]}},
+            {"$set": {"superseded_by_reopen": True, "fifo_deleted": True}},
+        )
+        # Bug: a deleted position's EXECUTED orders lingered in the user's
+        # Orders → Executed tab (the user list reads Order docs directly,
+        # which carry no superseded flag). Hard-remove them so a delete
+        # wipes the order everywhere, not just the trade/position/ledger.
+        # Operator: "trade delete karne par user side ke execute orders se
+        # bhi hat jaye."
+        _order_ids = list({t.order_id for t in _win_fills if getattr(t, "order_id", None)})
+        if _order_ids:
+            await _OrderSup.get_motor_collection().delete_many({"_id": {"$in": _order_ids}})
+        await _PSDel.get_motor_collection().update_many(
+            {"user_id": p.user_id, "new_position_id": p.id},
+            {"$set": {"successor_deleted_at": _now_sup()}},
+        )
     except Exception:
         logger.exception("delete_supersede_trades_failed", extra={"pos_id": str(p.id)})
 
     instrument_token = p.instrument.token
     segment_type = p.segment_type
-    await p.delete()
 
     # Tracker recompute — drops the now-gone row from intraday /
     # holding lots counters. Same source-of-truth helper that runs on
@@ -3547,7 +3192,7 @@ async def list_trades(
     from_dt: str | None = Query(default=None, description="ISO datetime, inclusive"),
     to_dt: str | None = Query(default=None, description="ISO datetime, exclusive"),
 ):
-    q: dict[str, Any] = {}
+    q: dict[str, Any] = {**LIVE_FILL}
     if user_id:
         await assert_user_in_scope(admin, user_id)
         q["user_id"] = PydanticObjectId(user_id)

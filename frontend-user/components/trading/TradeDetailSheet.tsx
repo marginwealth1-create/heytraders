@@ -35,7 +35,7 @@ import {
 import { playBuyTone, playSellTone } from "@/lib/trade-audio";
 import { useMarketStream } from "@/lib/useMarketStream";
 import { getIndexLotSize } from "@/lib/indexLots";
-import { isInstrumentMarketOpen, marketLabel, getMarketHoursInfo, useMarketHours } from "@/lib/marketHours";
+import { getMarketClosedMessage, isInstrumentMarketOpen } from "@/lib/marketHours";
 import { cn, formatINR, formatIST, formatPercent, pnlColor } from "@/lib/utils";
 import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
@@ -95,7 +95,6 @@ export function TradeDetailSheet(props: Props) {
 }
 
 function TradeDetailSheetInner({ token, open, onClose, onSwap, initialSide, seedQuote }: Props) {
-  useMarketHours();
   const qc = useQueryClient();
 
   // ── Live data ─────────────────────────────────────────────────────
@@ -515,6 +514,21 @@ function TradeDetailSheetInner({ token, open, onClose, onSwap, initialSide, seed
       toast.error("Instrument not loaded");
       return;
     }
+    if (
+      !isInstrumentMarketOpen(
+        (instrument as any).segment as string | undefined,
+        (instrument as any).exchange as string | undefined,
+      )
+    ) {
+      toast.error(
+        getMarketClosedMessage(
+          (instrument as any).segment as string | undefined,
+          (instrument as any).exchange as string | undefined,
+        ),
+        { duration: 5000 },
+      );
+      return;
+    }
     // Force-commit any pending lot input — the user can tap BUY/SELL
     // without first blurring the lot field on mobile, in which case
     // `lots` state still holds the previous value while `lotInput`
@@ -581,12 +595,11 @@ function TradeDetailSheetInner({ token, open, onClose, onSwap, initialSide, seed
         (instrument as any).exchange as string | undefined,
       )
     ) {
-      const hInfo = getMarketHoursInfo(
-        (instrument as any).segment as string | undefined,
-        (instrument as any).exchange as string | undefined,
-      );
       toast.error(
-        `${hInfo.name} market is closed (Trading hours: ${hInfo.startTime} – ${hInfo.endTime} IST). Try placing an AMO instead.`,
+        getMarketClosedMessage(
+          (instrument as any).segment as string | undefined,
+          (instrument as any).exchange as string | undefined,
+        ),
         { duration: 5000 },
       );
       return;

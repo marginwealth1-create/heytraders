@@ -397,12 +397,11 @@ export default function WalletPage() {
               <WalletIcon className="size-3.5" /> Available balance
             </div>
             <div className="font-tabular text-3xl font-bold md:text-4xl">
-              {/* Never display a negative balance on the user-facing hero —
-                  any shortfall is surfaced as settlement_outstanding in
-                  the banner below. */}
-              {formatINR(Math.max(0, Number(summary?.available_balance ?? 0)))}
+              {/* Minus mode: a loss past the balance shows here as a negative
+                  balance; the next money added pays it back. */}
+              {formatINR(Number(summary?.available_balance ?? 0))}
             </div>
-            <div className="text-[11px] opacity-80">Wallet · {selectedBank?.account_holder ?? "MarginWealth"}</div>
+            <div className="text-[11px] opacity-80">Wallet · {selectedBank?.account_holder ?? "Hey Traders"}</div>
           </div>
           <div className="hidden gap-2 sm:flex">
             <button
@@ -953,12 +952,14 @@ type FeedKind =
   | "admin_deduct"
   | "pnl_in"
   | "pnl_out"
+  | "adj_in"
+  | "adj_out"
   | "charge"
   | "shortfall";
 
 // Which kinds ADD money (green / "in"). Single source of truth so the
 // filter chips and the row colour never drift apart.
-const IN_KINDS = new Set<FeedKind>(["deposit", "admin_add", "pnl_in"]);
+const IN_KINDS = new Set<FeedKind>(["deposit", "admin_add", "pnl_in", "adj_in"]);
 type FeedRow = {
   id: string;
   kind: FeedKind;
@@ -1004,6 +1005,11 @@ function TransactionsFeed({
       } else if (tt === "WITHDRAWAL") {
         kind = "withdrawal";
         if (!narration) narration = "Withdrawal debited";
+      } else if (tt === "REVERSAL" || (tt === "ADJUSTMENT" && t?.bucket === "trading")) {
+        // An admin delete / reopen / edit undoing a trade, or a system
+        // adjustment (EOD carry fee): trading-side, never an admin's money
+        // move. The server words the narration as the ledger does.
+        kind = amt >= 0 ? "adj_in" : "adj_out";
       } else if (tt === "ADJUSTMENT") {
         kind = amt >= 0 ? "admin_add" : "admin_deduct";
         if (!narration) narration = amt >= 0 ? "Admin credited funds" : "Admin debited funds";
@@ -1189,6 +1195,8 @@ function FeedRowItem({ row }: { row: FeedRow }) {
     admin_deduct: "Admin debit",
     pnl_in: "Trade profit",
     pnl_out: "Trade loss",
+    adj_in: "Adjustment",
+    adj_out: "Adjustment",
     charge: "Brokerage & charges",
     shortfall: "Stop-out shortfall",
   };

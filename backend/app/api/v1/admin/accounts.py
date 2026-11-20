@@ -12,39 +12,44 @@ All calculations verified per spec — see docstring at module top.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from io import BytesIO
-from typing import Any
+from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Query
 from starlette.responses import StreamingResponse
 
-from app.core.dependencies import CurrentAdmin, require_perm, scoped_user_filter, scoped_user_ids
+from app.core.dependencies import (
+    CurrentAdmin,
+    is_effective_super_admin,
+    require_perm,
+    scoped_user_filter,
+    scoped_user_ids,
+)
+from app.core.exceptions import NotFoundError, ValidationFailedError
 from app.models.position import Position, PositionStatus
-from app.models.trade import Trade
-from app.models.transaction import TransactionType, WalletTransaction
+from app.models.trade import LIVE_FILL, Trade
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.schemas.common import APIResponse
 from app.services import accounts_dashboard_service as ads
+from app.services import tradebook_builder
 from app.utils.decimal_utils import to_decimal
+from app.utils.downloads import attachment
 
 router = APIRouter(prefix="/accounts", tags=["admin-accounts"])
 
 IST = ZoneInfo("Asia/Kolkata")
 
-_WEEK_PRESETS = {
-    "current_week": lambda now: (
-        (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0),
-        now,
-    ),
-    "last_week": lambda now: (
-        (now - timedelta(days=now.weekday() + 7)).replace(hour=0, minute=0, second=0, microsecond=0),
-        (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(seconds=1),
-    ),
+_WEEK_PRESETS: dict[str, Callable[[datetime], tuple[datetime, datetime]]] = {
+    # The P&L cards' IST weeks, Mon 00:00 → Sun 23:59:59.999.
+    "current_week": lambda now: tradebook_builder.periods(now)["week"],
+    "last_week": lambda now: tradebook_builder.periods(now)["last_week"],
     "this_month": lambda now: (
         now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
         now,
@@ -82,8 +87,6 @@ async def _aggregate_for_users(
     if not user_ids:
         return _empty()
 
-    is_lifetime = start_utc is None and end_utc is None
-
     wallets = await Wallet.find({"user_id": {"$in": user_ids}}).to_list()
 
     total_balance = sum(_d(w.available_balance) + _d(w.used_margin) for w in wallets)
@@ -97,69 +100,33 @@ async def _aggregate_for_users(
     total_equity = total_balance + total_unrealized
     total_settlement = sum(_d(w.settlement_outstanding) for w in wallets)
 
-    if is_lifetime:
-        deposits = sum(_d(w.total_deposits) for w in wallets)
-        withdrawals = sum(_d(w.total_withdrawals) for w in wallets)
-        realized_pnl = sum(_d(w.realized_pnl) for w in wallets)
+    # Realized P&L / Brokerage: the users' Billing statement Gross and
+    # Brokerage over the window (lifetime when unbounded) — the rows on screen.
+    booked = (await tradebook_builder.booked(user_ids, start_utc, end_utc)).values()
+    realized_pnl = float(sum((g for g, _ in booked), Decimal(0)))
+    brokerage = float(sum((b for _, b in booked), Decimal(0)))
 
-        # Brokerage: wallet.total_brokerage is often 0 because brokerage
-        # is tracked per-trade (Trade.brokerage) not as a separate wallet
-        # transaction. Always sum from trades for accuracy.
-        all_trades = await Trade.find({
-            "user_id": {"$in": user_ids},
-        }).to_list()
-        brokerage = sum(_d(t.brokerage) for t in all_trades)
-        volume = sum(_d(t.value) for t in all_trades)
+    date_filter: dict[str, Any] = {}
+    if start_utc:
+        date_filter["$gte"] = start_utc
+    if end_utc:
+        date_filter["$lte"] = end_utc
 
-        all_closing_trades = [t for t in all_trades if t.pnl_inr is not None]
-        total_trades = len(all_closing_trades)
-        profit_trades = sum(1 for t in all_closing_trades if _d(t.pnl_inr) > 0)
-        loss_trades = sum(1 for t in all_closing_trades if _d(t.pnl_inr) < 0)
-    else:
-        date_filter = {}
-        if start_utc:
-            date_filter["$gte"] = start_utc
-        if end_utc:
-            date_filter["$lte"] = end_utc
+    # Deposits / Withdrawals: the KPI's own cash classifier, lifetime too.
+    dep, wd = await ads.cash_in_out(user_ids, date_filter or None)
+    deposits, withdrawals, net_deposit = float(dep), float(wd), float(dep - wd)
 
-        dep_txns = await WalletTransaction.find({
-            "user_id": {"$in": user_ids},
-            "transaction_type": TransactionType.DEPOSIT.value,
-            "created_at": date_filter,
-        }).to_list()
-        deposits = sum(_d(t.amount) for t in dep_txns)
+    # Trades and volume: live fills only (LIVE_FILL), as every other screen.
+    trade_q: dict[str, Any] = {"user_id": {"$in": user_ids}, **LIVE_FILL}
+    if date_filter:
+        trade_q["executed_at"] = date_filter
+    fills = await Trade.find(trade_q).to_list()
+    volume = float(sum((to_decimal(t.value) for t in fills), Decimal(0)))
+    closes = [to_decimal(t.pnl_inr) for t in fills if t.pnl_inr is not None]
+    total_trades = len(closes)
+    profit_trades = sum(1 for p in closes if p > 0)
+    loss_trades = sum(1 for p in closes if p < 0)
 
-        wd_txns = await WalletTransaction.find({
-            "user_id": {"$in": user_ids},
-            "transaction_type": TransactionType.WITHDRAWAL.value,
-            "created_at": date_filter,
-        }).to_list()
-        withdrawals = sum(abs(_d(t.amount)) for t in wd_txns)
-
-        closed_positions = await Position.find({
-            "user_id": {"$in": user_ids},
-            "status": PositionStatus.CLOSED.value,
-            "closed_at": date_filter,
-        }).to_list()
-        realized_pnl = sum(_d(p.realized_pnl) for p in closed_positions)
-
-        closing_trades = await Trade.find({
-            "user_id": {"$in": user_ids},
-            "pnl_inr": {"$ne": None},
-            "executed_at": date_filter,
-        }).to_list()
-        total_trades = len(closing_trades)
-        profit_trades = sum(1 for t in closing_trades if _d(t.pnl_inr) > 0)
-        loss_trades = sum(1 for t in closing_trades if _d(t.pnl_inr) < 0)
-
-        all_trades = await Trade.find({
-            "user_id": {"$in": user_ids},
-            "executed_at": date_filter,
-        }).to_list()
-        brokerage = sum(_d(t.brokerage) for t in all_trades)
-        volume = sum(_d(t.value) for t in all_trades)
-
-    net_deposit = deposits - withdrawals
     win_rate = round((profit_trades / total_trades) * 100, 1) if total_trades > 0 else 0.0
     net_pnl = realized_pnl + total_unrealized
 
@@ -197,12 +164,16 @@ def _empty() -> dict[str, Any]:
 
 async def _make_entity(
     entity_user: User,
-    pool_ids: list[PydanticObjectId],
     role_label: str,
+    clause: dict[str, Any],
     start_utc: datetime | None,
     end_utc: datetime | None,
     **extra: Any,
 ) -> dict[str, Any]:
+    """One admin / broker / sub-broker row over the pool its on-screen card
+    (compute_broker_totals) reads: an admin's clients incl. a transferred
+    broker's subtree, a broker's whole subtree; ANDed with the caller's clause."""
+    pool_ids = await ads._entity_pool_ids(entity_user.id, entity_user.role.value, clause)
     agg = await _aggregate_for_users(pool_ids, start_utc=start_utc, end_utc=end_utc)
     return {
         "id": str(entity_user.id),
@@ -223,28 +194,14 @@ async def accounts_summary(
     preset: str | None = Query(default=None),
     _: None = Depends(require_perm("users", "read")),
 ) -> APIResponse:
-    now_ist = datetime.now(IST)
-
-    start_utc: datetime | None = None
-    end_utc: datetime | None = None
-    if preset and preset in _WEEK_PRESETS:
-        s, e = _WEEK_PRESETS[preset](now_ist)
-        start_utc = _to_utc(s)
-        end_utc = _to_utc(e)
-    elif from_date or to_date:
-        try:
-            if from_date:
-                start_utc = _to_utc(datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=IST))
-            if to_date:
-                end_utc = _to_utc(datetime.strptime(to_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=IST))
-        except ValueError:
-            pass
+    start_utc, end_utc = _parse_dates(from_date, to_date, preset)
 
     entities: list[dict[str, Any]] = []
     # Comprehensive scope (incl. broker subtree for ADMIN) so the
     # brokers / sub-brokers tabs list every broker under the admin even
     # when a transferred broker's descendants weren't re-stamped.
-    admin_scope = await scoped_user_filter(admin)
+    # all_pools: {} for the effective super-admin (incl. its EMPLOYEE, D1).
+    admin_scope = await scoped_user_filter(admin, all_pools=True)
 
     # Collect ALL user ids in scope for grand total
     all_scope_query: dict[str, Any] = {
@@ -252,7 +209,7 @@ async def accounts_summary(
         "status": {"$ne": UserStatus.CLOSED.value},
         "is_demo": {"$ne": True},
     }
-    if admin.role == UserRole.SUPER_ADMIN:
+    if await is_effective_super_admin(admin):
         all_users = await User.find(all_scope_query).to_list()
     else:
         # Use the thorough subtree resolver (NOT the flat assigned_admin_id
@@ -308,9 +265,10 @@ async def accounts_summary(
         }).to_list()
 
         async def _do_admin(adm: User) -> dict[str, Any]:
-            pool = [u.id for u in all_users if u.assigned_admin_id == adm.id]
             broker_count = sum(1 for u in await User.find({"assigned_admin_id": adm.id, "role": UserRole.BROKER.value}).to_list())
-            return await _make_entity(adm, pool, "ADMIN", start_utc, end_utc, broker_count=broker_count)
+            return await _make_entity(
+                adm, "ADMIN", admin_scope, start_utc, end_utc, broker_count=broker_count
+            )
 
         results = await asyncio.gather(*[_do_admin(a) for a in admins], return_exceptions=True)
         entities.extend(r for r in results if isinstance(r, dict))
@@ -321,8 +279,7 @@ async def accounts_summary(
             "role": UserRole.BROKER.value,
             "status": {"$ne": UserStatus.CLOSED.value},
         }
-        if admin.role != UserRole.SUPER_ADMIN:
-            broker_query.update(admin_scope)
+        broker_query.update(admin_scope)
         brokers = await User.find(broker_query).to_list()
 
         # Direct users (no broker)
@@ -332,8 +289,7 @@ async def accounts_summary(
             entities.append({"id": "direct", "name": "Direct Users (No Broker)", "role": "DIRECT", **agg})
 
         async def _do_broker(b: User) -> dict[str, Any]:
-            pool = [u.id for u in all_users if u.assigned_broker_id == b.id]
-            return await _make_entity(b, pool, "BROKER", start_utc, end_utc)
+            return await _make_entity(b, "BROKER", admin_scope, start_utc, end_utc)
 
         results = await asyncio.gather(*[_do_broker(b) for b in brokers], return_exceptions=True)
         entities.extend(r for r in results if isinstance(r, dict))
@@ -345,13 +301,11 @@ async def accounts_summary(
             "status": {"$ne": UserStatus.CLOSED.value},
             "assigned_broker_id": {"$ne": None},
         }
-        if admin.role != UserRole.SUPER_ADMIN:
-            sub_query.update(admin_scope)
+        sub_query.update(admin_scope)
         sub_brokers = await User.find(sub_query).to_list()
 
         async def _do_sub(sb: User) -> dict[str, Any]:
-            pool = [u.id for u in all_users if u.assigned_broker_id == sb.id]
-            return await _make_entity(sb, pool, "SUB_BROKER", start_utc, end_utc)
+            return await _make_entity(sb, "SUB_BROKER", admin_scope, start_utc, end_utc)
 
         results = await asyncio.gather(*[_do_sub(sb) for sb in sub_brokers], return_exceptions=True)
         entities.extend(r for r in results if isinstance(r, dict))
@@ -381,13 +335,10 @@ def _parse_dates(
         start_utc = _to_utc(s)
         end_utc = _to_utc(e)
     elif from_date or to_date:
-        try:
-            if from_date:
-                start_utc = _to_utc(datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=IST))
-            if to_date:
-                end_utc = _to_utc(datetime.strptime(to_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=IST))
-        except ValueError:
-            pass
+        # Whole IST days, the Billing statement's own window, so a row reads
+        # that user's statement for the same dates.
+        with contextlib.suppress(ValidationFailedError):
+            start_utc, end_utc = tradebook_builder.window(from_date, to_date)
     return start_utc, end_utc
 
 
@@ -423,17 +374,13 @@ async def broker_totals(
     preset: str | None = Query(default=None),
     _: None = Depends(require_perm("users", "read")),
 ) -> APIResponse:
-    try:
-        eid = PydanticObjectId(entity_id)
-    except Exception:
-        return APIResponse(data=ads._empty_broker_totals(), message="Invalid entity ID")
-
-    entity = await User.get(eid)
-    if not entity:
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None or scope[0] is None:
         return APIResponse(data=ads._empty_broker_totals(), message="Entity not found")
+    entity, _role, clause = scope
 
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    result = await ads.compute_broker_totals(eid, start_utc, end_utc)
+    result = await ads.compute_broker_totals(entity.id, start_utc, end_utc, clause)
     return APIResponse(data=result)
 
 
@@ -451,18 +398,16 @@ async def entity_users(
     _: None = Depends(require_perm("users", "read")),
 ) -> APIResponse:
     _empty_resp = {"items": [], "meta": {"page": 1, "page_size": page_size, "total": 0, "total_pages": 0}}
-    try:
-        eid = PydanticObjectId(entity_id)
-    except Exception:
-        return APIResponse(data=_empty_resp, message="Invalid entity ID")
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None:
+        return APIResponse(data=_empty_resp, message="Entity not found")
+    entity, entity_role, clause = scope
 
-    entity = await User.get(eid)
-    if not entity:
-        return APIResponse(data=_empty_resp)
-
-    entity_role = entity.role.value if hasattr(entity.role, "value") else str(entity.role)
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    result = await ads.get_entity_users(eid, entity_role, start_utc, end_utc, page, page_size, search)
+    result = await ads.get_entity_users(
+        entity.id if entity else None, entity_role, start_utc, end_utc,
+        page, page_size, search, pool_clause=clause,
+    )
     return APIResponse(data=result)
 
 
@@ -474,23 +419,29 @@ async def export_entity_users_excel(
     from_date: str | None = Query(default=None),
     to_date: str | None = Query(default=None),
     preset: str | None = Query(default=None),
+    *,
+    user_id: Annotated[PydanticObjectId | None, Query(description="One row only (row button)")] = None,
     _: None = Depends(require_perm("users", "read")),
 ) -> StreamingResponse:
-    eid = PydanticObjectId(entity_id)
-    entity = await User.get(eid)
-    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else entity_id
-    entity_role = (entity.role.value if hasattr(entity.role, "value") else str(entity.role)) if entity else "BROKER"
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None:
+        raise NotFoundError("Entity not found")
+    entity, entity_role, clause = scope
+    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else "Direct Users"
 
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    users_data = await ads.get_all_entity_users(eid, entity_role, start_utc, end_utc)
+    users_data = await ads.get_all_entity_users(
+        entity.id if entity else None, entity_role, start_utc, end_utc,
+        pool_clause=clause, user_id=user_id,
+    )
     label = _period_label(from_date, to_date, preset)
-    data = ads.render_entity_users_excel(entity_name, users_data, label)
+    data = await asyncio.to_thread(ads.render_entity_users_excel, entity_name, users_data, label)
     filename = f"pnl_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.xlsx"
 
     return StreamingResponse(
         BytesIO(data),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment(filename)},
     )
 
 
@@ -502,23 +453,29 @@ async def export_entity_users_pdf(
     from_date: str | None = Query(default=None),
     to_date: str | None = Query(default=None),
     preset: str | None = Query(default=None),
+    *,
+    user_id: Annotated[PydanticObjectId | None, Query(description="One row only (row button)")] = None,
     _: None = Depends(require_perm("users", "read")),
 ) -> StreamingResponse:
-    eid = PydanticObjectId(entity_id)
-    entity = await User.get(eid)
-    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else entity_id
-    entity_role = (entity.role.value if hasattr(entity.role, "value") else str(entity.role)) if entity else "BROKER"
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None:
+        raise NotFoundError("Entity not found")
+    entity, entity_role, clause = scope
+    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else "Direct Users"
 
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    users_data = await ads.get_all_entity_users(eid, entity_role, start_utc, end_utc)
+    users_data = await ads.get_all_entity_users(
+        entity.id if entity else None, entity_role, start_utc, end_utc,
+        pool_clause=clause, user_id=user_id,
+    )
     label = _period_label(from_date, to_date, preset)
-    data = ads.render_entity_users_pdf(entity_name, users_data, label)
+    data = await asyncio.to_thread(ads.render_entity_users_pdf, entity_name, users_data, label)
     filename = f"pnl_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.pdf"
 
     return StreamingResponse(
         BytesIO(data),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment(filename)},
     )
 
 
@@ -532,20 +489,22 @@ async def export_broker_totals_excel(
     preset: str | None = Query(default=None),
     _: None = Depends(require_perm("users", "read")),
 ) -> StreamingResponse:
-    eid = PydanticObjectId(entity_id)
-    entity = await User.get(eid)
-    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else entity_id
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None or scope[0] is None:
+        raise NotFoundError("Entity not found")
+    entity, _role, clause = scope
+    entity_name = entity.full_name or entity.user_code or entity_id
 
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    totals = await ads.compute_broker_totals(eid, start_utc, end_utc)
+    totals = await ads.compute_broker_totals(entity.id, start_utc, end_utc, clause)
     label = _period_label(from_date, to_date, preset)
-    data = ads.render_broker_totals_excel(totals, entity_name, label)
+    data = await asyncio.to_thread(ads.render_broker_totals_excel, totals, entity_name, label)
     filename = f"broker_summary_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.xlsx"
 
     return StreamingResponse(
         BytesIO(data),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment(filename)},
     )
 
 
@@ -559,18 +518,20 @@ async def export_broker_totals_pdf(
     preset: str | None = Query(default=None),
     _: None = Depends(require_perm("users", "read")),
 ) -> StreamingResponse:
-    eid = PydanticObjectId(entity_id)
-    entity = await User.get(eid)
-    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else entity_id
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None or scope[0] is None:
+        raise NotFoundError("Entity not found")
+    entity, _role, clause = scope
+    entity_name = entity.full_name or entity.user_code or entity_id
 
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    totals = await ads.compute_broker_totals(eid, start_utc, end_utc)
+    totals = await ads.compute_broker_totals(entity.id, start_utc, end_utc, clause)
     label = _period_label(from_date, to_date, preset)
-    data = ads.render_broker_totals_pdf(totals, entity_name, label)
+    data = await asyncio.to_thread(ads.render_broker_totals_pdf, totals, entity_name, label)
     filename = f"broker_summary_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.pdf"
 
     return StreamingResponse(
         BytesIO(data),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment(filename)},
     )

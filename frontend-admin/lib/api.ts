@@ -706,7 +706,11 @@ export const SupportAPI = {
 };
 
 export const LedgerAdminAPI = {
-  list: (params?: any) => unwrap<{ items: any[]; meta: any }>(api.get("/admin/ledger", { params })),
+  // `summary` (with a user_id): the user's whole-ledger cash in / out.
+  list: (params?: any) =>
+    unwrap<{ items: any[]; meta: any; summary?: { deposits: string; withdrawals: string; net: string } }>(
+      api.get("/admin/ledger", { params }),
+    ),
   manualEntry: (body: any) => unwrap<any>(api.post("/admin/ledger/manual-entry", body)),
 };
 
@@ -723,8 +727,15 @@ export const MoneyAPI = {
 };
 
 export const ReportsAdminAPI = {
-  // Instruments by live % move + clients by realised P&L.
-  topMovers: (params: { days?: number; include_options?: boolean; limit?: number }) =>
+  // Instruments by live % move + clients by Billing Net P&L over whole IST
+  // days from_date..to_date (YYYY-MM-DD), else the last `days` days.
+  topMovers: (params: {
+    days?: number;
+    from_date?: string;
+    to_date?: string;
+    include_options?: boolean;
+    limit?: number;
+  }) =>
     unwrap<any>(api.get("/admin/reports/top-movers", { params })),
   // Clients trading the same symbol + side inside one time window.
   similarActivity: (params: {
@@ -743,21 +754,27 @@ export const ReportsAdminAPI = {
   financial: () => unwrap<any>(api.get("/admin/reports/financial")),
   trades: () => unwrap<any>(api.get("/admin/reports/trades")),
   compliance: () => unwrap<any>(api.get("/admin/reports/compliance")),
-  tradebookPdf: async (
-    userId: string,
-    fromDate?: string,
-    toDate?: string,
-  ): Promise<Blob> => {
-    const params: Record<string, string> = { user_id: userId };
-    if (fromDate) params.from_date = fromDate;
-    if (toDate) params.to_date = toDate;
-    const res = await api.get("/admin/reports/tradebook/pdf", {
-      params,
-      responseType: "blob",
-    });
-    return res.data;
-  },
+  // Billing statement: the client's trades FIFO-paired. Dates are plain
+  // YYYY-MM-DD, read by the backend as whole IST days.
+  tradebookPdf: (userId: string, fromDate?: string, toDate?: string): Promise<Blob> =>
+    userFile("/admin/reports/tradebook/pdf", userId, fromDate, toDate),
+  // The same statement as a workbook: the PDF's tables, cell for cell.
+  tradebookXlsx: (userId: string, fromDate?: string, toDate?: string): Promise<Blob> =>
+    userFile("/admin/reports/tradebook/xlsx", userId, fromDate, toDate),
+  // Trade Book: one row per fill, newest first.
+  tradeBookPdf: (userId: string, fromDate?: string, toDate?: string): Promise<Blob> =>
+    userFile("/admin/reports/trade-book/pdf", userId, fromDate, toDate),
+  tradeBookXlsx: (userId: string, fromDate?: string, toDate?: string): Promise<Blob> =>
+    userFile("/admin/reports/trade-book/xlsx", userId, fromDate, toDate),
 };
+
+async function userFile(path: string, userId: string, fromDate?: string, toDate?: string): Promise<Blob> {
+  const params: Record<string, string> = { user_id: userId };
+  if (fromDate) params.from_date = fromDate;
+  if (toDate) params.to_date = toDate;
+  const res = await api.get(path, { params, responseType: "blob" });
+  return res.data;
+}
 
 export type MetaApiSettings = {
   enabled: boolean;
@@ -1111,18 +1128,6 @@ export const SettingsAPI = {
   getPaymentGateway: () => unwrap<any>(api.get("/admin/settings/payment-gateway")),
   setPaymentGateway: (enabled: boolean) =>
     unwrap<any>(api.put("/admin/settings/payment-gateway", { setting_value: enabled })),
-  // Market-wise start & end time trading hours configuration
-  getMarketHours: () =>
-    unwrap<Record<string, {
-      name: string;
-      start_time: string;
-      end_time: string;
-      is_enabled: boolean;
-      days?: number[];
-      description?: string;
-    }>>(api.get("/admin/settings/market-hours")),
-  setMarketHours: (payload: Record<string, any>) =>
-    unwrap<any>(api.put("/admin/settings/market-hours", payload)),
   // Per-admin Terms & Conditions shown to this admin's users on their profile.
   getTerms: () => unwrap<{ terms: string }>(api.get("/admin/settings/terms")),
   setTerms: (terms: string) => unwrap<{ terms: string }>(api.put("/admin/settings/terms", { terms })),
@@ -1130,6 +1135,26 @@ export const SettingsAPI = {
   getCarryToggle: () => unwrap<{ enabled: boolean }>(api.get("/admin/settings/carry-forward-toggle")),
   setCarryToggle: (enabled: boolean) =>
     unwrap<{ enabled: boolean }>(api.put("/admin/settings/carry-forward-toggle", { enabled })),
+  // Market-wise trading hours (IST).
+  getMarketHours: () =>
+    unwrap<{
+      hours: Record<
+        string,
+        { enabled: boolean; start: string; end: string; days: string }
+      >;
+    }>(api.get("/admin/settings/market-hours")),
+  setMarketHours: (
+    hours: Record<
+      string,
+      { enabled: boolean; start: string; end: string; days: string }
+    >,
+  ) =>
+    unwrap<{
+      hours: Record<
+        string,
+        { enabled: boolean; start: string; end: string; days: string }
+      >;
+    }>(api.put("/admin/settings/market-hours", { hours })),
   // Weekly mark-to-market settlement engine (super-admin only).
   weeklySettlementRun: () =>
     unwrap<{ week_key?: string; batch_id?: string; total?: number; settled?: number; skipped?: number; failed?: number; skipped_reason?: string }>(
@@ -1366,7 +1391,11 @@ export const AccountsAPI = {
       api.get(`/admin/accounts/entity-users/${entityId}`, { params }),
     ),
 
-  exportEntityUsersExcel: async (entityId: string, params?: DateParams): Promise<Blob> => {
+  // user_id: one row only (row button), scoped to the entity server-side.
+  exportEntityUsersExcel: async (
+    entityId: string,
+    params?: DateParams & { user_id?: string },
+  ): Promise<Blob> => {
     const res = await api.get(`/admin/accounts/entity-users/${entityId}/export/excel`, {
       params,
       responseType: "blob",
@@ -1374,7 +1403,10 @@ export const AccountsAPI = {
     return res.data;
   },
 
-  exportEntityUsersPdf: async (entityId: string, params?: DateParams): Promise<Blob> => {
+  exportEntityUsersPdf: async (
+    entityId: string,
+    params?: DateParams & { user_id?: string },
+  ): Promise<Blob> => {
     const res = await api.get(`/admin/accounts/entity-users/${entityId}/export/pdf`, {
       params,
       responseType: "blob",

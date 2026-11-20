@@ -294,10 +294,19 @@ async def place_order(
     # An SL/TP leg on the profitable side of the market is "already hit": the
     # risk enforcer fires it instantly and it fills at EXACTLY the (untraded)
     # leg price → fake P&L booked to the wallet. Reject an impossible leg at
-    # write time. ref = client's live snapshot, else the live LTP; fails open
-    # when neither exists.
+    # write time. ref = a parked order's own limit / trigger (what it fills at:
+    # a BUY LIMIT 90 with SL 95 under an LTP of 100 passed the LTP check, then
+    # filled at 90 and booked the untraded 95), else the client's live
+    # snapshot, else the live LTP; fails open when none exists. A MARKET entry
+    # is checked again at its fill (matching_engine).
     if (bracket_sl is not None or bracket_tp is not None) and not is_squareoff:
-        _bref = expected_price
+        _bref = (
+            price
+            if order_type in (OrderType.LIMIT, OrderType.SL) and price > 0
+            else trigger
+            if order_type == OrderType.SL_M and trigger > 0
+            else expected_price
+        )
         if _bref is None:
             try:
                 from app.services import market_data_service as _mds

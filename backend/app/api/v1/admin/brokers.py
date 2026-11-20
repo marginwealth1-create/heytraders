@@ -44,6 +44,8 @@ from app.schemas.admin.management import ResetPasswordRequest
 from app.schemas.common import APIResponse
 from app.services import broker_management_service as svc
 from app.services import broker_settlement_service as stl
+from app.services import tradebook_builder
+from app.services.accounts_dashboard_service import _broker_client_ids, client_totals_for_users
 from app.utils.time_utils import IST
 
 router = APIRouter(prefix="/management", tags=["admin-brokers"])
@@ -396,11 +398,10 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
     open positions, recent trades). Mirrors the sub-admin report at
     /admin/management/sub-admins/{id}/report but scoped to broker's
     direct clients + a 'subtree' headline number."""
-    from datetime import timedelta as _td
     from decimal import Decimal as _D
 
     from app.models.position import Position, PositionStatus
-    from app.models.trade import Trade
+    from app.models.trade import LIVE_FILL, Trade
     from app.models.transaction import (
         TransactionType,
         WalletTransaction,
@@ -408,7 +409,6 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
     from app.models.user import UserStatus
     from app.models.wallet import Wallet
     from app.utils.decimal_utils import to_decimal
-    from app.utils.time_utils import now_utc
 
     b = await assert_broker_in_scope(actor, broker_id)
 
@@ -452,13 +452,11 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
         )
 
     user_q = {"user_id": {"$in": pool}}
+    live_q = {**user_q, **LIVE_FILL}  # fills a delete / reopen took back are not trades
 
-    now_utc_dt = now_utc()
-    ist_now = now_utc_dt.astimezone(IST)
-    today_ist_start = ist_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    week_ist_start = today_ist_start - _td(days=ist_now.weekday())
-    today_start = today_ist_start.astimezone(now_utc_dt.tzinfo)
-    week_start = week_ist_start.astimezone(now_utc_dt.tzinfo)
+    # The IST day and the IST week (Mon 00:00 → now): the P&L cards' windows.
+    windows = tradebook_builder.periods()
+    today_start, week_start = windows["today"][0], windows["week"][0]
 
     wallets = await Wallet.find(user_q).to_list()
     wallet_sum = {
@@ -475,37 +473,20 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
         wallet_sum["credit_limit"] += to_decimal(w.credit_limit)
         wallet_sum["total_deposits"] += to_decimal(w.total_deposits)
         wallet_sum["total_withdrawals"] += to_decimal(w.total_withdrawals)
-        wallet_sum["total_brokerage"] += to_decimal(w.total_brokerage)
+        # Fills book brokerage as CHARGES (→ total_charges); total_brokerage
+        # only moves on an admin manual BROKERAGE entry.
+        wallet_sum["total_brokerage"] += to_decimal(w.total_brokerage) + to_decimal(w.total_charges)
 
-    from app.services import market_data_service
-    fallback_usd_inr = to_decimal(market_data_service.get_usd_inr_rate())
-
-    def _is_usd(p) -> bool:
-        return market_data_service.position_is_usd(p)
-
-    def _realised_inr(p) -> _D:
-        raw = to_decimal(p.realized_pnl)
-        if not _is_usd(p):
-            return raw
-        rate = to_decimal(p.open_usd_inr_rate) if p.open_usd_inr_rate is not None else fallback_usd_inr
-        return raw * rate
-
-    async def _realised_in(window_start):
-        rows = await Position.find(
-            {
-                **user_q,
-                "status": PositionStatus.CLOSED.value,
-                "closed_at": {"$gte": window_start},
-            }
-        ).to_list()
-        return sum((_realised_inr(p) for p in rows), _D("0"))
-
-    today_realised = await _realised_in(today_start)
-    week_realised = await _realised_in(week_start)
-    all_closed = await Position.find(
-        {**user_q, "status": PositionStatus.CLOSED.value}
-    ).to_list()
-    all_time_realised = sum((_realised_inr(p) for p in all_closed), _D("0"))
+    # Today / This week / All-time realised: the Billing statement Gross PnL
+    # (tradebook_builder.booked; all-time = no window) of the broker's direct
+    # clients — demo and CLOSED clients out — every close in the window at
+    # what the wallet booked, settlements included, undone fills out; a
+    # partial close of a position still open counts.
+    pnl_pool = await _broker_client_ids(b.id)
+    today_realised, week_realised, all_time_realised = [
+        (await client_totals_for_users(pnl_pool, *w))["net_client_pnl"]
+        for w in (windows["today"], windows["week"], (None, None))
+    ]
 
     open_positions = await Position.find(
         {**user_q, "status": PositionStatus.OPEN.value}
@@ -515,14 +496,14 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
         open_unrealised += to_decimal(p.unrealized_pnl)  # stored in rupees
 
     today_trades_count = await Trade.find(
-        {**user_q, "executed_at": {"$gte": today_start}}
+        {**live_q, "executed_at": {"$gte": today_start}}
     ).count()
     week_trades_count = await Trade.find(
-        {**user_q, "executed_at": {"$gte": week_start}}
+        {**live_q, "executed_at": {"$gte": week_start}}
     ).count()
-    all_time_trades_count = await Trade.find(user_q).count()
+    all_time_trades_count = await Trade.find(live_q).count()
     recent_trades_rows = (
-        await Trade.find(user_q).sort("-executed_at").limit(10).to_list()
+        await Trade.find(live_q).sort("-executed_at").limit(10).to_list()
     )
 
     trade_user_ids = list({t.user_id for t in recent_trades_rows})

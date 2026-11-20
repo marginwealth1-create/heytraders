@@ -48,7 +48,7 @@ from app.models.position_settlement import (
 from app.models.platform_setting import PlatformSetting
 from app.models.transaction import TransactionType
 from app.services import market_data_service, position_service, wallet_service
-from app.utils.decimal_utils import quantize_money, to_decimal
+from app.utils.decimal_utils import quantize_basis, quantize_money, to_decimal
 from app.utils.time_utils import (
     is_saturday_settlement_window,
     iso_week_key,
@@ -109,7 +109,7 @@ async def _settle_one_position(
         ltp = await market_data_service.get_ltp(token)
     except Exception:  # noqa: BLE001
         ltp = Decimal(0)
-    ltp = quantize_money(to_decimal(ltp))
+    ltp = quantize_basis(to_decimal(ltp))  # a price: forex / metals quote past 2 dp
 
     side = (
         pos.opened_side.value

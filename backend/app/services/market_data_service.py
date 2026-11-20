@@ -25,7 +25,7 @@ from typing import Any
 
 from app.core.redis_client import cache_get, cache_set, publish, publish_batch
 from app.models.instrument import Instrument  # noqa: F401 — kept for downstream imports
-from app.utils.decimal_utils import quantize_money, to_decimal
+from app.utils.decimal_utils import quantize_basis, quantize_money, to_decimal
 
 logger = logging.getLogger(__name__)
 
@@ -757,7 +757,7 @@ async def _apply_spread_only(token: str, quote: dict[str, Any]) -> dict[str, Any
 # Operator-set rate (platform setting), NOT a live FX feed: a rate that moved
 # on its own would move every open client's P&L and margin with it.
 USD_INR_SETTING_KEY = "fx.usd_inr_rate"
-USD_INR_FALLBACK = 97.0  # used only before the setting row is seeded/read
+USD_INR_FALLBACK = 1.0  # used only before the setting row is seeded/read; 1 = wallet has no currency, $ P&L books 1:1
 
 # The risk enforcer marks every open position once a second, so this must not
 # hit Mongo per position. One process-local value, refreshed every 30 s by
@@ -1046,7 +1046,7 @@ async def get_ltp_batch_mdlive(tokens: list[str]) -> dict[str, Decimal | None]:
         try:
             ltp = float(json.loads(val).get("ltp") or 0)
             if ltp > 0:
-                out[t] = quantize_money(to_decimal(ltp))
+                out[t] = quantize_basis(to_decimal(ltp))
         except Exception:
             continue
     return out
@@ -1113,7 +1113,7 @@ async def get_ltp_quote_batch_mdlive(
             ltp = float(data.get("ltp") or 0)
             if ltp > 0:
                 quote_out[t] = data
-                ltp_out[t] = quantize_money(to_decimal(ltp))
+                ltp_out[t] = quantize_basis(to_decimal(ltp))
         except Exception:
             continue
     return ltp_out, quote_out
@@ -1270,8 +1270,10 @@ async def get_quote(token: str) -> dict[str, Any]:
 
 
 async def get_ltp(token: str) -> Decimal:
+    # A price, not a money amount: 2 dp booked a GBPUSD BUY seen at 1.31152
+    # at 1.3100 (20 Nov). Indian feeds quote 2 dp anyway.
     q = await get_quote(token)
-    return quantize_money(to_decimal(q["ltp"]))
+    return quantize_basis(to_decimal(q["ltp"]))
 
 
 async def get_display_ltp(token: str) -> Decimal:
@@ -1365,6 +1367,39 @@ def get_quote_instant(token: str) -> dict[str, Any]:
     except Exception:
         pass
     return {}
+
+
+# Unsubscribing a token (last watchlist removal, expiry cleanup) leaves its last
+# tick in memory, and the instant reads above hand it back once the token is
+# re-subscribed. 17 Nov a noon tick of GOLD26NOV135000CE (2305.50) marked a
+# short opened at 20:48 for 1786 and stopped it out, the live book at
+# 1787 / 1795.5. A quote whose last exchange packet came more than this before
+# a position on its token opened, or an order on it was placed, never saw the
+# market that position / order lives in. A quiet contract's quote that printed
+# after the position opened still stands.
+QUOTE_PREDATES_SEC = 60
+
+
+def drop_quotes_predating(
+    ltp_map: dict[str, Any], quote_map: dict[str, Any], since: dict[str, float]
+) -> list[str]:
+    """Blank (LTP None, quote {}) each token whose quote's exchange packet is
+    more than QUOTE_PREDATES_SEC older than `since[token]` (Unix seconds) —
+    the newest position opened / order placed on it — and return those
+    tokens: no price for it until a fresh packet arrives. A quote with no
+    exchange packet time (MetaAPI / Infoway, Kite non-FULL modes) is left
+    alone."""
+    stale = []
+    for tok, opened in since.items():
+        try:
+            ets = float((quote_map.get(tok) or {}).get("exchange_timestamp") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ets > 0 and opened - ets > QUOTE_PREDATES_SEC:
+            ltp_map[tok] = None
+            quote_map[tok] = {}
+            stale.append(tok)
+    return stale
 
 
 async def get_quotes(tokens: list[str]) -> list[dict[str, Any]]:
@@ -1491,8 +1526,14 @@ def hold_tokens(owner: str, tokens) -> None:
         subscribe(missing)
 
 
+def held_tokens() -> set[str]:
+    """Every token pinned by `hold_tokens` — what open positions and parked
+    orders are priced off. The Kite WS pool never evicts or trims these."""
+    return set().union(*_held.values())
+
+
 def unsubscribe(tokens: list[str]) -> None:
-    held = set().union(*_held.values())
+    held = held_tokens()
     for t in tokens:
         if t not in held:
             _subscribed.discard(t)

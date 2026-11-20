@@ -32,8 +32,11 @@ from app.services import (
     position_service,
     wallet_service,
 )
-from app.utils.decimal_utils import quantize_money, to_decimal
-from app.utils.time_utils import now_utc
+from app.services.order_validator import bracket_direction_error
+from app.services.zerodha_service import zerodha
+from app.utils.background import fire_and_forget
+from app.utils.decimal_utils import quantize_basis, quantize_money, to_decimal
+from app.utils.time_utils import epoch, now_utc
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +115,16 @@ def _trade_number() -> str:
     return f"T{now_utc().strftime('%y%m%d')}{secrets.token_hex(4).upper()}"
 
 
+def _ask_feed(token: str) -> None:
+    """Get a token nobody streams onto the live feed, so a retry finds a price.
+    `subscribe` seeds `_state` (and forwards to the leader from a non-leader);
+    a numeric Zerodha token also needs the Kite WS, which `subscribe` never
+    reaches on the leader itself."""
+    market_data_service.subscribe([str(token)])
+    if str(token).isdigit():
+        fire_and_forget(zerodha.subscribe_tokens_on_demand([int(token)]), label="engine_cold_subscribe")
+
+
 async def execute_market_order(
     order: Order,
     *,
@@ -160,6 +173,13 @@ async def execute_market_order(
     except Exception:
         logger.exception("matching_engine_quote_fetch_failed")
 
+    # No price at all for an entry (a token nobody streams yet): it is refused
+    # below (STALE_FEED) — its margin and SL / TP legs were checked against no
+    # price either. Ask the feed for the token so the retry has one.
+    no_price = not (ltp and ltp > 0) and bid is None and ask is None
+    if no_price and not order.is_squareoff and force_fill_price is None:
+        _ask_feed(order.instrument.token)
+
     # ── Crossed / locked-quote guard (anti-arbitrage) ───────────────────
     # A valid market ALWAYS has ask >= bid. A stale or bad tick — common in the
     # last seconds before an exchange close / auction — can invert them
@@ -199,22 +219,26 @@ async def execute_market_order(
     # price and PnL accrues from it. Still subject to the zero/negative
     # sanity guard below.
     SLIPPAGE_CAP = Decimal("0.01")  # 1 %
+    # A bracket SL/TP fire: the risk enforcer passes the user's OWN stored
+    # trigger as `expected_price`. A parked LIMIT / SL exit (a per-fill TP /
+    # SL) is fired by the poller at its own limit / trigger the same way.
+    _exact_close = str(getattr(order, "close_reason", "") or "") in ("SL_HIT", "TP_HIT")
+    _own_price = _exact_close or order.order_type != OrderType.MARKET
     if force_fill_price is not None and force_fill_price > 0:
         fill_price = force_fill_price
-    # A SERVER-initiated squareoff carrying an expected_price is a bracket
-    # SL/TP fire — the risk enforcer passes the user's OWN stored trigger as
-    # `expected_price`. That is not a browser value, so honour it EXACTLY: the
-    # user set the barrier at that price and expects the close booked THERE,
-    # not at whatever LTP the (1–2 s) risk tick drifted to. The 1% anti-tamper
-    # cap below is for ENTRY orders only — applying it to bracket fires is what
-    # filled "SL 260 set → closed at 255" when the tick lagged >1% past the
-    # trigger. (EOD-rollover / kill-switch / zero-price squareoffs pass
-    # expected_price == ltp, so this books at ltp for them — no change.)
-    elif order.is_squareoff and expected_price is not None and expected_price > 0:
+    # That price is the user's, not a browser value, so honour it EXACTLY:
+    # the user set the barrier there and expects the close booked THERE, not
+    # at whatever LTP the (1–2 s) risk tick drifted to. Applying the 1% cap to
+    # bracket fires is what filled "SL 260 set → closed at 255" when the tick
+    # lagged >1% past the trigger.
+    elif order.is_squareoff and _own_price and expected_price is not None and expected_price > 0:
         fill_price = expected_price
-    # Prefer the client-supplied expected price when it's within 1% of the
-    # current live side — that keeps ENTRY identical to what the order
-    # panel was showing, and the cap blocks any browser-side tampering.
+    # Prefer the expected price when it's within 1% of the current live side:
+    # the order panel's price for an entry (the cap blocks browser-side
+    # tampering), and for any other squareoff (stop-out, EOD rollover) the
+    # close-side mark the server decided on. A mark >1% off the live book is
+    # not a price: 17 Nov a stop-out booked 2305.50 off a tick left in memory
+    # since noon while the book stood at 1787 / 1795.5.
     elif expected_price is not None and expected_price > 0:
         reference = live_side or ltp
         if reference and reference > 0:
@@ -231,13 +255,20 @@ async def execute_market_order(
                         "deviation_pct": float(deviation) * 100,
                     },
                 )
+        elif order.is_squareoff:
+            fill_price = expected_price  # an exit must always go through
         else:
-            fill_price = expected_price
+            # No live price at all: the client's price would check against
+            # nothing. 17 Nov (V5HMK3) and 9 Nov (DPA374) both opened this way.
+            raise OrderRejectedError(
+                "Live price not available yet for this instrument. Please retry in a few seconds.",
+                code="STALE_FEED",
+            )
     elif live_side is not None:
         fill_price = live_side
     # else: keep ltp fallback
 
-    fill_price = quantize_money(fill_price)
+    fill_price = quantize_basis(fill_price)  # a price keeps the feed's decimals (GBPUSD 1.31152)
 
     # ── Sanity guard: NEVER fill at zero / negative ──────────────────
     # If the upstream feed is down (Zerodha WS dropped + REST timing
@@ -340,7 +371,6 @@ async def execute_market_order(
     # decision (2026-06-23): SL/TP must exit at EXACTLY the set price even
     # though the broker forgoes its half-spread markup on these closes. Stop-
     # out / manual / ordinary market fills are unaffected and still get spread.
-    _exact_close = str(getattr(order, "close_reason", "") or "") in ("SL_HIT", "TP_HIT")
     if (
         order.order_type == OrderType.MARKET
         and not (force_fill_price is not None and force_fill_price > 0)
@@ -366,7 +396,7 @@ async def execute_market_order(
             else:
                 # Floating with a wide-enough live book: keep the real side.
                 spread_side = ask if order.action == OrderAction.BUY else bid
-            spread_side = quantize_money(spread_side)
+            spread_side = quantize_basis(spread_side)
             # Safety cap: a mis-keyed spread (e.g. a fat-finger 50000) must
             # NEVER book a wildly off-market fill — that is exactly how the
             # GOLD ₹1.38 cr phantom profit happened. Beyond 20 % of LTP,
@@ -384,6 +414,20 @@ async def execute_market_order(
                         "side_price": str(spread_side),
                     },
                 )
+
+    # A MARKET entry's SL / TP legs, against the book it fills into. The guard
+    # at placement read the client's own price, which the 1% cap above may have
+    # overruled: a leg already through the close side (the bid for a long, the
+    # ask for a short — what the risk loop fires legs on) fires on the next
+    # tick and books its untraded price. Checked before anything is written,
+    # so a refusal leaves no trade behind.
+    if order.order_type == OrderType.MARKET and not order.is_squareoff:
+        close_side = (bid if order.action == OrderAction.BUY else ask) or raw_ltp
+        _berr = bracket_direction_error(
+            order.action, close_side, sl=order.bracket_stop_loss, tp=order.bracket_target
+        )
+        if _berr:
+            raise OrderRejectedError(_berr, code="BRACKET_WRONG_SIDE")
 
     # ── Existing-position lookup first (needed to classify the fill as
     #    opening vs closing — `charge_on` gates brokerage on one or both).
@@ -446,16 +490,30 @@ async def execute_market_order(
     pnl_inr_dec: Decimal | None = None
     raw_pnl_inr_dec: Decimal | None = None
     fill_fx: Decimal | None = None
+    lot_basis: Decimal | None = None  # the specific-lot basis actually applied
+    lot_tapped: Decimal | None = None  # the lot the client exited, applied or not
+    closed_qty: Decimal | None = None
     if is_closing and existing_pos is not None:
         cur_qty = to_decimal(existing_pos.quantity)
         avg = to_decimal(existing_pos.avg_price)
+        closed_qty = min(abs(cur_qty), qty_dec)
         # Specific-lot close: realize against the tapped fill's entry price
         # instead of the position average. Opt-in — set ONLY by the Active-tab
-        # per-fill Exit; every other close leaves _cbo None → avg-price as before.
+        # per-fill Exit; every other close leaves it None → avg-price as before.
+        # A per-fill exit parked before this position opened (a weekly
+        # settlement has re-opened it at the settle price since) names a lot of
+        # the previous cycle, already settled — it closes at the average.
         _cbo = getattr(order, "cost_basis_override", None)
-        if _cbo is not None:
-            avg = to_decimal(_cbo)
-        closed_qty = min(abs(cur_qty), qty_dec)
+        if (
+            _cbo is not None
+            and existing_pos.opened_at is not None
+            and order.created_at.replace(tzinfo=None) < existing_pos.opened_at.replace(tzinfo=None)
+        ):
+            _cbo = None
+        lot_tapped = to_decimal(_cbo) if _cbo is not None else None
+        lot_basis = position_service.basis_override(existing_pos, closed_qty, lot_tapped)
+        if lot_basis is not None:
+            avg = lot_basis
         sign = Decimal(1) if cur_qty > 0 else Decimal(-1)
         raw_realized = (ltp - avg) * closed_qty * sign
         # Converted only for a position opened under the USD→INR rate; one
@@ -464,7 +522,10 @@ async def execute_market_order(
             fill_fx = to_decimal(round(market_data_service.get_usd_inr_rate(), 4))
             raw_realized = raw_realized * fill_fx
         raw_pnl_inr_dec = quantize_money(raw_realized)
-        pnl_inr_dec = quantize_money(raw_realized - to_decimal(charges.brokerage))
+        # The wallet's PNL row less its charge, so stamp + charge is what was
+        # booked: rounding the net instead read a paisa over on a half-paisa
+        # (24,262.125 booked 24,262.12; − 7.67 stamped 24,254.46).
+        pnl_inr_dec = raw_pnl_inr_dec - to_decimal(charges.brokerage)
 
     snapshot = execution_snapshot(
         quote=quote,
@@ -496,10 +557,11 @@ async def execute_market_order(
             str(quantize_money(notional + (charges.total if order.action == OrderAction.SELL else -charges.total)))
         ),
         pnl_inr=Decimal128(str(pnl_inr_dec)) if pnl_inr_dec is not None else None,
-        # Carry the specific-lot basis onto the Trade so the FIFO closed-blotter
-        # pairs this close with the SAME lot the P&L booked against. None for
-        # every non-Active-tab-Exit close → unchanged FIFO display.
-        cost_basis_override=getattr(order, "cost_basis_override", None) if is_closing else None,
+        closed_quantity=float(closed_qty) if closed_qty is not None else None,
+        # The lot the client exited, even when the money booked at the average
+        # (lot_basis None): the Active tab and the FIFO walk take THAT lot off
+        # the book; the walk prices the row off pnl_inr either way.
+        cost_basis_override=_money(lot_tapped),
         expected_price=_money(to_decimal(expected_price) if expected_price else None),
         reference_ltp=_money(raw_ltp),
         bid_at_fill=_money(bid),
@@ -551,11 +613,7 @@ async def execute_market_order(
         stop_loss=sl_dec,
         target=tp_dec,
         is_demo=bool(getattr(order, "is_demo", False)),
-        cost_basis_override=(
-            to_decimal(getattr(order, "cost_basis_override", None))
-            if getattr(order, "cost_basis_override", None) is not None
-            else None
-        ),
+        cost_basis_override=lot_basis,
     )
 
     # ── P&L sharing WS notify on Position close ──────────────────────
@@ -592,8 +650,6 @@ async def execute_market_order(
                 )
 
             try:
-                from app.utils.background import fire_and_forget
-
                 fire_and_forget(_notify_pnl_sharing(), label="pnl_sharing_ws")
             except Exception:
                 # No background helper available / scheduling failed — fall
@@ -622,53 +678,74 @@ async def execute_market_order(
     if freed_margin > 0:
         await wallet_service.release_margin(order.user_id, freed_margin)
 
-    await wallet_service.adjust(
-        order.user_id,
-        -charges.total,
-        transaction_type=TransactionType.CHARGES,
-        narration=f"Charges for {order.action.value} {order.instrument.symbol} x{order.quantity}",
-        reference_type="ORDER",
-        reference_id=str(order.id),
-    )
-
-    # Realized P&L (signed, INR, already FX-converted for USD segments
-    # at line ~200) — credited on closing fills only. Uses `raw_pnl_inr_dec`
-    # (NOT the brokerage-folded `pnl_inr_dec`) because the closing-leg
-    # brokerage is already debited separately via the CHARGES line above —
-    # using `pnl_inr_dec` here would double-debit it. `pnl_inr_dec` is
-    # kept only for `Trade.pnl_inr` (History tab display).
-    if raw_pnl_inr_dec is not None and raw_pnl_inr_dec != 0:
-        pnl_narration = (
-            f"Realized {'profit' if raw_pnl_inr_dec > 0 else 'loss'} "
-            f"on {order.instrument.symbol} close"
+    async def _book_charges() -> None:
+        await wallet_service.adjust(
+            order.user_id,
+            -charges.total,
+            transaction_type=TransactionType.CHARGES,
+            narration=f"Charges for {order.action.value} {order.instrument.symbol} x{order.quantity}",
+            reference_type="ORDER",
+            reference_id=str(order.id),
+            draw_margin=True,
         )
-        try:
-            await wallet_service.adjust(
-                order.user_id,
-                raw_pnl_inr_dec,
-                transaction_type=TransactionType.PNL,
-                narration=pnl_narration,
-                reference_type="ORDER",
-                reference_id=str(order.id),
+
+    async def _book_pnl() -> None:
+        # Realized P&L (signed, INR, already FX-converted for USD segments
+        # at line ~200) — credited on closing fills only. Uses `raw_pnl_inr_dec`
+        # (NOT the brokerage-folded `pnl_inr_dec`) because the closing-leg
+        # brokerage is already debited separately via the CHARGES line above —
+        # using `pnl_inr_dec` here would double-debit it. `pnl_inr_dec` is
+        # kept only for `Trade.pnl_inr` (History tab display).
+        if raw_pnl_inr_dec is not None and raw_pnl_inr_dec != 0:
+            pnl_narration = (
+                f"Realized {'profit' if raw_pnl_inr_dec > 0 else 'loss'} "
+                f"on {order.instrument.symbol} close"
             )
-        except InsufficientFundsError:
-            # Forced-close path (risk_enforcer stop-out, auto-squareoff): the
-            # position MUST close even if the realized loss exceeds available
-            # balance + credit_limit. Fall back to `force_debit` which debits
-            # what we can and books the overflow to `settlement_outstanding`.
-            # Voluntary user closes (`is_squareoff` falsy) keep raising so the
-            # user can't silently rack up dues from their own actions.
-            if getattr(order, "is_squareoff", False) and raw_pnl_inr_dec < 0:
-                await wallet_service.force_debit(
+            try:
+                await wallet_service.adjust(
                     order.user_id,
-                    -raw_pnl_inr_dec,
+                    raw_pnl_inr_dec,
                     transaction_type=TransactionType.PNL,
-                    narration=f"{pnl_narration} (stop-out: shortfall booked to outstanding)",
+                    narration=pnl_narration,
                     reference_type="ORDER",
                     reference_id=str(order.id),
+                    draw_margin=True,
                 )
-            else:
-                raise
+            except InsufficientFundsError:
+                # Forced-close path (risk_enforcer stop-out, auto-squareoff): the
+                # position MUST close even if the realized loss exceeds available
+                # balance + credit_limit. Fall back to `force_debit` which debits
+                # what we can and books the overflow to `settlement_outstanding`.
+                # Voluntary user closes (`is_squareoff` falsy) keep raising so the
+                # user can't silently rack up dues from their own actions.
+                if getattr(order, "is_squareoff", False) and raw_pnl_inr_dec < 0:
+                    await wallet_service.force_debit(
+                        order.user_id,
+                        -raw_pnl_inr_dec,
+                        transaction_type=TransactionType.PNL,
+                        narration=f"{pnl_narration} (stop-out: shortfall booked to outstanding)",
+                        reference_type="ORDER",
+                        reference_id=str(order.id),
+                    )
+                else:
+                    raise
+
+    # A profit lands before its own close brokerage is debited, so a
+    # profitable close never books a due for the charge (3-Nov X4P3CE
+    # BAJAJFINSV: ₹906 "unpaid brokerage" a second before +₹3,150 profit).
+    if raw_pnl_inr_dec is not None and raw_pnl_inr_dec > 0:
+        await _book_pnl()
+        await _book_charges()
+    else:
+        await _book_charges()
+        await _book_pnl()
+
+    # A due this (or an earlier) non-stop-out fill booked only because cash was
+    # locked as margin elsewhere is netted as soon as cash is free again.
+    try:
+        await wallet_service.net_fill_dues(order.user_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("net_fill_dues_failed", extra={"user_id": str(order.user_id)})
 
     return trade
 
@@ -753,7 +830,7 @@ async def _exit_order_fill_open_qty(order) -> float:
         return -1.0
     from datetime import datetime as _d, timezone as _tz
 
-    from app.models.trade import Trade as _Trade
+    from app.models.trade import LIVE_FILL, Trade as _Trade
 
     src = await _Trade.get(tid)
     if src is None:
@@ -761,6 +838,7 @@ async def _exit_order_fill_open_qty(order) -> float:
     trades = await _Trade.find(
         _Trade.user_id == order.user_id,
         _Trade.instrument.token == order.instrument.token,
+        LIVE_FILL,
     ).to_list()
     is_long = str(getattr(src.action, "value", src.action)).upper() == "BUY"
 
@@ -877,6 +955,15 @@ async def trigger_pending_orders() -> int:
     ltp_map: dict[str, Decimal | None] = {
         tok: market_data_service.get_ltp_instant(tok) for tok in unique_tokens
     }
+    # A quote from before an order on its token was placed is no price for the
+    # token (a tick left in memory since an unsubscribe): it must not fire one.
+    placed: dict[str, float] = {}
+    for o in rows:
+        if o.created_at is not None:
+            placed[o.instrument.token] = max(placed.get(o.instrument.token, 0.0), epoch(o.created_at))
+    market_data_service.drop_quotes_predating(
+        ltp_map, {tok: market_data_service.get_quote_instant(tok) for tok in unique_tokens}, placed
+    )
 
     # Cross-worker dedup. The poller runs in every uvicorn worker — without
     # a distributed claim, two workers reading the same OPEN limit order in
@@ -906,6 +993,11 @@ async def trigger_pending_orders() -> int:
     def _order_segment_closed(seg: str | None) -> bool:
         if not seg:
             return False
+        from app.utils.time_utils import muhurat_open
+
+        _mu = muhurat_open(seg, _now_pend, 60)
+        if _mu is not None:
+            return not _mu
         if _is_weekend_pend and seg.upper().startswith(("NSE", "BSE", "MCX", "NFO", "BFO")):
             return True
         # Out of session = past close (15:30→midnight) OR before open

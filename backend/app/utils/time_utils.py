@@ -25,6 +25,11 @@ def to_ist(dt: datetime) -> datetime:
     return dt.astimezone(IST)
 
 
+def epoch(dt: datetime) -> float:
+    """Unix seconds of a stored instant (Mongo hands back naive UTC)."""
+    return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).timestamp()
+
+
 def to_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=IST)
@@ -48,9 +53,38 @@ def is_weekend(d: date) -> bool:
     return d.weekday() >= 5  # Sat=5, Sun=6
 
 
+# Special sessions (Diwali Muhurat): on these IST dates the Indian exchanges
+# (NSE/BSE/NFO/BFO/MCX) trade ONLY inside this window — weekend or not — and
+# are closed the rest of the day. Every market gate consults muhurat_open()
+# FIRST. Mirror: frontend-user/lib/marketHours.ts MUHURAT_SESSIONS.
+MUHURAT_SESSIONS: dict[date, tuple[time, time]] = {
+    date(2026, 11, 8): (time(14, 20), time(15, 40)),
+}
+_MUHURAT_SEGS = ("NSE", "BSE", "NFO", "BFO", "MCX")
+
+
+def muhurat_window(d: date) -> tuple[time, time] | None:
+    return MUHURAT_SESSIONS.get(d)
+
+
+def muhurat_open(seg: str | None, at: datetime | None = None, grace_sec: int = 0) -> bool | None:
+    """None → not a muhurat day or not an Indian segment (normal rules apply).
+    True / False → the muhurat window alone decides. `grace_sec` delays the
+    open (stale-first-tick protection for stop-out / pending fills)."""
+    now = to_ist(at or now_ist())
+    w = MUHURAT_SESSIONS.get(now.date())
+    if w is None or not (seg or "").upper().startswith(_MUHURAT_SEGS):
+        return None
+    start = (datetime.combine(now.date(), w[0]) + timedelta(seconds=grace_sec)).time()
+    return start <= now.time() <= w[1]
+
+
 def is_market_open(at: datetime | None = None) -> bool:
     """Naive check — does NOT consider holidays. The HolidayService overlays that."""
     now = to_ist(at or now_ist())
+    mu = muhurat_open("NSE", now)
+    if mu is not None:
+        return mu
     if is_weekend(now.date()):
         return False
     return market_open_time() <= now.time() <= market_close_time()
@@ -81,14 +115,18 @@ def add_business_days(d: date, n: int) -> date:
 # Drives the auto MIS→NRML / carry-forward rollover loop (the minute the
 # per-position Carry-Forward decision runs: ON → carry, OFF → square off).
 # Operator-set rollover times for this platform: NSE/BSE 16:00 IST, MCX
-# 23:40 IST. Forex (CDS) is 24/5 and crypto 24/7 — no daily rollover, so
-# those segments are excluded from the loop entirely.
+# 23:40 IST. Global forex (FOREX) rolls at 03:30 IST (FOREX_ROLLOVER); NSE
+# currency futures (CDS) and crypto (24/7) are not rolled.
 # NOTE: these ONLY affect the rollover + `is_after_close` (pending-order
 # firing / risk-EOD) — NEW order acceptance is gated by live-feed staleness,
 # so moving these does not open a stale-price trading window.
 NSE_BSE_CLOSE: time = time(15, 41)  # operator: market close + CF rollover
 MCX_CLOSE: time = time(23, 55)  # operator 2026-11-03; also order_validator, user positions exit
 # guard, zerodha _feed_expected_now, frontend-user lib/marketHours.ts — change together
+# Forex trades 24x5 and closes its day at 17:00 New York = 03:30 IST (operator
+# 2026-11-20): positions carry then, Tue-Sat mornings closing the Mon-Fri sessions.
+FOREX_ROLLOVER: time = time(3, 30)
+FOREX_SEGMENTS: frozenset[str] = frozenset({"FOREX"})
 # Session OPEN times — symmetric to the close times above. Needed so the
 # risk enforcer recognises the PRE-OPEN window (weekday midnight → open)
 # as "market closed". Without these, is_after_close() alone returns False

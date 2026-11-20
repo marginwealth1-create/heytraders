@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { AlertOctagon, CalendarDays, History, Info, Loader2, Pencil, RefreshCw, RotateCcw, Search, TrendingDown, TrendingUp, Trash2, X, X as XIcon } from "lucide-react";
+import { AlertOctagon, History, Info, Loader2, Pencil, RefreshCw, RotateCcw, Search, TrendingDown, TrendingUp, Trash2, X, X as XIcon } from "lucide-react";
 import { TradingAPI, UsersAPI } from "@/lib/api";
 import { useMarketStream } from "@/lib/useMarketStream";
 import { Button } from "@/components/ui/button";
@@ -27,6 +27,7 @@ import { NettingEntriesDialog } from "@/components/admin/NettingEntriesDialog";
 import { BidAskHistoryModal } from "@/components/admin/BidAskHistoryModal";
 import { StatusPill } from "@/components/common/StatusPill";
 import { cn, formatINR, pnlColor } from "@/lib/utils";
+import { isoToLocalInput, localInputToIso, parseDate } from "@/lib/time";
 import { OwnerBadge } from "@/components/admin/OwnerBadge";
 import { useAdminAuthStore } from "@/stores/authStore";
 import { SymbolAvatar } from "@/components/common/SymbolAvatar";
@@ -38,15 +39,6 @@ function fmtFeedPrice(value: string | number | null | undefined, _quote?: string
   const n = typeof value === "string" ? Number(value) : (value ?? 0);
   if (!Number.isFinite(n)) return "—";
   return n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
-}
-
-/** Backend serialises naive UTC; add `Z` if missing before parsing. */
-function parseDate(v: string | Date | null | undefined): Date | null {
-  if (!v) return null;
-  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
-  const hasTz = /[zZ]|[+-]\d{2}:?\d{2}$/.test(v);
-  const d = new Date(hasTz ? v : v + "Z");
-  return isNaN(d.getTime()) ? null : d;
 }
 
 // Color + label for the close_reason chip. Legal tags come from
@@ -577,9 +569,7 @@ function AdminPositionsInner() {
     setForm({
       avg_price: String(editing.avg_price ?? ""),
       quantity: String(editing.quantity ?? ""),
-      opened_at: editing.opened_at
-        ? new Date(parseDate(editing.opened_at) ?? editing.opened_at).toISOString().slice(0, 16)
-        : "",
+      opened_at: isoToLocalInput(editing.opened_at),
       stop_loss: editing.stop_loss != null ? String(editing.stop_loss) : "",
       target: editing.target != null ? String(editing.target) : "",
       realized_pnl: editing.realized_pnl != null ? String(editing.realized_pnl) : "",
@@ -602,8 +592,11 @@ function AdminPositionsInner() {
       if (form.quantity !== "" && Number(form.quantity) !== Number(editing.quantity))
         patch.quantity = Number(form.quantity);
       if (form.opened_at) {
-        const iso = new Date(form.opened_at).toISOString();
-        if (iso !== editing.opened_at) patch.opened_at = iso;
+        // Compare instants at the input's minute resolution: an untouched
+        // field equals its own prefill and is never re-sent.
+        const iso = localInputToIso(form.opened_at);
+        if (iso && iso !== localInputToIso(isoToLocalInput(editing.opened_at)))
+          patch.opened_at = iso;
       }
       if (form.stop_loss === "") patch.stop_loss = null;
       else if (Number(form.stop_loss) !== Number(editing.stop_loss ?? 0))
@@ -710,6 +703,15 @@ function AdminPositionsInner() {
     (s: number, r: any) => s + Number(r.unrealized_pnl || 0),
     0
   );
+  // Net = M2M − Close PNL. Close PNL can't follow the in-page search, so the
+  // M2M here is the whole scoped book's — still the WS-overlaid rows, so Net
+  // moves with every tick, not with the REST poll.
+  const bookM2M = (openRowsLive ?? openRows ?? []).reduce(
+    (s: number, r: any) => s + Number(r.unrealized_pnl || 0),
+    0
+  );
+  const closePnl = pnl?.week_total_of_both ?? 0;
+  const netPnl = bookM2M - closePnl;
 
   // Pagination. CLOSED is paginated SERVER-side (rows already represent the
   // current page), so we use them as-is. OPEN is the full set loaded in one
@@ -1309,48 +1311,38 @@ function AdminPositionsInner() {
           icon={totalPnl >= 0 ? TrendingUp : TrendingDown}
         />
         <PnlCard
-          // Headline = Total of Both (broker take = −Net Client PNL + Brokerage),
+          // Close PNL = Total of Both (broker take = −Client Gross PNL + Brokerage),
           // the SAME figure the Accounts dashboard shows for this Mon→Sun window.
-          // Breakdown (Net P&L + Brokerage) sits in the hint so the two pages
-          // reconcile line-for-line. Date range on top mirrors Accounts.
-          label={
-            pnl?.week_label
-              ? `This Week — Total of Both (${pnl.week_label})`
-              : "This Week — Total of Both"
-          }
+          // Breakdown (Client Gross P&L, Brokerage) sits in the hint so the two
+          // pages reconcile line-for-line. Date range on top mirrors Accounts.
+          label={pnl?.week_label ? `Close PNL (${pnl.week_label})` : "Close PNL"}
           // Broker take: PROFIT (positive) → red, LOSS (negative) → green.
           value={pnl?.week_total_of_both ?? 0}
           invertColor
           hint={
             <>
-              Net P&amp;L{" "}
+              Client Gross P&amp;L{" "}
               <span className={pnlColor(pnl?.week_net_client_pnl ?? 0)}>
                 {formatINR(pnl?.week_net_client_pnl ?? 0)}
               </span>{" "}
-              + Brokerage {formatINR(pnl?.week_brokerage ?? 0)}
+              · Brokerage {formatINR(pnl?.week_brokerage ?? 0)}
             </>
           }
           icon={(pnl?.week_total_of_both ?? 0) >= 0 ? TrendingUp : TrendingDown}
           loading={pnlLoading}
         />
         <PnlCard
-          label={
-            pnl?.last_week_label
-              ? `Last Week — Total of Both (${pnl.last_week_label})`
-              : "Last Week — Total of Both"
-          }
-          value={pnl?.last_week_total_of_both ?? 0}
-          invertColor
+          // Client view, like Open PNL: Close PNL is the broker's take, so
+          // Net = M2M − Close PNL is the client's floating + booked week.
+          label="Net = M2M − Close PNL"
+          value={netPnl}
           hint={
             <>
-              Net P&amp;L{" "}
-              <span className={pnlColor(pnl?.last_week_net_client_pnl ?? 0)}>
-                {formatINR(pnl?.last_week_net_client_pnl ?? 0)}
-              </span>{" "}
-              + Brokerage {formatINR(pnl?.last_week_brokerage ?? 0)}
+              M2M <span className={pnlColor(bookM2M)}>{formatINR(bookM2M)}</span> − Close PNL{" "}
+              {formatINR(closePnl)}
             </>
           }
-          icon={CalendarDays}
+          icon={netPnl >= 0 ? TrendingUp : TrendingDown}
           loading={pnlLoading}
         />
       </section>
@@ -1824,7 +1816,7 @@ function AdminPositionsInner() {
                 />
               </div>
               <div className="space-y-1.5 sm:col-span-2">
-                <Label>Opened at</Label>
+                <Label>Opened at (IST)</Label>
                 <Input
                   type="datetime-local"
                   value={form.opened_at}

@@ -2,13 +2,14 @@
 
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { toast } from "sonner";
 import {
   BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
 import {
   ArrowDownRight, ArrowUpRight, BookOpen, Briefcase,
-  ChevronRight, DollarSign, Download,
+  ChevronDown, ChevronRight, DollarSign, Download,
   FileSpreadsheet, FileText, Loader2, PieChartIcon,
   RefreshCw, Search, TrendingUp, Trophy, UserPlus, Users, X,
 } from "lucide-react";
@@ -22,10 +23,17 @@ import {
   type EntityUsersResponse,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/common/PageHeader";
 import { useAdminAuthStore } from "@/stores/authStore";
-import { cn } from "@/lib/utils";
+import { istWeekSoFar } from "@/lib/time";
+import { cn, saveBlob } from "@/lib/utils";
 
 const CHART_GREEN = "#10b981";
 const CHART_RED = "#ef4444";
@@ -48,13 +56,13 @@ const BROKER_TABS: TabDef[] = [
   { value: "sub_brokers", label: "Sub-Brokers", icon: <UserPlus className="size-3.5" /> },
 ];
 
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
+/** Row download: save the blob, or toast why it failed (no silent no-op). */
+async function saveOrToast(fetchBlob: () => Promise<Blob>, filename: string) {
+  try {
+    saveBlob(await fetchBlob(), filename);
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : "Download failed");
+  }
 }
 
 function downloadCSV(entities: AccountEntity[], grandTotal?: AccountEntity) {
@@ -62,9 +70,9 @@ function downloadCSV(entities: AccountEntity[], grandTotal?: AccountEntity) {
   if (!rows.length) return;
   const headers = [
     "Name", "Role", "Users", "Deposits", "Withdrawals", "Net Deposit",
-    "Realized P&L", "Unrealized P&L", "Net P&L", "Brokerage",
+    "Realized P&L", "Unrealized P&L", "Realized + Unrealized P&L", "Brokerage",
     "Total Trades", "Profit Trades", "Loss Trades", "Win Rate %",
-    "Volume", "Balance", "Equity", "Open Positions",
+    "Volume", "Balance", "Equity", "Open Positions", "Settlement",
   ];
   const csvRows = [
     headers.join(","),
@@ -74,11 +82,12 @@ function downloadCSV(entities: AccountEntity[], grandTotal?: AccountEntity) {
         e.net_deposit, e.realized_pnl, e.unrealized_pnl, e.net_pnl,
         e.brokerage, e.total_trades, e.profit_trades, e.loss_trades,
         e.win_rate, e.volume, e.balance, e.equity, e.open_positions,
+        e.settlement_outstanding,
       ].join(",")
     ),
   ];
   const blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
-  downloadBlob(blob, `accounts_${new Date().toISOString().slice(0, 10)}.csv`);
+  saveBlob(blob, `accounts_${new Date().toISOString().slice(0, 10)}.csv`);
 }
 
 /* ═══════════════════════════════════════════════════════════════════ */
@@ -93,16 +102,13 @@ export default function AccountsDashboardPage() {
     : ADMIN_TABS;
 
   const [scope, setScope] = useState("all_users");
-  // Default range = current ISO week (Mon → Sun) so the page lands
+  // Default range = the current IST week (Mon → Sun) so the page lands
   // with real filtered data instead of a lifetime aggregate.  Admin
-  // can override either bound for ad-hoc periods.
-  const _today = new Date();
-  const _dow = _today.getDay(); // 0 = Sun
-  const _monOffset = _dow === 0 ? -6 : 1 - _dow;
-  const _monday = new Date(_today);
-  _monday.setDate(_today.getDate() + _monOffset);
-  const _sunday = new Date(_monday);
-  _sunday.setDate(_monday.getDate() + 6);
+  // can override either bound for ad-hoc periods. Dates are held as UTC
+  // midnights of IST days: a browser-local Monday was Sunday's week before
+  // 05:30 IST.
+  const _monday = new Date(`${istWeekSoFar()[0]}T00:00:00Z`);
+  const _sunday = new Date(_monday.getTime() + 6 * 86_400_000);
   const _iso = (d: Date) => d.toISOString().slice(0, 10);
   const [fromDate, setFromDate] = useState(_iso(_monday));
   const [toDate, setToDate] = useState(_iso(_sunday));
@@ -115,7 +121,7 @@ export default function AccountsDashboardPage() {
   // (Monday → Sunday) to match the default fromDate / toDate above.
   const weekPresets = useMemo(() => {
     const fmtIst = (d: Date) =>
-      d.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+      d.toLocaleDateString("en-IN", { day: "numeric", month: "short", timeZone: "UTC" });
     const out: { key: string; label: string; from: string; to: string }[] = [];
     // Current week = the one already populated on first render
     const curMon = new Date(_monday);
@@ -127,8 +133,8 @@ export default function AccountsDashboardPage() {
       to: _iso(curSun),
     });
     // Last week
-    const lastMon = new Date(curMon); lastMon.setDate(curMon.getDate() - 7);
-    const lastSun = new Date(curSun); lastSun.setDate(curSun.getDate() - 7);
+    const lastMon = new Date(curMon); lastMon.setUTCDate(curMon.getUTCDate() - 7);
+    const lastSun = new Date(curSun); lastSun.setUTCDate(curSun.getUTCDate() - 7);
     out.push({
       key: "last",
       label: `Last week (${fmtIst(lastMon)} – ${fmtIst(lastSun)})`,
@@ -137,8 +143,8 @@ export default function AccountsDashboardPage() {
     });
     // 4 prior weeks covering the rest of the last ~month
     for (let i = 2; i <= 5; i++) {
-      const m = new Date(curMon); m.setDate(curMon.getDate() - 7 * i);
-      const s = new Date(curSun); s.setDate(curSun.getDate() - 7 * i);
+      const m = new Date(curMon); m.setUTCDate(curMon.getUTCDate() - 7 * i);
+      const s = new Date(curSun); s.setUTCDate(curSun.getUTCDate() - 7 * i);
       out.push({
         key: `w-${i}`,
         label: `${fmtIst(m)} – ${fmtIst(s)}`,
@@ -456,10 +462,10 @@ function BrokerEntityCard({
                     size="sm"
                     onClick={async (ev) => {
                       ev.stopPropagation();
-                      try {
-                        const blob = await AccountsAPI.exportBrokerTotalsExcel(e.id, dateParams);
-                        downloadBlob(blob, `${e.user_code || e.name}_summary.xlsx`);
-                      } catch {}
+                      await saveOrToast(
+                        () => AccountsAPI.exportBrokerTotalsExcel(e.id, dateParams),
+                        `${e.user_code || e.name}_summary.xlsx`,
+                      );
                     }}
                   >
                     <Download className="size-3 mr-1" /> Export Excel
@@ -469,10 +475,10 @@ function BrokerEntityCard({
                     size="sm"
                     onClick={async (ev) => {
                       ev.stopPropagation();
-                      try {
-                        const blob = await AccountsAPI.exportBrokerTotalsPdf(e.id, dateParams);
-                        downloadBlob(blob, `${e.user_code || e.name}_summary.pdf`);
-                      } catch {}
+                      await saveOrToast(
+                        () => AccountsAPI.exportBrokerTotalsPdf(e.id, dateParams),
+                        `${e.user_code || e.name}_summary.pdf`,
+                      );
                     }}
                   >
                     <FileText className="size-3 mr-1" /> Export PDF
@@ -603,7 +609,7 @@ function BrokerTotalsCard({
             {fmt(data.actual_pnl)}
           </div>
           <div className="mt-0.5 text-[10px] text-muted-foreground">
-            = (−Net Client PNL) + Net Client BKG
+            = (−Client Gross PNL) + Client Brokerage
           </div>
           <div className="mt-1 font-mono text-[10px] tabular-nums text-muted-foreground/80">
             {/* Use the broker-view PNL (= −net_client_pnl) so the math on this
@@ -629,13 +635,24 @@ function BrokerTotalsCard({
 
       {/* ── Composition tiles ────────────────────────────────── */}
       <div className="relative mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <KpiTile label="Net Client PNL" value={fmt(data.net_client_pnl)} valueClass={color(data.net_client_pnl)} />
-        <KpiTile label="Net Client BKG" value={fmt(data.net_client_bkg)} valueClass={color(data.net_client_bkg)} />
+        {/* One vocabulary with the Billing statement (§7.3): Gross before
+            brokerage, Net = Gross − Brokerage. */}
+        <KpiTile label="Client Gross PNL" value={fmt(data.net_client_pnl)} valueClass={color(data.net_client_pnl)} />
+        <KpiTile label="Client Brokerage" value={fmt(data.net_client_bkg)} valueClass={color(data.net_client_bkg)} />
         {/* Broker take, INVERTED tint (operator): PROFIT (positive) → red,
             LOSS (negative) → green. Negate before `color` to flip it. Matches
             the Positions page Total-of-Both cards. */}
-        <KpiTile label="Total of Both" value={fmt(data.total_of_both)} valueClass={color(String(-Number(data.total_of_both)))} hint="PNL + BKG" />
-        {/* Settlement (outstanding) tile hidden — not shown to admins (operator). */}
+        <KpiTile label="Total of Both" value={fmt(data.total_of_both)} valueClass={color(String(-Number(data.total_of_both)))} hint="−Client Gross PNL + Client Brokerage" />
+        {/* Settlement is an outflow the broker settles to clients — a LOSS to
+            the broker. Operator request: show it in red when it's a loss
+            (positive settlement = broker pays out). Inverted tint like
+            "Total of Both": positive → red, negative (recovery) → green. */}
+        <KpiTile
+          label="Settlement"
+          value={fmt(data.settlement)}
+          valueClass={color(String(-Number(data.settlement)))}
+          hint="Booked − Recovered in window (lifetime snapshot if no filter). Red = loss to broker."
+        />
       </div>
 
       {/* ── Sharing + cash flow + user count ──────────────────
@@ -707,28 +724,6 @@ function KpiTile({
   );
 }
 
-function TotalsRow({
-  label, value, fmt, color, info,
-}: {
-  label: string;
-  value: string;
-  fmt: (v: string) => string;
-  color: (v: string) => string;
-  info?: boolean;
-}) {
-  return (
-    <div className="flex justify-between items-center px-3 py-1">
-      <span className="text-xs font-mono font-semibold text-muted-foreground tracking-wide">
-        {label} {info && <span className="text-muted-foreground/50 cursor-help" title="Net Client PNL (inverted) + Net Client BKG">ⓘ</span>}
-      </span>
-      <span className={`font-semibold tabular-nums ${color(value)}`}>
-        {fmt(value)}
-      </span>
-    </div>
-  );
-}
-
-
 /* ═══════════════════════════════════════════════════════════════════ */
 /* User PNL Table (lazy loaded inside broker card)                     */
 /* ═══════════════════════════════════════════════════════════════════ */
@@ -763,18 +758,10 @@ function UserPnlTable({
     }),
   });
 
-  const handleDownloadExcel = async () => {
-    try {
-      const blob = await AccountsAPI.exportEntityUsersExcel(entityId, dateParams);
-      downloadBlob(blob, `pnl_all_${entityName}.xlsx`);
-    } catch {}
-  };
-  const handleDownloadPdf = async () => {
-    try {
-      const blob = await AccountsAPI.exportEntityUsersPdf(entityId, dateParams);
-      downloadBlob(blob, `pnl_all_${entityName}.pdf`);
-    } catch {}
-  };
+  const handleDownloadExcel = () =>
+    saveOrToast(() => AccountsAPI.exportEntityUsersExcel(entityId, dateParams), `pnl_all_${entityName}.xlsx`);
+  const handleDownloadPdf = () =>
+    saveOrToast(() => AccountsAPI.exportEntityUsersPdf(entityId, dateParams), `pnl_all_${entityName}.pdf`);
 
   const items = data?.items ?? [];
   const meta = data?.meta;
@@ -821,11 +808,11 @@ function UserPnlTable({
                   <th className="px-3 py-2.5 text-left text-xs font-semibold text-muted-foreground">User ID</th>
                   <th className="px-3 py-2.5 text-left text-xs font-semibold text-muted-foreground">Username</th>
                   <th className="px-3 py-2.5 text-left text-xs font-semibold text-muted-foreground">Owner</th>
-                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Total PNL</th>
-                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Net PNL <InfoTip text="Sum of realized P&L from closed positions" /></th>
-                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Net BKG <InfoTip text="Total brokerage charged" /></th>
+                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Net PNL <InfoTip text="Gross PNL − Brokerage: the Billing statement's Net PnL for the window" /></th>
+                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Gross PNL <InfoTip text="Before brokerage: each close in the window at what the wallet booked, weekly / expiry settlements at their settle price (the statement's Gross PnL)" /></th>
+                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Brokerage <InfoTip text="Every charge on a fill executed in the window (the statement's Brokerage)" /></th>
                   <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Settlement <InfoTip text="Net settlement booked − recovered in the selected period. Without a date filter, falls back to the user's current outstanding wallet balance (lifetime)." /></th>
-                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Total − Settle <InfoTip text="Total PNL minus Settlement — the row's real take after settlement is netted off" /></th>
+                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Net − Settle <InfoTip text="Net PNL minus Settlement — the row's real take after settlement is netted off" /></th>
                   <th className="px-3 py-2.5 text-center text-xs font-semibold text-muted-foreground">Actions</th>
                 </tr>
               </thead>
@@ -987,6 +974,67 @@ function PaginationBar({
 }
 
 
+/** A row's Excel / PDF button: which document to download — the account
+ *  summary, the Billing statement or the Trade Book — for the dashboard's
+ *  selected dates. */
+function DownloadMenu({
+  format,
+  user: u,
+  entityId,
+  dateParams,
+  className,
+}: {
+  format: "xlsx" | "pdf";
+  user: EntityUserRow;
+  entityId: string;
+  dateParams: { from_date?: string; to_date?: string };
+  className: string;
+}) {
+  const { from_date, to_date } = dateParams;
+  const Icon = format === "xlsx" ? FileSpreadsheet : FileText;
+  const docs: Array<[label: string, prefix: string, fetchBlob: () => Promise<Blob>]> =
+    format === "xlsx"
+      ? [
+          [
+            "Account summary",
+            "pnl",
+            () => AccountsAPI.exportEntityUsersExcel(entityId, { ...dateParams, user_id: u.user_id }),
+          ],
+          ["Billing", "billing", () => ReportsAdminAPI.tradebookXlsx(u.user_id, from_date, to_date)],
+          ["Trade Book", "tradebook", () => ReportsAdminAPI.tradeBookXlsx(u.user_id, from_date, to_date)],
+        ]
+      : [
+          [
+            "Account summary",
+            "pnl",
+            () => AccountsAPI.exportEntityUsersPdf(entityId, { ...dateParams, user_id: u.user_id }),
+          ],
+          ["Billing", "billing", () => ReportsAdminAPI.tradebookPdf(u.user_id, from_date, to_date)],
+          ["Trade Book", "tradebook", () => ReportsAdminAPI.tradeBookPdf(u.user_id, from_date, to_date)],
+        ];
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="sm" className={className}>
+          <Icon className="size-3 mr-0.5" /> {format === "xlsx" ? "Excel" : "PDF"}
+          <ChevronDown className="size-3 ml-0.5 opacity-60" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-[10rem]">
+        {docs.map(([label, prefix, fetchBlob]) => (
+          <DropdownMenuItem
+            key={label}
+            className="text-xs"
+            onSelect={() => saveOrToast(fetchBlob, `${prefix}_${u.user_code}.${format}`)}
+          >
+            {label === "Account summary" ? <Icon /> : <BookOpen />} {label}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 function UserPnlRow({
   user: u,
   entityId,
@@ -1036,42 +1084,47 @@ function UserPnlRow({
           >
             <FileText className="size-3 mr-0.5" /> Settle
           </Button>
+          {/* Excel / PDF: account summary, Billing or Trade Book. */}
+          <DownloadMenu
+            format="xlsx"
+            user={u}
+            entityId={entityId}
+            dateParams={dateParams}
+            className="h-7 text-[10px] px-2"
+          />
+          <DownloadMenu
+            format="pdf"
+            user={u}
+            entityId={entityId}
+            dateParams={dateParams}
+            className="h-7 text-[10px] px-2"
+          />
+          {/* Billing: the FIFO statement (incl. weekly settlement rows). */}
           <Button
             variant="outline"
             size="sm"
             className="h-7 text-[10px] px-2"
+            title="Billing statement (FIFO, incl. weekly settlement)"
             onClick={async () => {
-              const blob = await AccountsAPI.exportEntityUsersExcel(entityId, dateParams);
-              downloadBlob(blob, `pnl_${u.user_code}.xlsx`);
-            }}
-          >
-            <FileSpreadsheet className="size-3 mr-0.5" /> Excel
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 text-[10px] px-2"
-            onClick={async () => {
-              const blob = await AccountsAPI.exportEntityUsersPdf(entityId, dateParams);
-              downloadBlob(blob, `pnl_${u.user_code}.pdf`);
-            }}
-          >
-            <FileText className="size-3 mr-0.5" /> PDF
-          </Button>
-          {/* Full FIFO trade book — trade-by-trade incl. WEEKLY SETTLEMENT rows
-              (operator: weekly settlement should show in the trade book too). */}
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 text-[10px] px-2"
-            title="Full trade book (incl. weekly settlement)"
-            onClick={async () => {
-              const blob = await ReportsAdminAPI.tradebookPdf(
-                u.user_id,
-                dateParams.from_date,
-                dateParams.to_date,
+              await saveOrToast(
+                () => ReportsAdminAPI.tradebookPdf(u.user_id, dateParams.from_date, dateParams.to_date),
+                `billing_${u.user_code}.pdf`,
               );
-              downloadBlob(blob, `tradebook_${u.user_code}.pdf`);
+            }}
+          >
+            <BookOpen className="size-3 mr-0.5" /> Billing
+          </Button>
+          {/* Trade Book: one row per fill, as executed. */}
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-[10px] px-2"
+            title="Trade book (one row per fill)"
+            onClick={async () => {
+              await saveOrToast(
+                () => ReportsAdminAPI.tradeBookPdf(u.user_id, dateParams.from_date, dateParams.to_date),
+                `tradebook_${u.user_code}.pdf`,
+              );
             }}
           >
             <BookOpen className="size-3 mr-0.5" /> Trade Book
@@ -1116,17 +1169,17 @@ function UserPnlCard({
         </div>
         <div className={`shrink-0 text-right text-sm font-semibold tabular-nums ${pnlColor(u.total_pnl)}`}>
           ₹{fmtMoney(u.total_pnl)}
-          <div className="text-[9px] font-normal uppercase tracking-wider text-muted-foreground">Total PNL</div>
+          <div className="text-[9px] font-normal uppercase tracking-wider text-muted-foreground">Net PNL</div>
         </div>
       </div>
 
       <div className="mt-3 grid grid-cols-2 gap-2 rounded-md bg-muted/20 p-2 text-[11px]">
         <div>
-          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Net PNL</div>
+          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Gross PNL</div>
           <div className={`mt-0.5 font-semibold tabular-nums ${pnlColor(u.net_pnl)}`}>₹{fmtMoney(u.net_pnl)}</div>
         </div>
         <div>
-          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Net BKG</div>
+          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Brokerage</div>
           <div className="mt-0.5 font-semibold tabular-nums">₹{fmtMoney(u.net_bkg)}</div>
         </div>
         <div>
@@ -1134,7 +1187,7 @@ function UserPnlCard({
           <div className="mt-0.5 font-semibold tabular-nums">₹{fmtMoney(u.settlement)}</div>
         </div>
         <div>
-          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Total − Settle</div>
+          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Net − Settle</div>
           <div className={`mt-0.5 font-semibold tabular-nums ${pnlColor(u.pnl_minus_settlement ?? "0")}`}>
             ₹{fmtMoney(u.pnl_minus_settlement ?? "0")}
           </div>
@@ -1145,40 +1198,45 @@ function UserPnlCard({
         <Button variant="outline" size="sm" className="h-8 text-[10px]" disabled>
           <FileText className="size-3 mr-1" /> Settle
         </Button>
+        {/* Excel / PDF: account summary, Billing or Trade Book. */}
+        <DownloadMenu
+          format="xlsx"
+          user={u}
+          entityId={entityId}
+          dateParams={dateParams}
+          className="h-8 text-[10px]"
+        />
+        <DownloadMenu
+          format="pdf"
+          user={u}
+          entityId={entityId}
+          dateParams={dateParams}
+          className="h-8 text-[10px]"
+        />
+        {/* Billing: the FIFO statement (incl. weekly settlement rows). */}
         <Button
           variant="outline"
           size="sm"
           className="h-8 text-[10px]"
           onClick={async () => {
-            const blob = await AccountsAPI.exportEntityUsersExcel(entityId, dateParams);
-            downloadBlob(blob, `pnl_${u.user_code}.xlsx`);
-          }}
-        >
-          <FileSpreadsheet className="size-3 mr-1" /> Excel
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-8 text-[10px]"
-          onClick={async () => {
-            const blob = await AccountsAPI.exportEntityUsersPdf(entityId, dateParams);
-            downloadBlob(blob, `pnl_${u.user_code}.pdf`);
-          }}
-        >
-          <FileText className="size-3 mr-1" /> PDF
-        </Button>
-        {/* Full FIFO trade book — incl. weekly settlement rows. */}
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-8 text-[10px]"
-          onClick={async () => {
-            const blob = await ReportsAdminAPI.tradebookPdf(
-              u.user_id,
-              dateParams.from_date,
-              dateParams.to_date,
+            await saveOrToast(
+              () => ReportsAdminAPI.tradebookPdf(u.user_id, dateParams.from_date, dateParams.to_date),
+              `billing_${u.user_code}.pdf`,
             );
-            downloadBlob(blob, `tradebook_${u.user_code}.pdf`);
+          }}
+        >
+          <BookOpen className="size-3 mr-1" /> Billing
+        </Button>
+        {/* Trade Book: one row per fill, as executed. */}
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 text-[10px]"
+          onClick={async () => {
+            await saveOrToast(
+              () => ReportsAdminAPI.tradeBookPdf(u.user_id, dateParams.from_date, dateParams.to_date),
+              `tradebook_${u.user_code}.pdf`,
+            );
           }}
         >
           <BookOpen className="size-3 mr-1" /> Trade Book

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 from beanie import PydanticObjectId
@@ -12,10 +14,10 @@ from app.core.dependencies import CurrentUser
 from app.models._base import OrderAction, OrderType, ProductType
 from app.models.audit_log import AuditAction
 from app.models.position import Position, PositionStatus
-from app.models.trade import Trade
+from app.models.trade import LIVE_FILL, Trade
 from app.schemas.common import APIResponse
 from app.schemas.trading import HoldingOut, PositionOut
-from app.services import audit_service, market_data_service, netting_service, order_service, order_validator, position_service
+from app.services import audit_service, market_data_service, netting_service, order_service, order_validator, position_service, tradebook_builder
 from app.utils.decimal_utils import to_decimal
 
 router = APIRouter(prefix="/positions", tags=["user-positions"])
@@ -79,42 +81,20 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "0.0.0.0"
 
 
-def _is_segment_market_open_now(segment_type: str | None) -> bool:
+async def _is_segment_market_open_now(segment_type: str | None) -> bool:
     """Server-side mirror of the apk's `isInstrumentMarketOpen`. Reject
     user-initiated squareoff calls when the segment's market is closed
-    — bypasses are only available via admin force-close. Crypto + Forex
-    always return True (24/7 / 24×5 segments).
+    — bypasses are only available via admin force-close. Uses the
+    admin-configured market trading hours (IST).
     """
-    from datetime import datetime as _dt
-    from app.utils.time_utils import now_ist
+    from app.services.market_hours_service import (
+        get_market_hours,
+        is_market_open_by_config,
+    )
 
-    seg = (segment_type or "").upper()
-    if "CRYPTO" in seg:
-        return True
-    if (
-        seg == "FOREX"
-        or seg == "STOCKS"
-        or seg == "INDICES"
-        or seg == "COMMODITIES"
-        or "FOREX" in seg
-        or seg.startswith("CDS")
-    ):
-        now: _dt = now_ist()
-        wd = now.weekday()  # Mon=0 … Sun=6
-        if wd == 5:  # Saturday
-            return False
-        if wd == 6 and now.hour < 21:  # Sunday before 21:00 IST
-            return False
-        return True
-    now2 = now_ist()
-    wd2 = now2.weekday()
-    if wd2 >= 5:  # Weekend
-        return False
-    mins = now2.hour * 60 + now2.minute
-    if seg.startswith("MCX"):
-        return 9 * 60 <= mins <= 23 * 60 + 55  # = time_utils.MCX_CLOSE
-    # NSE / BSE equity + F&O fallback
-    return 9 * 60 + 15 <= mins <= 15 * 60 + 30
+    hours_map = await get_market_hours()
+    is_open, _ = is_market_open_by_config(hours_map, segment_type, None)
+    return is_open
 
 
 def _segment_market_label(segment_type: str | None) -> str:
@@ -151,6 +131,19 @@ def _parse_position_id(position_id: str) -> PydanticObjectId:
         return PydanticObjectId(position_id)
     except Exception:  # bson.errors.InvalidId
         raise HTTPException(status_code=404, detail="Position not found")
+
+
+def _lot_basis(p: Position, t: Any) -> str | None:
+    """The tapped fill's price as a specific-lot exit basis — None (exit at the
+    average) when the fill predates `p`: a weekly settlement re-opened the
+    position at the settle price, so that lot's move is settled and the lot is
+    no longer one of its. 2 s grace: opened_at is stamped just after the
+    opening fill."""
+    if p.opened_at and t.executed_at and (
+        t.executed_at.replace(tzinfo=None) < p.opened_at.replace(tzinfo=None) - timedelta(seconds=2)
+    ):
+        return None
+    return str(t.price)
 
 
 def _effective_qty(p: Position) -> tuple[float, float, int]:
@@ -320,14 +313,16 @@ def _pos(p: Position, expiry: str | None = None, carry_enabled: bool = False) ->
 
 
 def _segment_carryable(segment: str | None) -> bool:
-    """True only for segments with a daily EOD rollover (Indian NSE / BSE / MCX
-    F&O). 24-hour markets — forex / commodity (XAGUSD, XAUUSD) / crypto (BTCUSD)
-    — are rollover-exempt (no EOD close), so `convert_intraday_to_carry` never
-    fires for them and the per-position Carry-Forward toggle would do nothing.
-    Gate `carry_forward_enabled` on this so the toggle is hidden there."""
-    from app.utils.time_utils import market_close_time_for_segment
+    """True only for segments with a daily EOD rollover: Indian NSE / BSE / MCX
+    F&O, and global forex (03:30 IST). Other 24-hour markets — commodity CFDs
+    (XAGUSD, XAUUSD) / crypto (BTCUSD) — are rollover-exempt, so
+    `convert_intraday_to_carry` never fires for them and the per-position
+    Carry-Forward toggle would do nothing. Gate `carry_forward_enabled` on
+    this so the toggle is hidden there — and shown wherever the rollover runs,
+    or a pool with the toggle on squares every position it could not show."""
+    from app.utils.time_utils import FOREX_SEGMENTS, market_close_time_for_segment
 
-    return market_close_time_for_segment(segment) is not None
+    return market_close_time_for_segment(segment) is not None or segment in FOREX_SEGMENTS
 
 
 async def _expiry_map(tokens: list[str]) -> dict[str, str]:
@@ -377,47 +372,14 @@ async def open_positions(user: CurrentUser):
             pass
 
     # Refresh LTP and unrealized PnL for the response (best-effort)
-    # Also fetch total brokerage per position from associated trades.
-    from datetime import timedelta
+    # Also the brokerage on each position's own live fills — each fill on
+    # exactly one position (position_service.own_fills), as the admin sees it.
     tokens = [r.instrument.token for r in rows]
-
-    # Per-position maps: opened_at (for opening fill lower bound) and
-    # cycle start (reopened_at or opened_at, for closing fill filter).
-    position_opens: dict[tuple[str, str], Any] = {}
-    position_cycle_starts: dict[tuple[str, str], Any] = {}
-    for r in rows:
-        k = (r.instrument.token, str(r.product_type.value))
-        position_opens[k] = r.opened_at
-        position_cycle_starts[k] = r.reopened_at or r.opened_at
-
-    oldest_open = min((r.opened_at for r in rows if r.opened_at), default=None)
-    trade_q: dict[str, Any] = {
-        "user_id": user.id,
-        "instrument.token": {"$in": tokens},
+    fills_of = await position_service.own_fills(rows)
+    charges_map = {
+        r.id: sum((to_decimal(t.total_charges or t.brokerage or 0) for t in fills_of[r.id]), Decimal(0))
+        for r in rows
     }
-    if oldest_open is not None:
-        trade_q["executed_at"] = {"$gte": oldest_open - timedelta(seconds=5)}
-    trades = await Trade.find(trade_q).to_list()
-
-    # Sum brokerage per (token, product_type).
-    # Opening fills (pnl_inr=None): count from opened_at onwards (lower bound
-    #   prevents old cycles from bleeding in; no upper bound since position is
-    #   still OPEN and more lots can be added at any time).
-    # Closing fills (pnl_inr set): only count from the current reopen cycle
-    #   (>= reopened_at) so stale closing fills don't accumulate.
-    charges_map: dict[tuple[str, str], float] = {}
-    for t in trades:
-        k = (t.instrument.token, str(t.product_type.value))
-        is_closing = getattr(t, "pnl_inr", None) is not None
-        if is_closing:
-            cycle_start = position_cycle_starts.get(k)
-            if cycle_start is not None and t.executed_at < cycle_start - timedelta(seconds=5):
-                continue  # stale closing fill from a previous cycle — skip
-        else:
-            pos_open = position_opens.get(k)
-            if pos_open is not None and t.executed_at < pos_open - timedelta(seconds=5):
-                continue  # opening fill from before this position opened — skip
-        charges_map[k] = charges_map.get(k, 0.0) + float(str(t.brokerage))
 
     # Parallelise LTP fetch + unrealised P&L refresh across every open
     # position with asyncio.gather. Sequential awaits made this O(N) on
@@ -464,8 +426,7 @@ async def open_positions(user: CurrentUser):
     out = []
     for r, resolved in zip(rows, ovn_resolved):
         d = _pos(r, expiry=emap.get(r.instrument.token), carry_enabled=carry_enabled)
-        k = (r.instrument.token, str(r.product_type.value))
-        charges_amt = charges_map.get(k, 0.0)
+        charges_amt = charges_map[r.id]
         d["charges"] = f"{charges_amt:.2f}"
         # Net the displayed P&L with the commission the admin charges.
         # The user reported the broker brokerage being deducted from
@@ -477,9 +438,9 @@ async def open_positions(user: CurrentUser):
         # wallet.
         if charges_amt > 0:
             try:
-                d["unrealized_pnl"] = f"{float(d['unrealized_pnl']) - charges_amt:.2f}"
-                d["realized_pnl"] = f"{float(d['realized_pnl']) - charges_amt:.2f}"
-            except (TypeError, ValueError):
+                d["unrealized_pnl"] = f"{to_decimal(d['unrealized_pnl']) - charges_amt:.2f}"
+                d["realized_pnl"] = f"{to_decimal(d['realized_pnl']) - charges_amt:.2f}"
+            except (TypeError, ArithmeticError):
                 pass
 
         # ── Carry-forward margin (the "Holding Margin" tile) ──
@@ -641,7 +602,7 @@ async def squareoff(
     # (admin/trading.py) and the risk enforcer keep their own bypass — this
     # gate is user-only and mirrors the squareoff-all endpoint's guard.
     _seg = getattr(p, "segment_type", None) or getattr(p.instrument, "segment", None)
-    if not _is_segment_market_open_now(_seg):
+    if not await _is_segment_market_open_now(_seg):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -957,6 +918,7 @@ async def list_active_trades(user: CurrentUser):
     trade_q: dict[str, Any] = {
         "user_id": user.id,
         "instrument.token": {"$in": tokens},
+        **LIVE_FILL,  # an undone close must not eat the lots a reopen restored
     }
     trades = await Trade.find(trade_q).sort("-executed_at").to_list()
 
@@ -967,6 +929,7 @@ async def list_active_trades(user: CurrentUser):
         trade_q_fallback: dict[str, Any] = {
             "user_id": _OID(str(user.id)),
             "instrument.token": {"$in": tokens},
+            **LIVE_FILL,
         }
         trades = await Trade.find(trade_q_fallback).sort("-executed_at").to_list()
 
@@ -1650,6 +1613,7 @@ async def close_active_trade(trade_id: str, user: CurrentUser):
     all_trades = await Trade.find(
         Trade.user_id == user.id,
         Trade.instrument.token == t.instrument.token,
+        LIVE_FILL,
     ).to_list()
 
     # Attribute by TOKEN unless this token genuinely holds MULTIPLE open
@@ -1805,7 +1769,7 @@ async def close_active_trade(trade_id: str, user: CurrentUser):
             # own entry price, not the position average (operator: "active me
             # 105 close karu to 105 ki hi entry close ho, FIFO/avg mat lagao").
             # Native fill price; only this Active-tab path sets it.
-            "cost_basis_override": str(t.price),
+            "cost_basis_override": _lot_basis(p, t),
         },
     )
 
@@ -1858,7 +1822,7 @@ async def _fill_open_qty(user_id, t) -> float:
     from datetime import datetime as _d, timezone as _tz
 
     trades = await Trade.find(
-        Trade.user_id == user_id, Trade.instrument.token == t.instrument.token
+        Trade.user_id == user_id, Trade.instrument.token == t.instrument.token, LIVE_FILL
     ).to_list()
     is_long = t.action == OrderAction.BUY
 
@@ -1905,7 +1869,6 @@ async def _ensure_fill_sl_tp(user, p, t, sl_val, tp_val, set_sl: bool, set_tp: b
         qty = abs(float(t.quantity))
     lot_size = max(1, int(p.instrument.lot_size or 1))
     lots = qty / lot_size if lot_size else qty
-    basis = float(str(t.price))
     group = str(t.id)
 
     existing = await Order.find(
@@ -1930,7 +1893,7 @@ async def _ensure_fill_sl_tp(user, p, t, sl_val, tp_val, set_sl: bool, set_tp: b
         "lots": lots,
         "force_quantity": qty,
         "is_squareoff": True,
-        "cost_basis_override": str(basis),
+        "cost_basis_override": _lot_basis(p, t),
         "sl_tp_source_trade_id": str(t.id),
         "oco_group_id": group,
         "placed_from": "WEB",
@@ -2111,15 +2074,17 @@ _PNL_SUMMARY_TTL = 1.5
 async def positions_pnl_summary(user: CurrentUser):
     """Per-user PnL windows for the dashboard cards (Today / Week / Last week).
 
-    today_pnl     — realised P&L since IST midnight + current open unrealised.
-    week_pnl      — same, since the most recent IST Sunday 00:00.
-    last_week_pnl — total realised P&L of the previous Sun→Sat window.
+    today_pnl / week_pnl / last_week_pnl — the user's Billing statement Net
+    P&L (Gross − Brokerage, tradebook_builder.booked) for the IST day, this
+    IST week (Mon 00:00 → now) and last week (Mon → Sun): every close at what
+    the wallet booked, settlements included, undone fills out. The
+    ``*_realised`` fields carry the same figures (kept for older clients).
+    Floating M2M is in no period figure; it is ``open_unrealised``.
 
-    NOTE on FX: ``Position.realized_pnl`` and ``unrealized_pnl`` are stored in
-    the instrument's NATIVE currency (USD for crypto/forex). We convert each
-    USD-quoted position to INR using the position's locked-at-open USD/INR
-    rate (realised) or the live rate (unrealised), matching what ``_pos()``
-    sends to the live-positions strip.
+    NOTE on FX: ``Position.unrealized_pnl`` is stored in the instrument's
+    NATIVE currency (USD for crypto/forex); each USD-quoted open position is
+    converted at the live rate, matching what ``_pos()`` sends to the
+    live-positions strip.
     """
     # Short-TTL cache hit — skip the whole heavy recompute (see note above).
     _ck = str(user.id)
@@ -2127,67 +2092,15 @@ async def positions_pnl_summary(user: CurrentUser):
     if _hit is not None and _hit[0] > _pnl_time.monotonic():
         return APIResponse(data=_hit[1])
 
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-
-    IST = _tz(_td(hours=5, minutes=30))
-    now_ist = _dt.now(IST)
-    today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-    days_back = (now_ist.weekday() + 1) % 7
-    week_start_ist = today_start_ist - _td(days=days_back)
-    last_week_start_ist = week_start_ist - _td(days=7)
-    last_week_end_ist = week_start_ist  # exclusive
-
-    today_start = today_start_ist.astimezone(_tz.utc)
-    week_start = week_start_ist.astimezone(_tz.utc)
-    last_week_start = last_week_start_ist.astimezone(_tz.utc)
-    last_week_end = last_week_end_ist.astimezone(_tz.utc)
+    windows = tradebook_builder.periods()
+    today_net, week_net, last_week_net = await asyncio.gather(
+        *(tradebook_builder.net([user.id], *windows[k]) for k in ("today", "week", "last_week"))
+    )
 
     current_usd_inr = market_data_service.get_usd_inr_rate()
 
     def _is_usd(p: Position) -> bool:
         return market_data_service.position_is_usd(p)
-
-    def _realised_inr(p: Position) -> float:
-        raw = float(str(p.realized_pnl))
-        if not _is_usd(p):
-            return raw
-        rate = (
-            float(str(p.open_usd_inr_rate))
-            if p.open_usd_inr_rate is not None
-            else current_usd_inr
-        )
-        return raw * rate
-
-    async def _realised_in(window_start, window_end=None) -> float:
-        # Use trades (closing fills with pnl_inr set) as the source of truth —
-        # same as the admin trading.py pnl-summary endpoint so user and admin
-        # numbers always agree.  The old position-based approach (summing
-        # position.realized_pnl where closed_at OR updated_at fell in window)
-        # had two bugs: (1) it was gross P&L without brokerage deduction, and
-        # (2) the updated_at branch dragged in realized P&L from open positions
-        # that were touched by the risk enforcer / tick, causing massive
-        # over-counting on accounts with many open positions.
-        rng: dict[str, Any] = {"$gte": window_start}
-        if window_end is not None:
-            rng["$lt"] = window_end
-        trades = await Trade.find(
-            {
-                "user_id": user.id,
-                "executed_at": rng,
-                "pnl_inr": {"$ne": None},
-                "price": {"$gt": 0},
-            }
-        ).to_list()
-        gross = sum(float(str(t.pnl_inr)) for t in trades if t.pnl_inr is not None)
-        charges = sum(
-            float(str(getattr(t, "total_charges", None) or t.brokerage or 0))
-            for t in trades
-        )
-        return gross - charges
-
-    today_realised = await _realised_in(today_start)
-    week_realised = await _realised_in(week_start)
-    last_week_realised = await _realised_in(last_week_start, last_week_end)
 
     open_positions = await Position.find(
         {"user_id": user.id, "status": PositionStatus.OPEN.value}
@@ -2227,16 +2140,16 @@ async def positions_pnl_summary(user: CurrentUser):
         total_unrealised += raw
 
     _data = {
-        "today_pnl": round(today_realised + total_unrealised, 2),
-        "today_realised": round(today_realised, 2),
+        "today_pnl": float(today_net),
+        "today_realised": float(today_net),
         "open_unrealised": round(total_unrealised, 2),
-        "week_pnl": round(week_realised + total_unrealised, 2),
-        "week_realised": round(week_realised, 2),
-        "last_week_pnl": round(last_week_realised, 2),
-        "today_start": today_start.isoformat(),
-        "week_start": week_start.isoformat(),
-        "last_week_start": last_week_start.isoformat(),
-        "last_week_end": last_week_end.isoformat(),
+        "week_pnl": float(week_net),
+        "week_realised": float(week_net),
+        "last_week_pnl": float(last_week_net),
+        "today_start": windows["today"][0].isoformat(),
+        "week_start": windows["week"][0].isoformat(),
+        "last_week_start": windows["last_week"][0].isoformat(),
+        "last_week_end": windows["last_week"][1].isoformat(),
         "usd_inr_rate": round(current_usd_inr, 4),
     }
     # Cache for the next 1.5 s so concurrent / rapid polls reuse this compute.
@@ -2277,7 +2190,7 @@ async def squareoff_all(user: CurrentUser):
         # still enforces it here for web / direct-API callers and so
         # the user can't bypass via curl. Crypto + Forex always pass
         # (24/7 / 24x5).
-        if not _is_segment_market_open_now(r.segment_type):
+        if not await _is_segment_market_open_now(r.segment_type):
             blocked_by_market_closed += 1
             continue
         # Per-row hold-time gate: skip (don't fail the whole batch) when the

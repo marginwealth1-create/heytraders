@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 from beanie import PydanticObjectId
@@ -14,22 +16,26 @@ from app.core.dependencies import (
     CurrentAdmin,
     assert_role_aware_perm,
     assert_user_in_scope,
+    is_effective_super_admin,
     require_perm,
     scoped_user_filter,
 )
 from app.core.security import hash_password
 from app.models.audit_log import AuditAction
+from app.models.trade import LIVE_FILL, Trade
 from app.models.transaction import TransactionType
 from app.models.user import User, UserRole, UserStatus
+from app.models.wallet import Wallet
 from app.schemas.admin.common import (
     BlockUserRequest,
     CreateUserRequest,
     WalletAdjustRequest,
 )
 from app.schemas.common import APIResponse
-from app.services import user_service, wallet_service
+from app.services import tradebook_builder, user_service, wallet_service
 from app.services.audit_service import log_event
-from app.utils.decimal_utils import to_decimal128
+from app.utils.decimal_utils import to_decimal, to_decimal128
+from app.utils.time_utils import now_utc
 
 router = APIRouter(prefix="/users", tags=["admin-users"])
 
@@ -138,7 +144,13 @@ async def list_users(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
     _: None = Depends(require_perm("users", "read")),
+    activity: str | None = None,
+    sort: str | None = None,
 ):
+    """`activity`: active = traded (a live fill) in the last 7 days,
+    inactive = not. `sort`: funds_desc / funds_asc (balance = available +
+    used margin, the Balance column) or pnl_desc / pnl_asc (this IST week's
+    Net P&L, the Weekly P&L column); default newest first."""
     query: dict[str, Any] = {}
     # /admin/users is for trading users only. Sub-admins are listed at
     # /admin/management/sub-admins (super-admin only). Reject role filters
@@ -148,6 +160,7 @@ async def list_users(
             UserRole.SUPER_ADMIN.value,
             UserRole.ADMIN.value,
             UserRole.BROKER.value,
+            UserRole.EMPLOYEE.value,
         }:
             raise HTTPException(
                 status_code=400,
@@ -157,11 +170,14 @@ async def list_users(
     else:
         # Hide all admin-tier rows from the regular Users page — they live
         # at /admin/management/sub-admins and /admin/management/brokers.
+        # EMPLOYEE logins are staff stamped into their admin's pool, not
+        # clients (dashboard "Total users" already leaves them out).
         query["role"] = {
             "$nin": [
                 UserRole.SUPER_ADMIN.value,
                 UserRole.ADMIN.value,
                 UserRole.BROKER.value,
+                UserRole.EMPLOYEE.value,
             ]
         }
     if status:
@@ -195,7 +211,9 @@ async def list_users(
         query["is_demo"] = {"$ne": True}
         query["email"] = {"$not": re.compile(r"@demo\.local$", re.IGNORECASE)}
 
-    scope = await scoped_user_filter(admin)
+    # Super-admin (and its staff) READS every pool; writes stay strict, so
+    # rows in a sub-admin's pool are flagged read_only below.
+    scope = await scoped_user_filter(admin, all_pools=True)
     and_clauses: list[dict] = []
     if q:
         regex = re.compile(re.escape(q.strip()), re.IGNORECASE)
@@ -213,12 +231,16 @@ async def list_users(
         and_clauses.append(scope)
     else:
         query.update(scope)
+    if activity in ("active", "inactive"):
+        and_clauses.append(await _traded_last_week(activity == "active"))
     if and_clauses:
         query["$and"] = and_clauses
 
     total = await User.find(query).count()
     rows = (
-        await User.find(query)
+        await _ranked_page(query, sort, page, page_size)
+        if sort in _RANKED_SORTS
+        else await User.find(query)
         .sort("-created_at")
         .skip((page - 1) * page_size)
         .limit(page_size)
@@ -229,72 +251,31 @@ async def list_users(
         rows = [r for r in rows if not getattr(r, "is_demo", False) and "@demo.local" not in (r.email or "")]
     items = [_ser(u) for u in rows]
     await _enrich_admin_broker_names(items)
+    # Mirrors assert_user_in_scope: a super-admin writes only to unassigned
+    # users; the UI hides write actions on the rest until reassigned.
+    super_side = await is_effective_super_admin(admin)
+    for item in items:
+        item["read_only"] = super_side and item["assigned_admin_id"] is not None
 
     # Batch-load wallets for the page so the admin list can surface the
     # `available_balance` + `settlement_outstanding` columns. One round-trip
     # via $in keeps this O(1) instead of N+1 over wallet_service.summary().
-    from app.models.wallet import Wallet
     user_ids = [u.id for u in rows]
     wallets = await Wallet.find({"user_id": {"$in": user_ids}}).to_list()
     wallet_map = {str(w.user_id): w for w in wallets}
 
-    # Weekly closed P&L (#6) — net realised P&L booked in the current ISO week
-    # (Monday 00:00 IST → now). Surfaced on the all-users page in place of the
-    # old settlement column. One grouped aggregate over just this page's users.
-    from datetime import timedelta as _td
-
-    from app.models.transaction import TransactionType, WalletTransaction
-    from app.utils.time_utils import now_ist, to_utc
-
-    _now_i = now_ist()
-    _wk_start = to_utc(
-        (_now_i - _td(days=_now_i.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-    )
-    wk_pnl_map: dict[str, float] = {}
-    # NET realized P&L for the week = booked P&L − brokerage ± any admin
-    # reversals. Summing ONLY PNL rows made the column (a) gross (brokerage
-    # never subtracted) and (b) sticky after a delete — deleting a closed
-    # trade posts a REVERSAL row (not a PNL row), so the deleted trade's P&L
-    # lingered here forever. Include CHARGES (brokerage), REVERSAL
-    # (delete/reopen/edit undo) so a delete of any close nets its whole
-    # footprint back to zero. Operator: "trade delete karne par pnl and
-    # brokerage dono weekly se hat jaye."
-    #
-    # Only rows that MOVE the wallet count, so Balance = funds ± Weekly P&L.
-    # SETTLEMENT_OUTSTANDING_BOOKED never moves it (balance 0 → 0; the
-    # shortfall is owed, shown as "Settlement due"); it's counted when it is
-    # actually paid — the RECOVERY row debits the wallet. Counting both also
-    # double-charged a shortfall recovered the same week (29-Oct HPY86W:
-    # card −3,925.17 vs wallet −3,593.00).
-    _WK_TYPES = [
-        TransactionType.PNL.value,
-        TransactionType.CHARGES.value,
-        TransactionType.REVERSAL.value,
-        TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY.value,
-    ]
-    try:
-        _cur = WalletTransaction.get_motor_collection().aggregate(
-            [
-                {
-                    "$match": {
-                        "user_id": {"$in": user_ids},
-                        "transaction_type": {"$in": _WK_TYPES},
-                        "created_at": {"$gte": _wk_start},
-                    }
-                },
-                {"$group": {"_id": "$user_id", "pnl": {"$sum": {"$toDouble": "$amount"}}}},
-            ]
-        )
-        async for _row in _cur:
-            wk_pnl_map[str(_row["_id"])] = float(_row.get("pnl") or 0.0)
-    except Exception:  # noqa: BLE001
-        wk_pnl_map = {}
+    # Weekly PnL (#6): each row's Billing statement Net P&L (Gross −
+    # Brokerage, tradebook_builder.booked) for this IST week, Mon 00:00 → now
+    # — the figure the client's own cards, the row's action menu and the
+    # Accounts dashboard read. A deleted / reopened trade drops out with its
+    # brokerage (its fills are undone); a stop-out shows its whole loss (the
+    # shortfall is "Settlement due"). One batched read for the page.
+    wk_pnl_map = await tradebook_builder.booked(user_ids, *tradebook_builder.periods()["week"])
 
     for item in items:
         w = wallet_map.get(item["id"])
-        _wk = round(wk_pnl_map.get(item["id"], 0.0), 2)
+        _g, _b = wk_pnl_map.get(PydanticObjectId(item["id"]), (Decimal(0), Decimal(0)))
+        _wk = _g - _b
         item["wallet"] = (
             {
                 "available_balance": str(w.available_balance),
@@ -319,6 +300,38 @@ async def list_users(
             "meta": {"page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size},
         }
     )
+
+
+_RANKED_SORTS = ("funds_desc", "funds_asc", "pnl_desc", "pnl_asc")
+
+
+async def _traded_last_week(traded: bool) -> dict[str, Any]:
+    """Users with (or without) a live fill in the last 7 days."""
+    ids = await Trade.get_motor_collection().distinct(
+        "user_id", {"executed_at": {"$gte": now_utc() - timedelta(days=7)}, **LIVE_FILL}
+    )
+    return {"_id": {"$in" if traded else "$nin": ids}}
+
+
+async def _ranked_page(query: dict[str, Any], sort: str, page: int, page_size: int) -> list[User]:
+    """One page of the users matching `query`, ranked by balance (available +
+    used margin) or this IST week's Net P&L. Both live outside the user doc,
+    so every match is ranked, then paged.
+    ponytail: the whole scope is ranked per request — fine at a few hundred
+    clients; a stored per-user figure if the book grows past that."""
+    ids = [d["_id"] async for d in User.get_motor_collection().find(query, {"_id": 1})]
+    if sort.startswith("funds"):
+        key = {
+            w.user_id: to_decimal(w.available_balance) + to_decimal(w.used_margin)
+            for w in await Wallet.find({"user_id": {"$in": ids}}).to_list()
+        }
+    else:
+        week = tradebook_builder.periods()["week"]
+        key = {uid: g - b for uid, (g, b) in (await tradebook_builder.booked(ids, *week)).items()}
+    ids.sort(key=lambda i: key.get(i, Decimal(0)), reverse=sort.endswith("_desc"))
+    page_ids = ids[(page - 1) * page_size : page * page_size]
+    found = {u.id: u for u in await User.find({"_id": {"$in": page_ids}}).to_list()}
+    return [found[i] for i in page_ids if i in found]
 
 
 @router.get("/live-stats", response_model=APIResponse[dict])
@@ -374,6 +387,16 @@ async def users_live_stats(
     from app.utils.decimal_utils import to_decimal
 
     # ── 1. Resolve target users (parse ids or query the admin's scope) ──
+    # Client-tier rows only, in BOTH branches: explicit ids must not reach an
+    # admin / broker / staff login (the super-admin's pool clause is {}).
+    client_roles = {
+        "$nin": [
+            UserRole.SUPER_ADMIN.value,
+            UserRole.ADMIN.value,
+            UserRole.BROKER.value,
+            UserRole.EMPLOYEE.value,
+        ]
+    }
     target_oids: list[PydanticObjectId] = []
     if user_ids:
         for raw in user_ids.split(","):
@@ -389,21 +412,19 @@ async def users_live_stats(
                 continue
         if not target_oids:
             return APIResponse(data={"items": []})
-        scope_query: dict[str, Any] = {"_id": {"$in": target_oids}}
-        scope_query.update(await scoped_user_filter(admin))
+        scope_query: dict[str, Any] = {
+            "_id": {"$in": target_oids},
+            "role": client_roles,
+        }
+        scope_query.update(await scoped_user_filter(admin, all_pools=True))
         users = await User.find(scope_query).to_list()
     else:
         scope_query = {
-            "role": {
-                "$nin": [
-                    UserRole.SUPER_ADMIN.value,
-                    UserRole.ADMIN.value,
-                    UserRole.BROKER.value,
-                ]
-            },
+            "role": client_roles,
             "status": {"$ne": UserStatus.CLOSED.value},
+            "is_demo": {"$ne": True},
         }
-        scope_query.update(await scoped_user_filter(admin))
+        scope_query.update(await scoped_user_filter(admin, all_pools=True))
         users = await User.find(scope_query).limit(200).to_list()
 
     if not users:
@@ -492,7 +513,7 @@ async def get_user(
     admin: CurrentAdmin,
     _: None = Depends(require_perm("users", "read")),
 ):
-    u = await assert_user_in_scope(admin, user_id)
+    u = await assert_user_in_scope(admin, user_id, for_read=True)
     detail = _ser(u)
     wallet = await wallet_service.summary(u.id)
     # Realized P&L that reconciles with deposits (balance = deposits + realised).
@@ -1322,7 +1343,11 @@ async def impersonate(user_id: str, admin: CurrentAdmin):
 
 # ── Live Trade Stats ────────────────────────────────────────────────
 @router.get("/{user_id}/live-trade-stats", response_model=APIResponse[dict])
-async def live_trade_stats(user_id: str, admin: CurrentAdmin):
+async def live_trade_stats(
+    user_id: str,
+    admin: CurrentAdmin,
+    _: None = Depends(require_perm("users", "read")),
+):
     """Per-user live trading snapshot for the admin row dropdown.
 
     Aggregates:
@@ -1333,15 +1358,16 @@ async def live_trade_stats(user_id: str, admin: CurrentAdmin):
       • cf_total_eod     — sum of overnight margin needed for every
                            currently-open MIS/NRML position at EOD rates
       • cf_extra_needed  — max(0, cf_total_eod − wallet free balance)
-      • weekly_net_pnl   — realised P&L this IST week
-      • weekly_trades    — closed-position count this IST week
+      • weekly_net_pnl   — this IST week's (Mon 00:00 → now) Billing
+                           statement Net P&L (tradebook_builder.booked), the
+                           Users list's Weekly PnL
+      • weekly_trades    — positions closed this IST week
                            (also split into wins / losses)
-      • closed_pnl_all   — realised P&L lifetime
+      • closed_pnl_all_time — lifetime Billing statement Gross P&L
       • all_time_trades  — closed-position count lifetime
       • open_positions   — list of currently-open positions (symbol,
                            qty, avg, ltp, floating P&L per row)
     """
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from decimal import Decimal
 
     from app.models.position import Position, PositionStatus
@@ -1352,19 +1378,14 @@ async def live_trade_stats(user_id: str, admin: CurrentAdmin):
     )
     from app.utils.decimal_utils import to_decimal
 
-    target = await assert_user_in_scope(admin, user_id)
+    target = await assert_user_in_scope(admin, user_id, for_read=True)
     wallet = await wallet_service.get_or_create(target.id)
 
     available = float(str(wallet.available_balance))
     used_margin = float(str(wallet.used_margin))
     credit_limit = float(str(wallet.credit_limit))
 
-    IST = _tz(_td(hours=5, minutes=30))
-    now_ist_dt = _dt.now(IST)
-    today_start = now_ist_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    days_back = (now_ist_dt.weekday() + 1) % 7  # Sun = 0
-    week_start_ist = today_start - _td(days=days_back)
-    week_start = week_start_ist.astimezone(_tz.utc)
+    week_start, week_end = tradebook_builder.periods()["week"]
 
     usd_inr = market_data_service.get_usd_inr_rate()
 
@@ -1405,10 +1426,14 @@ async def live_trade_stats(user_id: str, admin: CurrentAdmin):
         }
     ).to_list()
 
-    weekly_realised = sum(_realised_inr(p) for p in weekly_closed)
+    weekly_net = await tradebook_builder.net([target.id], week_start, week_end)
+    # The lifetime statement's Gross: a partial close of a position still open,
+    # settlements and the rate each close booked at in; undone fills out.
+    all_realised, _ = (await tradebook_builder.booked([target.id], None, None)).get(
+        target.id, (Decimal(0), Decimal(0))
+    )
     weekly_wins = sum(1 for p in weekly_closed if _realised_inr(p) > 0)
     weekly_losses = sum(1 for p in weekly_closed if _realised_inr(p) < 0)
-    all_realised = sum(_realised_inr(p) for p in all_closed)
     all_wins = sum(1 for p in all_closed if _realised_inr(p) > 0)
     all_losses = sum(1 for p in all_closed if _realised_inr(p) < 0)
 
@@ -1539,11 +1564,11 @@ async def live_trade_stats(user_id: str, admin: CurrentAdmin):
             "equity": round(equity, 2),
             "cf_total_eod": round(cf_total_eod, 2),
             "cf_extra_needed": round(cf_extra_needed, 2),
-            "weekly_net_pnl": round(weekly_realised, 2),
+            "weekly_net_pnl": float(weekly_net),
             "weekly_trades": len(weekly_closed),
             "weekly_wins": weekly_wins,
             "weekly_losses": weekly_losses,
-            "closed_pnl_all_time": round(all_realised, 2),
+            "closed_pnl_all_time": float(all_realised),
             "all_time_trades": len(all_closed),
             "all_time_wins": all_wins,
             "all_time_losses": all_losses,

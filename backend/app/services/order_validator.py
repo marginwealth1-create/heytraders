@@ -58,6 +58,8 @@ from app.utils.time_utils import (
 # — they have no daily bell, so is_within_open_grace() returns False.
 # Keep this in lockstep with risk_enforcer._OPEN_GRACE_SEC.
 _OPEN_SETTLE_BUFFER_SEC = 60
+# Forex / metals / energy: a provider tick older than this = feed down, no trade.
+_INTL_STALE_SEC = 120
 
 
 @dataclass
@@ -1073,20 +1075,9 @@ async def validate(
             s["leverage"] = 1.0
             s["fixed_margin_per_lot"] = 0.0
 
-    # 8b) NRML on an exchange segment is held overnight, so it locks the
-    # OVERNIGHT tier now (Times mode otherwise keeps the intraday leverage for
-    # every product). Expiry day: the expiry rules above already chose the
-    # tier. Crypto / forex / international rows have no carry tier — the
-    # resolver hands them intraday values, so their NRML stays intraday.
-    if (
-        product_type == ProductType.NRML
-        and not is_expiry_day_now
-        and str(segment_type).upper().startswith(("NSE", "BSE", "NFO", "BFO", "MCX"))
-    ):
-        s["leverage"] = s.get("overnight_leverage") or s.get("leverage")
-        s["margin_percentage"] = s.get("overnight_margin_percentage") or s.get("margin_percentage")
-        if s.get("margin_calc_mode") == "fixed":
-            s["fixed_margin_per_lot"] = s.get("overnight_fixed_margin_per_lot") or s.get("fixed_margin_per_lot")
+    # (8b removed 2026-11-11, operator: NRML locks the same INTRADAY margin as
+    # MIS — margin never changes for a carry; the overnight tier is only the
+    # EOD rollover's funds check.)
 
     # 9) margin check (all-Decimal arithmetic — never mix Decimal × float)
     margin_pct = to_decimal(s.get("margin_percentage") or 100.0) / to_decimal(100)
@@ -1281,18 +1272,45 @@ async def validate(
     # authenticated, scope-checked operator action, unlike a user's WEB order
     # which stays gated (the stale-price fairness guard below is for USERS).
     _is_admin_placed = (placed_from or "WEB").upper() == "ADMIN"
+    if not is_amo and not _is_force_close and not _is_admin_placed:
+        ist = now_ist()
+        from app.services.market_hours_service import (
+            get_market_hours,
+            is_market_open_by_config,
+        )
+
+        _mh_map = await get_market_hours()
+        _mh_open, _mh_msg = is_market_open_by_config(
+            _mh_map, segment_type, exch_upper, ist
+        )
+        if not _mh_open:
+            raise MarketClosedError(_mh_msg)
+
+        # 11-intl) Forex / metals / energy trade only on a LIVE price. With the
+        # Binance-futures backup off (operator 2026-11-10: MetaAPI price only),
+        # a MetaAPI outage leaves the last cached price — and the admin spread
+        # would still quote bid/ask around it. Refuse instead of filling stale.
+        if is_24x5:
+            import time as _it
+
+            try:
+                _iq = await market_data_service.get_quote(instrument.token) or {}
+            except Exception:
+                _iq = {}
+            _ifts = _iq.get("feed_ts")
+            _iage = (_it.time() - float(_ifts)) if _ifts else None
+            if _iq.get("source") not in ("metaapi", "infoway", "binance", "binance_futures") or (
+                _iage is not None and _iage > _INTL_STALE_SEC
+            ):
+                raise MarketClosedError(
+                    f"{instrument.symbol}: live price is not coming right now (price feed down). "
+                    "Please try again in a few minutes."
+                )
+
     if not is_amo and not is_24x7 and not _is_force_close and not _is_admin_placed:
         ist = now_ist()
 
-        # 24×5 (forex / metals / energy): closed only on weekends (Sat full-day;
-        # Sun close before 17:30 ET ≈ 03:00 IST Mon)
-        if is_24x5:
-            wd = ist.weekday()  # Mon=0 ... Sun=6
-            if wd == 5 or (wd == 6 and ist.hour < 4):
-                raise MarketClosedError("Forex market is closed for the weekend.")
-        else:
-            if is_weekend(ist.date()):
-                raise MarketClosedError("Market is closed (weekend). Place AMO instead.")
+        if not is_24x5:
             # holiday lookup (only Indian exchanges)
             h = await TradingHoliday.find_one(
                 TradingHoliday.holiday_date == ist.date(),
@@ -1325,13 +1343,6 @@ async def validate(
                     raise MarketClosedError(
                         f"{h.description}: session closed at {h.close_time} IST."
                     )
-
-            from app.services.market_hours_service import is_market_open_now
-
-            ex_str = instrument.exchange.value if hasattr(instrument.exchange, "value") else str(instrument.exchange or "")
-            is_open, m_msg, _ = await is_market_open_now(ex_str, segment_type, at=ist)
-            if not is_open:
-                raise MarketClosedError(f"{m_msg} Place AMO instead.")
 
         # ── 11a-2) Open settle-buffer (stale-first-tick protection) ──────
         # We're confirmed in-session above (not weekend/holiday, inside the

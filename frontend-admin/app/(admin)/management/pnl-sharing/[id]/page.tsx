@@ -17,49 +17,8 @@ import { PeriodToggle } from "@/components/pnl-sharing/PeriodToggle";
 import { SettlementHistoryTable } from "@/components/pnl-sharing/SettlementHistoryTable";
 import { Button } from "@/components/ui/button";
 import { PnlSharingAPI, type SettlementCadence } from "@/lib/api/pnl-sharing";
-
-function triggerDownload(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-function periodBounds(cadence: SettlementCadence): { from: string; to: string } {
-  const now = new Date();
-  if (cadence === "DAILY") {
-    const start = new Date(now);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(now);
-    end.setHours(23, 59, 59, 999);
-    return { from: start.toISOString(), to: end.toISOString() };
-  }
-  if (cadence === "WEEKLY") {
-    const day = now.getDay() || 7;
-    const start = new Date(now);
-    start.setDate(now.getDate() - day + 1);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(start);
-    end.setDate(start.getDate() + 6);
-    end.setHours(23, 59, 59, 999);
-    return { from: start.toISOString(), to: end.toISOString() };
-  }
-  const start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
-  const end = new Date(
-    now.getFullYear(),
-    now.getMonth() + 1,
-    0,
-    23,
-    59,
-    59,
-    999
-  );
-  return { from: start.toISOString(), to: end.toISOString() };
-}
+import { saveBlob } from "@/lib/utils";
+import { istPeriodBounds } from "@/lib/time";
 
 export default function PnlSharingDetailPage() {
   const params = useParams<{ id: string }>();
@@ -67,7 +26,7 @@ export default function PnlSharingDetailPage() {
   const [cadence, setCadence] = useState<SettlementCadence>("MONTHLY");
 
   const { data: agreement } = useAgreement(id);
-  const { from, to } = periodBounds(cadence);
+  const { from, to } = istPeriodBounds(cadence);
   const { data: report } = useReport(id, cadence, from, to);
 
   const { data: settlements = [] } = useQuery({
@@ -192,7 +151,7 @@ export default function PnlSharingDetailPage() {
                 agreement.id,
                 { period: cadence, from, to, format: "pdf" },
               );
-              triggerDownload(blob, filename);
+              saveBlob(blob, filename);
             } catch (e) {
               const err = e as { message?: string };
               toast.error(err?.message ?? "PDF download failed");
@@ -204,7 +163,7 @@ export default function PnlSharingDetailPage() {
                 agreement.id,
                 { period: cadence, from, to, format: "excel" },
               );
-              triggerDownload(blob, filename);
+              saveBlob(blob, filename);
             } catch (e) {
               const err = e as { message?: string };
               toast.error(err?.message ?? "Excel download failed");

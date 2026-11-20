@@ -6,13 +6,13 @@ but operates independently (no PnlSharingAgreement required).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from typing import Any
+from xml.sax.saxutils import escape
 
 from beanie import PydanticObjectId
 from openpyxl import Workbook
@@ -30,20 +30,54 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from app.core.dependencies import _admin_pool_clause, effective_scope_actor, scoped_user_filter
+from app.core.exceptions import InsufficientPermissionsError
 from app.models.pnl_sharing import AgreementStatus, AgreementType, PnlSharingAgreement
-from app.models.position import Position, PositionStatus
-from app.models.trade import Trade
-from app.models.transaction import TransactionType, WalletTransaction
+from app.models.transaction import CASH_TYPES, TransactionType, WalletTransaction, ledger_bucket
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
-from app.services import market_data_service
-from app.services.admin_settlement_service import _realised_inr
+from app.services import tradebook_builder
 from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import IST
 
 logger = logging.getLogger(__name__)
 
 TRADING_ROLES = [UserRole.CLIENT.value, UserRole.DEALER.value, UserRole.MASTER.value]
+
+# Virtual entity: the Brokers tab's "Direct Users (No Broker)" row (id "direct").
+DIRECT = "DIRECT"
+
+
+async def entity_scope(
+    admin: User, entity_id: str
+) -> tuple[User | None, str, dict[str, Any]] | None:
+    """The ONE scope guard behind every /admin/accounts entity endpoint.
+
+    Returns ``(entity, entity_role, caller_clause)``, or None for an unknown
+    id. ``"direct"`` gives ``(None, DIRECT, clause)``. An EMPLOYEE entity —
+    incl. the caller's own id, which the All Users tab sends — is its parent
+    admin's pool. The effective super-admin may name any entity (clause
+    ``{}``, D1); anyone else only itself or a BROKER inside its own pool
+    (403 otherwise), and its pool clause is ANDed into every user query.
+    """
+    clause = await scoped_user_filter(admin, all_pools=True)
+    if entity_id == "direct":
+        return None, DIRECT, clause
+    try:
+        entity = await User.get(PydanticObjectId(entity_id))
+    except Exception:
+        return None
+    if entity is None:
+        return None
+    entity = await effective_scope_actor(entity)
+    actor = await effective_scope_actor(admin)
+    if actor.role != UserRole.SUPER_ADMIN and entity.id != actor.id:
+        in_pool = entity.role == UserRole.BROKER and await User.find_one(
+            {"$and": [{"_id": entity.id}, clause]}
+        )
+        if not in_pool:
+            raise InsufficientPermissionsError("Entity is outside your scope")
+    return entity, entity.role.value, clause
 
 
 # ── Week options for dropdown ────────────────────────────────────────
@@ -84,8 +118,17 @@ async def _broker_client_ids(broker_id: PydanticObjectId) -> list[PydanticObject
 async def _entity_pool_ids(
     entity_id: PydanticObjectId,
     entity_role: str,
+    pool_clause: dict[str, Any] | None = None,
 ) -> list[PydanticObjectId]:
-    """User IDs in an entity's pool based on role."""
+    """User IDs in an entity's pool based on role, ANDed with the caller's
+    ``pool_clause`` (from entity_scope) when given."""
+    if entity_role == UserRole.EMPLOYEE.value:
+        # Staff works on its parent admin's pool. trading.py passes the
+        # caller's own (id, role) straight in, so resolve it here too.
+        emp = await User.get(entity_id)
+        if emp is not None:
+            parent = await effective_scope_actor(emp)
+            entity_id, entity_role = parent.id, parent.role.value
     coll = User.get_motor_collection()
     query: dict[str, Any] = {
         "role": {"$in": TRADING_ROLES},
@@ -100,49 +143,18 @@ async def _entity_pool_ids(
         # uske andar ke sub-broker ke users bhi dikhe").
         query["broker_ancestry"] = entity_id
     elif entity_role in (UserRole.ADMIN.value, "ADMIN"):
-        query["assigned_admin_id"] = entity_id
+        # The admin's whole pool, the one its Positions table shows: its own
+        # clients plus every client under its brokers (a transferred broker's
+        # subtree keeps the old assigned_admin_id).
+        query.update(await _admin_pool_clause(entity_id))
     elif entity_role in (UserRole.SUPER_ADMIN.value, "SUPER_ADMIN"):
         pass  # all users
     else:
-        query["assigned_broker_id"] = entity_id
+        return []  # default-deny: an unknown entity role means NO users, never all
+    if pool_clause:
+        query = {"$and": [query, pool_clause]}
     cursor = coll.find(query, {"_id": 1})
     return [doc["_id"] async for doc in cursor]
-
-
-# ── System-generated ADJUSTMENT filter ──────────────────────────────
-#
-# ADJUSTMENT is overloaded: operator-driven Add/Deduct Fund AND a
-# handful of automated corrections that should NOT count as cash
-# inflow or outflow on the dashboard. Each pattern below maps to a
-# concrete narration the platform writes at a known site:
-#
-#   "Initial balance credit by …"
-#       Written by user-creation flow (admin/users.py) when a new user
-#       is opened with a non-zero starting balance. Onboarding entry,
-#       not a real deposit.
-#   "Bogus 0-price fill reversal …"
-#       Written when the operator runs the fix_bogus_proceeds_credits
-#       recovery script (or its inline variant) to undo a trade booked
-#       at ₹0 due to a Zerodha feed flatline. The credit is a
-#       correction restoring the pre-bug wallet state, not new money.
-#       Operator hit this on CL62329114 — two ₹8,63,120 reversal rows
-#       inflated the per-week Add Fund total to ~₹17 lakh.
-#   "Reversal …" (generic)
-#       Catch-all for any future correction script that prefixes its
-#       narration with the word. Cheap to include; missing it would
-#       just re-create the same bug for the next operator-written fix.
-_SYSTEM_ADJUSTMENT_PATTERNS = (
-    "initial balance credit",
-    "bogus 0-price fill reversal",
-    "reversal trade=",  # the bogus-fill narration always contains this fragment
-)
-
-
-def _is_system_adjustment(narration: str) -> bool:
-    """True when an ADJUSTMENT row is a backend-written correction
-    that should not be displayed as a real Add/Deduct Fund move."""
-    n = (narration or "").lower()
-    return any(p in n for p in _SYSTEM_ADJUSTMENT_PATTERNS)
 
 
 # ── Broker totals (PNL sharing snapshot) ─────────────────────────────
@@ -192,6 +204,32 @@ async def _settlement_in_window(
     return booked - recovered
 
 
+async def cash_in_out(
+    user_ids: list[PydanticObjectId], date_filter: dict[str, Any] | None
+) -> tuple[Decimal, Decimal]:
+    """Deposits and withdrawals over `created_at` ∈ date_filter (lifetime when
+    None): the cash rows the ledger strip sums (models.transaction.ledger_bucket)
+    — DEPOSIT / WITHDRAWAL and every admin Add / Deduct Fund, whatever type it
+    was booked under; a system ADJUSTMENT (initial balance credit, bogus-fill
+    reversal, the EOD carry fee) is no cash in or out."""
+    deposits = withdrawals = Decimal("0")
+    if not user_ids:
+        return deposits, withdrawals
+    q: dict[str, Any] = {
+        "user_id": {"$in": user_ids},
+        "transaction_type": {"$in": [t.value for t in CASH_TYPES]},
+    }
+    if date_filter:
+        q["created_at"] = date_filter
+    for t in await WalletTransaction.find(q).to_list():
+        bucket = ledger_bucket(t.transaction_type, t.amount, t.narration)
+        if bucket == "deposit":
+            deposits += abs(to_decimal(t.amount))
+        elif bucket == "withdrawal":
+            withdrawals += abs(to_decimal(t.amount))
+    return deposits, withdrawals
+
+
 async def client_totals_for_users(
     user_ids: list[PydanticObjectId],
     start_utc: datetime | None,
@@ -203,43 +241,17 @@ async def client_totals_for_users(
     numbers (operator: the two pages MUST match). Both callers pass a demo-free,
     non-CLOSED pool, so no user filtering happens here.
 
-    * net_client_pnl = Σ realized P&L of CLOSED positions closed in the window
-      (USD-quoted segments converted to INR via the position's locked rate).
-    * net_client_bkg = Σ |brokerage| of trades executed in the window, excluding
-      fills an admin reopen/delete undid (`superseded_by_reopen`).
+    * net_client_pnl / net_client_bkg = Σ the users' Billing statement Gross
+      PnL / Brokerage over the window (tradebook_builder.booked): a row and
+      the card read what the statement reads.
     * total_of_both  = broker view = −net_client_pnl + net_client_bkg.
     """
     net_client_pnl = Decimal("0")
     net_client_bkg = Decimal("0")
     if user_ids:
-        date_filter: dict[str, Any] | None = None
-        if start_utc or end_utc:
-            date_filter = {}
-            if start_utc:
-                date_filter["$gte"] = start_utc
-            if end_utc:
-                date_filter["$lte"] = end_utc
-
-        fallback_usd_inr = to_decimal(market_data_service.get_usd_inr_rate())
-        if date_filter:
-            positions = await Position.find({
-                "user_id": {"$in": user_ids},
-                "status": PositionStatus.CLOSED.value,
-                "closed_at": date_filter,
-            }).to_list()
-        else:
-            positions = await Position.find({"user_id": {"$in": user_ids}}).to_list()
-        for p in positions:
-            net_client_pnl += _realised_inr(p, fallback_usd_inr)
-
-        bkg_trade_q: dict[str, Any] = {
-            "user_id": {"$in": user_ids},
-            "superseded_by_reopen": {"$ne": True},
-        }
-        if date_filter:
-            bkg_trade_q["executed_at"] = date_filter
-        for t in await Trade.find(bkg_trade_q).to_list():
-            net_client_bkg += abs(to_decimal(t.brokerage))
+        for gross, bkg in (await tradebook_builder.booked(user_ids, start_utc, end_utc)).values():
+            net_client_pnl += gross
+            net_client_bkg += bkg
 
     return {
         "net_client_pnl": net_client_pnl,
@@ -252,6 +264,7 @@ async def compute_broker_totals(
     entity_id: PydanticObjectId,
     start_utc: datetime | None,
     end_utc: datetime | None,
+    pool_clause: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute NET CLIENT PNL, BKG, TOTAL, SETTLEMENT, ACTUAL PNL, SHARING.
     Despite the name this also serves the ADMIN and SUPER_ADMIN tabs —
@@ -264,7 +277,7 @@ async def compute_broker_totals(
     if not entity:
         return _empty_broker_totals()
 
-    user_ids = await _entity_pool_ids(entity_id, entity.role.value)
+    user_ids = await _entity_pool_ids(entity_id, entity.role.value, pool_clause)
     # Operator-debug log — when "filter not working" complaints come in
     # we can grep journalctl for this line and confirm the dates that
     # actually reached the aggregation, ruling out a frontend bug.
@@ -280,8 +293,6 @@ async def compute_broker_totals(
 
     net_client_pnl = Decimal("0")
     net_client_bkg = Decimal("0")
-    total_deposits = Decimal("0")
-    total_withdrawals = Decimal("0")
 
     # Build the date filter at function scope so the post-block
     # settlement helper can see it even when user_ids is empty (the
@@ -301,55 +312,7 @@ async def compute_broker_totals(
     net_client_pnl = _ct["net_client_pnl"]
     net_client_bkg = _ct["net_client_bkg"]
 
-    if user_ids:
-        # Deposits in window =
-        #   • user-initiated DEPOSIT requests, AND
-        #   • admin manual "Add Fund" (ADJUSTMENT, amount > 0).
-        # The ONLY ADJUSTMENT+ we exclude is the automatic initial_balance
-        # credit written on user creation (narration "Initial balance credit
-        # by …") — that's an onboarding entry, not a real deposit, and folding
-        # it in once ballooned the tile to ~23 lakh for a week of signups.
-        # Withdrawals mirror this with ADJUSTMENT negatives ("Deduct Fund").
-        dep_query: dict[str, Any] = {
-            "user_id": {"$in": user_ids},
-            "transaction_type": {"$in": [TransactionType.DEPOSIT.value, TransactionType.ADJUSTMENT.value]},
-        }
-        if date_filter:
-            dep_query["created_at"] = date_filter
-        dep_txns = await WalletTransaction.find(dep_query).to_list()
-        for t in dep_txns:
-            amt = to_decimal(t.amount)
-            if t.transaction_type == TransactionType.ADJUSTMENT:
-                if amt <= 0:
-                    continue  # admin Deduct Fund → counted under withdrawals
-                if _is_system_adjustment(t.narration or ""):
-                    # Onboarding initial balance, bogus-fill reversal, or
-                    # any other auto-generated correction — NOT a real
-                    # admin Add Fund. See _is_system_adjustment for the
-                    # full pattern list and why it matters.
-                    continue
-            total_deposits += abs(amt)
-
-        # Withdrawals in window =
-        #   • user-initiated WITHDRAWAL requests, AND
-        #   • admin manual "Deduct Fund" (ADJUSTMENT, amount < 0).
-        wd_query: dict[str, Any] = {
-            "user_id": {"$in": user_ids},
-            "transaction_type": {"$in": [TransactionType.WITHDRAWAL.value, TransactionType.ADJUSTMENT.value]},
-        }
-        if date_filter:
-            wd_query["created_at"] = date_filter
-        wd_txns = await WalletTransaction.find(wd_query).to_list()
-        for t in wd_txns:
-            amt = to_decimal(t.amount)
-            if t.transaction_type == TransactionType.ADJUSTMENT:
-                if amt >= 0:
-                    continue  # admin Add Fund → counted under deposits
-                if _is_system_adjustment(t.narration or ""):
-                    # Negative system corrections (e.g. reversal debits)
-                    # are NOT real Deduct Fund actions.
-                    continue
-            total_withdrawals += abs(amt)
+    total_deposits, total_withdrawals = await cash_in_out(user_ids, date_filter)
 
     # Settlement — windowed (BOOKED − RECOVERY WalletTransactions in
     # the selected period) when a date filter is set, full lifetime
@@ -474,26 +437,32 @@ def _empty_broker_totals() -> dict[str, Any]:
 # ── Per-user PNL breakdown within an entity ──────────────────────────
 
 async def get_entity_users(
-    entity_id: PydanticObjectId,
+    entity_id: PydanticObjectId | None,
     entity_role: str,
     start_utc: datetime | None,
     end_utc: datetime | None,
     page: int = 1,
     page_size: int = 15,
     search: str | None = None,
+    *,
+    pool_clause: dict[str, Any] | None = None,
+    user_id: PydanticObjectId | None = None,
 ) -> dict[str, Any]:
     """Paginated per-user PNL breakdown for an entity's client pool.
 
-    Operator request: only ACTIVE users surface here.  Previously this
-    filter was `status != CLOSED` so PENDING (never logged in) and
-    BLOCKED rows polluted the table with empty 0.00 lines.  The
-    aggregate pool totals card and broker tabs still walk the full
-    `assigned_*` graph — this filter is local to the per-user
-    pagination only.
+    Status filter is `status != CLOSED` — the same as the pool totals card
+    and the summary. BEHAVIOUR CHANGE: this used to be `status == ACTIVE`
+    (an operator request to hide empty 0.00 PENDING/BLOCKED rows), which
+    also dropped a kill-switched (BLOCKED) client who HAD traded, so the
+    rows and the per-user Excel/PDF summed short of the card and that
+    client could not be billed. The zero-activity guard below already keeps
+    empty rows out. ``pool_clause`` (the caller's, from entity_scope) is
+    ANDed in; ``user_id`` narrows to that one row inside the entity's scope
+    (an id outside it returns nothing).
     """
     user_query: dict[str, Any] = {
         "role": {"$in": TRADING_ROLES},
-        "status": UserStatus.ACTIVE.value,
+        "status": {"$ne": UserStatus.CLOSED.value},
         "is_demo": {"$ne": True},
     }
     if entity_role in (UserRole.BROKER.value, "BROKER"):
@@ -501,17 +470,14 @@ async def get_entity_users(
         # this broker's id for every descendant), not just direct clients.
         user_query["broker_ancestry"] = entity_id
     elif entity_role in (UserRole.ADMIN.value, "ADMIN"):
-        # Include direct users + users under admin's brokers
-        broker_ids = [
-            b["_id"] async for b in User.get_motor_collection().find(
-                {"assigned_admin_id": entity_id, "role": UserRole.BROKER.value},
-                {"_id": 1},
-            )
-        ]
-        scope_filter = [{"assigned_admin_id": entity_id}]
-        if broker_ids:
-            scope_filter.append({"assigned_broker_id": {"$in": broker_ids}})
-        user_query["$or"] = scope_filter
+        # Direct users + every user under the admin's brokers and sub-brokers:
+        # the pool _entity_pool_ids gives the KPI cards.
+        user_query.update(await _admin_pool_clause(entity_id))
+    elif entity_role == DIRECT:
+        user_query["assigned_broker_id"] = None
+    elif entity_role not in (UserRole.SUPER_ADMIN.value, "SUPER_ADMIN"):
+        # Default-deny: an unknown entity role means NO users, never all.
+        return {"items": [], "meta": {"page": 1, "page_size": page_size, "total": 0, "total_pages": 1}}
 
     if search and search.strip():
         import re
@@ -524,6 +490,10 @@ async def get_entity_users(
             user_query = {"$and": [user_query, {"$or": search_filter}]}
         else:
             user_query["$or"] = search_filter
+    if pool_clause:
+        user_query = {"$and": [user_query, pool_clause]}
+    if user_id is not None:
+        user_query = {"$and": [user_query, {"_id": user_id}]}
 
     # Scan ALL users matching the scope (no DB pagination) so the
     # post-filter "drop all-zero rows" step can yield a true paginated
@@ -565,7 +535,6 @@ async def get_entity_users(
         date_filter["$lte"] = end_utc
     has_date = bool(date_filter)
 
-    fallback_usd_inr = to_decimal(market_data_service.get_usd_inr_rate())
     user_ids = [u.id for u in users]
 
     # ── 5 batch $in queries instead of 417×4 per-user queries ───────
@@ -573,24 +542,8 @@ async def get_entity_users(
     # Position + Trade + Wallet + Settlement query PER USER — 1,668
     # queries for 417 users, spiking MongoDB CPU to 18-20%.  Now we
     # fetch everything in 5 bulk queries and aggregate in Python.
-    if has_date:
-        all_positions = await Position.find({
-            "user_id": {"$in": user_ids},
-            "status": PositionStatus.CLOSED.value,
-            "closed_at": date_filter,
-        }).to_list()
-    else:
-        all_positions = await Position.find({"user_id": {"$in": user_ids}}).to_list()
-
-    # Skip reopen/delete-superseded trades — their brokerage / turnover must
-    # not show in the per-user breakdown once the position is undone.
-    trade_q: dict[str, Any] = {
-        "user_id": {"$in": user_ids},
-        "superseded_by_reopen": {"$ne": True},
-    }
-    if has_date:
-        trade_q["executed_at"] = date_filter
-    all_trades = await Trade.find(trade_q).to_list()
+    # Net PNL / Net BKG: each user's Billing statement Gross / Brokerage.
+    booked_by_user_pnl = await tradebook_builder.booked(user_ids, start_utc, end_utc)
 
     all_wallets = await Wallet.find({"user_id": {"$in": user_ids}}).to_list()
 
@@ -611,14 +564,6 @@ async def get_entity_users(
         recovery_txns = []
 
     # Build per-user lookup dicts from the batch results
-    pos_by_user: dict = defaultdict(list)
-    for p in all_positions:
-        pos_by_user[p.user_id].append(p)
-
-    trades_by_user: dict = defaultdict(list)
-    for t in all_trades:
-        trades_by_user[t.user_id].append(t)
-
     wallet_by_user: dict = {w.user_id: w for w in all_wallets}
 
     booked_by_user: dict = defaultdict(Decimal)
@@ -633,14 +578,7 @@ async def get_entity_users(
     items = []
     for u in users:
         uid = u.id
-        net_pnl = sum(
-            (_realised_inr(p, fallback_usd_inr) for p in pos_by_user[uid]),
-            Decimal("0"),
-        )
-        net_bkg = sum(
-            (abs(to_decimal(t.brokerage)) for t in trades_by_user[uid]),
-            Decimal("0"),
-        )
+        net_pnl, net_bkg = booked_by_user_pnl.get(uid, (Decimal("0"), Decimal("0")))
         total_pnl = net_pnl - net_bkg
 
         wallet = wallet_by_user.get(uid)
@@ -696,15 +634,18 @@ async def get_entity_users(
 
 
 async def get_all_entity_users(
-    entity_id: PydanticObjectId,
+    entity_id: PydanticObjectId | None,
     entity_role: str,
     start_utc: datetime | None,
     end_utc: datetime | None,
+    *,
+    pool_clause: dict[str, Any] | None = None,
+    user_id: PydanticObjectId | None = None,
 ) -> list[dict[str, Any]]:
     """All users (no pagination) for export."""
     result = await get_entity_users(
         entity_id, entity_role, start_utc, end_utc,
-        page=1, page_size=10000,
+        page=1, page_size=10000, pool_clause=pool_clause, user_id=user_id,
     )
     return result["items"]
 
@@ -731,7 +672,10 @@ def render_entity_users_excel(
     ws.append([f"Period: {period_label}"])
     ws.append([])
 
-    headers = ["User ID", "Username", "Total PNL", "Net PNL", "Net BKG", "Settlement", "PNL - Settlement"]
+    # The statement's words (§7.3): net_pnl is the Gross, total_pnl the Net.
+    headers = [
+        "User ID", "Username", "Net PNL", "Gross PNL", "Brokerage", "Settlement", "Net PNL - Settlement",
+    ]
     ws.append(headers)
     row_num = 4
     for col_idx in range(1, len(headers) + 1):
@@ -782,8 +726,8 @@ def render_broker_totals_excel(
     ws.append([])
 
     rows = [
-        ("NET CLIENT PNL", totals["net_client_pnl"]),
-        ("NET CLIENT BKG", totals["net_client_bkg"]),
+        ("CLIENT GROSS PNL", totals["net_client_pnl"]),
+        ("CLIENT BROKERAGE", totals["net_client_bkg"]),
         ("TOTAL OF BOTH", totals["total_of_both"]),
         ("SETTLEMENT", totals["settlement"]),
         ("ACTUAL PNL", totals["actual_pnl"]),
@@ -822,11 +766,11 @@ def render_single_user_excel(user_data: dict[str, Any], period_label: str) -> by
     ws.append([])
 
     rows = [
-        ("Net PNL", user_data["net_pnl"]),
-        ("Net BKG", user_data["net_bkg"]),
-        ("Total PNL", user_data["total_pnl"]),
+        ("Gross PNL", user_data["net_pnl"]),
+        ("Brokerage", user_data["net_bkg"]),
+        ("Net PNL", user_data["total_pnl"]),
         ("Settlement", user_data["settlement"]),
-        ("PNL - Settlement", user_data["pnl_minus_settlement"]),
+        ("Net PNL - Settlement", user_data["pnl_minus_settlement"]),
     ]
     for label, val in rows:
         ws.append([label, float(val)])
@@ -875,11 +819,11 @@ def render_entity_users_pdf(
     meta_style = ParagraphStyle("meta", parent=styles["Normal"], fontSize=9, textColor=colors.grey)
 
     elements: list = []
-    elements.append(Paragraph(f"PNL Report — {entity_name}", h1))
-    elements.append(Paragraph(f"Period: {period_label}", meta_style))
+    elements.append(Paragraph(escape(f"PNL Report — {entity_name}"), h1))
+    elements.append(Paragraph(escape(f"Period: {period_label}"), meta_style))
     elements.append(Spacer(1, 8))
 
-    headers = ["User ID", "Username", "Total PNL", "Net PNL", "Net BKG", "Settlement", "PNL-Sett."]
+    headers = ["User ID", "Username", "Net PNL", "Gross PNL", "Brokerage", "Settlement", "Net-Sett."]
     data = [headers]
     for u in users_data:
         data.append([
@@ -928,13 +872,13 @@ def render_broker_totals_pdf(
     meta_style = ParagraphStyle("meta", parent=styles["Normal"], fontSize=9, textColor=colors.grey)
 
     elements: list = []
-    elements.append(Paragraph(f"Broker Summary — {entity_name}", h1))
-    elements.append(Paragraph(f"Period: {period_label}", meta_style))
+    elements.append(Paragraph(escape(f"Broker Summary — {entity_name}"), h1))
+    elements.append(Paragraph(escape(f"Period: {period_label}"), meta_style))
     elements.append(Spacer(1, 10))
 
     rows = [
-        ["NET CLIENT PNL", _money_fmt(totals["net_client_pnl"])],
-        ["NET CLIENT BKG", _money_fmt(totals["net_client_bkg"])],
+        ["CLIENT GROSS PNL", _money_fmt(totals["net_client_pnl"])],
+        ["CLIENT BROKERAGE", _money_fmt(totals["net_client_bkg"])],
         ["TOTAL OF BOTH", _money_fmt(totals["total_of_both"])],
         ["ACTUAL PNL", _money_fmt(totals["actual_pnl"])],
         ["SETTLEMENT (loss to broker)", _money_fmt(totals["settlement"])],

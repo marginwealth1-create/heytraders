@@ -145,8 +145,18 @@ async def adjust(
     reference_type: str | None = None,
     reference_id: str | None = None,
     actor_id: str | PydanticObjectId | None = None,
+    draw_margin: bool = False,
 ) -> WalletTransaction:
     """Apply a signed delta (+ credit, - debit) to available_balance.
+
+    `draw_margin` (trade debits from the matching engine): a loss / charge
+    bigger than the free cash is taken from the margin the user's OTHER open
+    positions lock — largest first, wallet `used_margin` and each position's
+    `margin_used` reduced together so they always match — exactly how a
+    broker debits a realised loss from the whole account. Only what's left
+    after free cash AND all locked margin is booked to settlement (the
+    account's equity is really exhausted). 3-Nov X4P3CE booked four "dues"
+    while ₹10k+ sat in a BTC position's margin.
 
     Settlement policy (per admin requirement — user-facing rule:
     "balance kabhi negative na ho, user nahi bhare ga"):
@@ -233,6 +243,22 @@ async def adjust(
     before = ZERO
     after = ZERO
     settlement_booked = ZERO
+    drawn = ZERO
+    draw_from: list[tuple[Any, Decimal]] = []
+    if draw_margin and amt < ZERO and auto_settlement_on:
+        from app.models.position import Position, PositionStatus
+
+        draw_from = sorted(
+            (
+                (p.id, to_decimal(p.margin_used))
+                for p in await Position.find(
+                    Position.user_id == PydanticObjectId(str(user_id)),
+                    Position.status == PositionStatus.OPEN,
+                ).to_list()
+                if to_decimal(p.margin_used) > ZERO
+            ),
+            key=lambda x: -x[1],
+        )
     for _attempt in range(12):
         w = await get_or_create(user_id)
         before = to_decimal(w.available_balance)
@@ -243,6 +269,7 @@ async def adjust(
         # caller should have rejected the request upfront.
         if (
             transaction_type in (TransactionType.WITHDRAWAL, TransactionType.ADJUSTMENT)
+            and amt < ZERO
             and after < ZERO
         ):
             raise InsufficientFundsError(
@@ -264,10 +291,20 @@ async def adjust(
         # In manual mode (auto-OFF) we leave `after` at its raw negative
         # value so the ledger row records the genuine shortfall.
 
+        # Take the overflow from the margin other open positions lock before
+        # calling it a due (see `draw_margin`).
+        drawn = ZERO
+        if draw_from and settlement_booked > ZERO:
+            pool = min(to_decimal(w.used_margin), sum((m for _, m in draw_from), ZERO))
+            drawn = min(settlement_booked, pool) if pool > ZERO else ZERO
+            settlement_booked = sub(settlement_booked, drawn)
+
         set_fields = {
             "available_balance": to_decimal128(after),
             "version": (w.version or 0) + 1,
         }
+        if drawn > ZERO:
+            set_fields["used_margin"] = to_decimal128(sub(to_decimal(w.used_margin), drawn))
         if settlement_booked > ZERO:
             set_fields["settlement_outstanding"] = to_decimal128(
                 add(to_decimal(w.settlement_outstanding), settlement_booked)
@@ -336,6 +373,35 @@ async def adjust(
         )
         await txn.insert()
 
+    # Margin drawn from open positions: keep each position's margin_used in
+    # step with the wallet, and show the drawn slice in the ledger (balance
+    # column unchanged — it came out of locked margin, not free cash).
+    if drawn > ZERO:
+        left = drawn
+        for pid, m in draw_from:
+            if left <= ZERO:
+                break
+            take = m if m < left else left
+            await Position.get_motor_collection().update_one(
+                {"_id": pid}, {"$inc": {"margin_used": Decimal128(str(-take))}}
+            )
+            left = sub(left, take)
+        drawn_txn = WalletTransaction(
+            user_id=PydanticObjectId(user_id),
+            transaction_type=transaction_type,
+            amount=Decimal128(str(-drawn)),
+            balance_before=Decimal128(str(after)),
+            balance_after=Decimal128(str(after)),
+            reference_type=reference_type,
+            reference_id=reference_id,
+            narration=f"{narration} — ₹{drawn} taken from margin locked in open positions",
+            status=TransactionStatus.COMPLETED,
+            created_by=PydanticObjectId(actor_id) if actor_id else None,
+        )
+        await drawn_txn.insert()
+        if txn is None:
+            txn = drawn_txn
+
     # Settlement ledger entry — books against settlement_outstanding,
     # not available_balance. balance_before / balance_after stay on
     # `after` (the floored available_balance) so the Balance column
@@ -376,24 +442,8 @@ async def adjust(
         )
     )
 
-    # ── Manual-settlement enqueue ─────────────────────────────────────
-    # In auto-OFF mode, a debit that left the wallet in red queues a
-    # pending SettlementRequest. Best-effort: a Mongo hiccup here must
-    # NOT roll back the wallet write — the admin can always re-sync
-    # later from the Payments → Settlement Requests tab (the row is
-    # re-derived from |available_balance| each time).
-    if not auto_settlement_on and after < ZERO:
-        try:
-            await _ensure_pending_settlement_request(
-                user_id=user_id,
-                narration=narration,
-                reference_type=reference_type,
-                reference_id=reference_id,
-            )
-        except Exception:  # pragma: no cover
-            logger.exception(
-                "settlement_request_enqueue_failed user=%s", user_id
-            )
+    # Minus mode (auto-OFF): the minus stays on the balance and the next money
+    # added pays it back — no admin approval request (operator 2026-11-10).
 
     return txn
 
@@ -652,7 +702,17 @@ async def has_pending_settlement_request(
         SettlementRequest.user_id == uid,
         SettlementRequest.status == SettlementStatus.PENDING,
     )
-    return existing is not None
+    if existing is None:
+        return False
+    # Money added since (deposit / add fund / profit) already paid the minus
+    # back — the request is moot: close it so the user can trade again.
+    w = await get_or_create(uid)
+    if to_decimal(w.available_balance) >= ZERO:
+        existing.status = SettlementStatus.REJECTED
+        existing.rejected_reason = "Auto-closed: balance back to ₹0 or above (minus recovered from money added)"
+        await existing.save()
+        return False
+    return True
 
 
 async def credit_balance(
@@ -871,21 +931,6 @@ async def force_debit(
             balance_after=new_balance,
         )
     )
-
-    # Enqueue pending settlement when manual mode left the wallet in red.
-    if not auto_settlement_on and new_balance < ZERO:
-        try:
-            await _ensure_pending_settlement_request(
-                user_id=user_id,
-                narration=narration,
-                reference_type=reference_type,
-                reference_id=reference_id,
-            )
-        except Exception:  # pragma: no cover
-            logger.exception(
-                "settlement_request_enqueue_failed_on_force_debit user=%s",
-                user_id,
-            )
 
     return primary_tx  # type: ignore[return-value]
 
@@ -1141,6 +1186,67 @@ async def net_phantom_settlement(
         new_out,
     )
     return txn
+
+
+async def net_fill_dues(user_id: str | PydanticObjectId) -> WalletTransaction | None:
+    """Net settlement due booked by a fill that was NOT a stop-out against
+    cash that is free now.
+
+    Such a due never meant the user ran out of money: the close's loss (or
+    brokerage) hit `available_balance` while the rest of the cash sat as
+    margin in another open position, or the close's brokerage was debited a
+    moment before its own profit landed. 3-Nov X4P3CE: four dues
+    (₹485 / ₹4,869 / ₹906 / ₹8,260) booked while ₹10k+ was locked in a BTC
+    position that later closed in profit — balance and "settlement" sat side
+    by side. A STOP_OUT shortfall (equity really exhausted) is left as is.
+    Called at the end of every fill; cheap no-op unless the wallet has both a
+    due and free cash.
+    """
+    from app.models.order import Order
+
+    uid = PydanticObjectId(str(user_id))
+    w = await get_or_create(uid)
+    due = to_decimal(w.settlement_outstanding)
+    if due <= ZERO or to_decimal(w.available_balance) <= ZERO:
+        return None
+    booked = await WalletTransaction.find(
+        WalletTransaction.user_id == uid,
+        WalletTransaction.transaction_type == TransactionType.SETTLEMENT_OUTSTANDING_BOOKED,
+        {"reference_type": "ORDER"},
+    ).to_list()
+    order_ids = []
+    for r in booked:
+        try:
+            order_ids.append(PydanticObjectId(r.reference_id))
+        except Exception:  # noqa: BLE001
+            pass
+    stop_outs = {
+        str(o.id)
+        for o in await Order.find({"_id": {"$in": order_ids}, "close_reason": "STOP_OUT"}).to_list()
+    }
+    eligible = sum(
+        (abs(to_decimal(r.amount)) for r in booked if r.reference_id not in stop_outs), ZERO
+    )
+    netted = sum(
+        (
+            abs(to_decimal(r.amount))
+            for r in await WalletTransaction.find(
+                WalletTransaction.user_id == uid,
+                WalletTransaction.transaction_type == TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY,
+                {"reference_type": "FILL_NETTING"},
+            ).to_list()
+        ),
+        ZERO,
+    )
+    pending = eligible - netted
+    if pending <= ZERO:
+        return None
+    return await net_phantom_settlement(
+        uid,
+        max(ZERO, due - pending),
+        reference_type="FILL_NETTING",
+        narration="Settlement netted — the cash was locked as margin when this loss / charge was booked",
+    )
 
 
 async def net_phantom_settlement_for_users(

@@ -7,6 +7,7 @@ proportionally across fills.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from beanie import Indexed, PydanticObjectId
 from bson import Decimal128
@@ -21,6 +22,18 @@ from app.utils.time_utils import now_utc
 
 def _zero() -> Decimal128:
     return Decimal128("0")
+
+
+# A fill that still stands — not taken back by an admin delete or reopen. Every
+# such undo sets superseded_by_reopen (alone before fifo_deleted / superseded_at
+# existed); a delete adds fifo_deleted, a reopen superseded_at, which is all the
+# FIFO walk drops. Screens that rebuild a book from fills splice this in; the
+# walk and the statements do not (legacy-flagged fills are walked on purpose).
+LIVE_FILL: dict[str, Any] = {
+    "superseded_by_reopen": {"$ne": True},
+    "fifo_deleted": {"$ne": True},
+    "superseded_at": None,
+}
 
 
 class Trade(TimestampMixin):
@@ -54,6 +67,10 @@ class Trade(TimestampMixin):
     # Already net of the closing-leg brokerage (when `chargeOn` includes
     # the close), so the displayed P&L matches the user's true cost.
     pnl_inr: Money | None = None
+    # Units of the position this closing fill closed — less than `quantity`
+    # on a reversal, whose excess opened the other side. None on opening
+    # fills and on closes booked before this field existed.
+    closed_quantity: float | None = None
 
     # ── Execution snapshot: what the market looked like at this fill ───
     # Slippage and latency cannot be reconstructed after the fact — for a
@@ -83,6 +100,16 @@ class Trade(TimestampMixin):
     # FINAL close — matching the admin Position-doc view. The wallet P&L is
     # already netted via the reopen's REVERSAL; this only governs display.
     superseded_by_reopen: bool = False
+    # Set with superseded_by_reopen by an admin DELETE: the fill leaves the
+    # FIFO cost book (list_closed_trade_events_fifo) altogether, so a deleted
+    # position's opening lots stop pricing later closes. Deletes made before
+    # this field existed left it unset.
+    fifo_deleted: bool = False
+    # Set with superseded_by_reopen by an admin REOPEN from §2.6 on: the undone
+    # close leaves the FIFO cost book, so its lots are back for the re-close.
+    # Fills flagged before carry none and are still walked (sent statements
+    # reproduce).
+    superseded_at: datetime | None = None
 
     executed_at: datetime = Field(default_factory=now_utc)
 

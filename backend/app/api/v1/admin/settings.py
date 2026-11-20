@@ -210,28 +210,41 @@ async def set_terms(payload: _TermsPayload, admin: CurrentAdmin):
     )
 
 
-# ── Market trading hours configuration ──────────────────────────────
+# ── Market Trading Hours (IST) ───────────────────────────────────────
+class _MarketHoursPayload(BaseModel):
+    hours: dict[str, Any]
+
+
 @router.get("/settings/market-hours", response_model=APIResponse[dict])
-async def get_market_hours_settings(admin: CurrentAdmin):
-    _require_admin_or_super(admin)
+async def get_market_hours_setting(admin: CurrentAdmin):
+    """Return the configured market-wise trading hours (IST)."""
     from app.services.market_hours_service import get_market_hours
-    cfg = await get_market_hours()
-    return APIResponse(data=cfg)
+
+    hours = await get_market_hours(force_refresh=True)
+    return APIResponse(data={"hours": hours})
 
 
 @router.put("/settings/market-hours", response_model=APIResponse[dict])
-async def update_market_hours_settings(payload: dict[str, Any], admin: CurrentAdmin):
+async def set_market_hours_setting(payload: _MarketHoursPayload, admin: CurrentAdmin):
+    """Save the configured market-wise trading hours (IST)."""
     _require_admin_or_super(admin)
-    from app.services.market_hours_service import update_market_hours
-    saved = await update_market_hours(payload)
+    from app.services.market_hours_service import (
+        MARKET_HOURS_SETTING_KEY,
+        save_market_hours,
+    )
+
+    saved = await save_market_hours(payload.hours)
     await log_event(
         action=AuditAction.SETTING_CHANGE,
         entity_type="PlatformSetting",
-        entity_id="trading.market_hours",
+        entity_id=MARKET_HOURS_SETTING_KEY,
         actor_id=admin.id,
-        new_values=saved,
+        new_values={"market_hours": saved},
     )
-    return APIResponse(data=saved, message="Market hours updated successfully.")
+    return APIResponse(
+        data={"hours": saved},
+        message="Market trading hours saved.",
+    )
 
 
 # ── Platform settings ────────────────────────────────────────────────
@@ -355,12 +368,24 @@ async def _audit_scope_user_ids(admin) -> list[PydanticObjectId] | None:
     underlying mongo filters (`assigned_admin_id` for admin,
     `broker_ancestry` for broker) walk the right subtree per role.
     """
-    from app.core.dependencies import scoped_user_filter
+    from app.core.dependencies import (
+        _admin_bool_perm,
+        effective_scope_actor,
+        scoped_user_filter,
+    )
     from app.models.user import User, UserRole
 
+    # An EMPLOYEE audits its parent's pool only with the `audit` grant (this
+    # route has no perm gate); without it, just its own events as before.
+    actor = admin
+    if actor.role == UserRole.EMPLOYEE and not _admin_bool_perm(
+        actor.admin_permissions, "audit"
+    ):
+        return [actor.id]
+    admin = await effective_scope_actor(actor)
     if admin.role == UserRole.SUPER_ADMIN:
         return None
-    ids: set[PydanticObjectId] = {admin.id}
+    ids: set[PydanticObjectId] = {admin.id, actor.id}
     # Use the SAME comprehensive pool clause the /admin/users list + the audit
     # page's own user-search run through (`scoped_user_filter` → `_pool_clause`).
     # For ADMIN that unions the directly-assigned users AND the transferred-

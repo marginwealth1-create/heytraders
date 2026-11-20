@@ -79,7 +79,12 @@ class Settings(BaseSettings):
     # within ~1 s — 5× faster than the legacy 5 s loop and imperceptible to
     # users. Lower back toward 0.5 only once the busiest shard's total_ms
     # sits comfortably under the chosen interval.
-    RISK_TICK_SEC: float = 1.0
+    # 2026-11-05: book is ~14-22 open positions (sweep 0.3-1.1 s) — back to
+    # 0.5 s on operator request so stop-out reacts faster. A sweep slower than
+    # this just runs back-to-back (risk_enforcer_tick_overrun); watch it.
+    # 2026-11-09: 0.25 s on operator request. A slower sweep runs back-to-back
+    # with a 50 ms yield (_MIN_TICK_GAP_SEC), never queued.
+    RISK_TICK_SEC: float = 0.25
 
     # Market tick-fanout interval (seconds) — how often the feed leader's
     # `market_tick_loop` overlays subscribed tokens, refreshes `mdlive`, and

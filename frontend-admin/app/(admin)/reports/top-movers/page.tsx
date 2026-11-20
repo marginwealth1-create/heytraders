@@ -10,6 +10,7 @@ import { PageHeader } from "@/components/common/PageHeader";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn, formatINR } from "@/lib/utils";
 import { SymbolAvatar } from "@/components/common/SymbolAvatar";
+import { istWeekSoFar } from "@/lib/time";
 
 type SymbolRow = {
   token: string;
@@ -36,22 +37,32 @@ type Payload = {
 };
 
 export default function TopMoversPage() {
-  const [days, setDays] = useState(1);
+  // Clients rank over whole IST days; opens on this week so far, and any
+  // other week (or range) is a date pick away. Cleared → the last 24 hours.
+  const [fromDate, setFromDate] = useState(() => istWeekSoFar()[0]);
+  const [toDate, setToDate] = useState(() => istWeekSoFar()[1]);
   const [includeOptions, setIncludeOptions] = useState(false);
 
   const { data, isFetching } = useQuery<Payload>({
-    queryKey: ["admin", "top-movers", days, includeOptions],
-    queryFn: () => ReportsAdminAPI.topMovers({ days, include_options: includeOptions }),
+    queryKey: ["admin", "top-movers", fromDate, toDate, includeOptions],
+    queryFn: () =>
+      ReportsAdminAPI.topMovers({
+        from_date: fromDate || undefined,
+        to_date: toDate || undefined,
+        include_options: includeOptions,
+      }),
     refetchInterval: 15_000,
   });
+  const span =
+    fromDate || toDate ? `${fromDate || "start"} → ${toDate || "now"}` : "last 24 hours";
 
   return (
     <div className="space-y-4">
       <PageHeader
         title="Top gainers & losers"
-        description="Instruments by live % move, and clients by realised P&L."
+        description="Instruments by live % move, and clients by their Billing Net P&L over the dates picked."
         actions={
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <input
                 type="checkbox"
@@ -60,16 +71,23 @@ export default function TopMoversPage() {
               />
               Include options
             </label>
-            <select
-              value={days}
-              onChange={(e) => setDays(Number(e.target.value))}
+            <input
+              type="date"
+              value={fromDate}
+              max={toDate || undefined}
+              onChange={(e) => setFromDate(e.target.value)}
               className="h-9 rounded-md border border-border bg-background px-2 text-sm"
-              aria-label="Client P&L window"
-            >
-              <option value={1}>Clients: today</option>
-              <option value={7}>Clients: 7 days</option>
-              <option value={30}>Clients: 30 days</option>
-            </select>
+              aria-label="Clients from date"
+            />
+            <span className="text-xs text-muted-foreground">to</span>
+            <input
+              type="date"
+              value={toDate}
+              min={fromDate || undefined}
+              onChange={(e) => setToDate(e.target.value)}
+              className="h-9 rounded-md border border-border bg-background px-2 text-sm"
+              aria-label="Clients to date"
+            />
           </div>
         }
       />
@@ -88,14 +106,14 @@ export default function TopMoversPage() {
         />
         <ClientCard
           title="Most profitable clients"
-          description={`Realised P&L, last ${data?.days ?? days} day(s)`}
+          description={`Net P&L, ${span}`}
           rows={data?.clients.gainers ?? []}
           loading={isFetching && !data}
           up
         />
         <ClientCard
           title="Biggest losing clients"
-          description={`Realised P&L, last ${data?.days ?? days} day(s)`}
+          description={`Net P&L, ${span}`}
           rows={data?.clients.losers ?? []}
           loading={isFetching && !data}
         />

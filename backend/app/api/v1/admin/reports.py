@@ -1,33 +1,40 @@
-"""Admin reports — users, financial, trades, tax, compliance, tradebook PDF."""
+"""Admin reports — users, financial, trades, tax, compliance, Billing / Trade Book PDF and Excel."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 
-from app.core.dependencies import CurrentAdmin, require_perm, scoped_user_ids
-from app.models.order import Order, OrderStatus
-from app.models.position import Position, PositionStatus
-from app.models.trade import Trade
+from app.core.dependencies import (
+    CurrentAdmin,
+    assert_user_in_scope,
+    is_effective_super_admin,
+    require_perm,
+    scoped_user_ids,
+)
+from app.core.exceptions import InsufficientPermissionsError, NotFoundError
+from app.models.trade import LIVE_FILL, Trade
 from app.models.transaction import (
     DepositRequest,
     DepositStatus,
-    TransactionType,
-    WalletTransaction,
     WithdrawalRequest,
     WithdrawalStatus,
 )
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.schemas.common import APIResponse
-from app.services import report_pdf_service
-from app.utils.time_utils import now_utc
+from app.services import report_pdf_service, report_xlsx_service, tradebook_builder
+from app.utils.decimal_utils import quantize_money, to_decimal
+from app.utils.downloads import attachment
+from app.utils.time_utils import now_ist, now_utc
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/reports", tags=["admin-reports"])
@@ -38,7 +45,7 @@ async def users_report(
     admin: CurrentAdmin,
     _: None = Depends(require_perm("reports", "read")),
 ):
-    scope = await scoped_user_ids(admin)
+    scope = await scoped_user_ids(admin, all_pools=True)
     if not scope:
         return APIResponse(
             data={"total": 0, "active": 0, "blocked": 0, "by_role": {}, "last_24h_signups": 0}
@@ -62,7 +69,7 @@ async def financial_report(
     admin: CurrentAdmin,
     _: None = Depends(require_perm("reports", "read")),
 ):
-    scope = await scoped_user_ids(admin)
+    scope = await scoped_user_ids(admin, all_pools=True)
     if not scope:
         return APIResponse(
             data={
@@ -83,7 +90,11 @@ async def financial_report(
     total_credit = sum(float(str(w.credit_limit)) for w in wallets)
     total_deposits = sum(float(str(w.total_deposits)) for w in wallets)
     total_withdrawals = sum(float(str(w.total_withdrawals)) for w in wallets)
-    total_brokerage = sum(float(str(w.total_brokerage)) for w in wallets)
+    # Fills book brokerage as CHARGES (→ total_charges); total_brokerage only
+    # moves on an admin manual BROKERAGE entry.
+    total_brokerage = sum(
+        float(str(w.total_brokerage)) + float(str(w.total_charges)) for w in wallets
+    )
 
     pending_dep = await DepositRequest.find(
         {"status": DepositStatus.PENDING.value, **user_q}
@@ -111,22 +122,29 @@ async def trades_report(
     admin: CurrentAdmin,
     _: None = Depends(require_perm("reports", "read")),
 ):
-    today = now_utc() - timedelta(hours=24)
-    week = now_utc() - timedelta(days=7)
-    scope = await scoped_user_ids(admin)
+    # The IST day and the IST week (Mon 00:00 → now) — the windows every P&L
+    # card reads — so "week" brokerage is the Billing statements' Brokerage.
+    windows = tradebook_builder.periods()
+    scope = await scoped_user_ids(admin, all_pools=True)
     if not scope:
         empty = {"count": 0, "volume": 0.0, "brokerage": 0.0, "charges": 0.0}
         return APIResponse(data={"today": empty, "week": empty})
-    base = {"user_id": {"$in": scope}}
-    today_trades = await Trade.find({**base, "executed_at": {"$gte": today}}).to_list()
-    week_trades = await Trade.find({**base, "executed_at": {"$gte": week}}).to_list()
+    # Fills an admin delete / reopen took back are out of every sum.
+    base = {"user_id": {"$in": scope}, **LIVE_FILL}
+    today_trades, week_trades = [
+        await Trade.find({**base, "executed_at": {"$gte": windows[k][0], "$lte": windows[k][1]}}).to_list()
+        for k in ("today", "week")
+    ]
 
     def _agg(rows):
+        def total(field: str) -> float:
+            return float(quantize_money(sum((to_decimal(getattr(t, field)) for t in rows), Decimal(0))))
+
         return {
             "count": len(rows),
-            "volume": round(sum(float(str(t.value)) for t in rows), 2),
-            "brokerage": round(sum(float(str(t.brokerage)) for t in rows), 2),
-            "charges": round(sum(float(str(t.total_charges)) for t in rows), 2),
+            "volume": total("value"),
+            "brokerage": total("brokerage"),
+            "charges": total("total_charges"),
         }
 
     return APIResponse(data={"today": _agg(today_trades), "week": _agg(week_trades)})
@@ -137,7 +155,7 @@ async def compliance_report(
     admin: CurrentAdmin,
     _: None = Depends(require_perm("reports", "read")),
 ):
-    scope = await scoped_user_ids(admin)
+    scope = await scoped_user_ids(admin, all_pools=True)
     if not scope:
         return APIResponse(data={"kyc_verified": 0, "kyc_pending": 0})
     base = {"_id": {"$in": scope}}
@@ -146,25 +164,67 @@ async def compliance_report(
     return APIResponse(data={"kyc_verified": kyc_done, "kyc_pending": kyc_pending})
 
 
-# ── Tradebook PDF (ARK Trader style, per-user) ────────────────────
+# ── Per-user Billing statement and Trade Book, PDF and Excel ───────
+
+_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-def _d128(v: Any) -> float:
-    if v is None:
-        return 0.0
-    return float(str(v))
+async def _tradebook_user(admin: User, user_id: str) -> User:
+    """The super-admin's Accounts Dashboard lists every pool's clients, so its
+    Trade Book button must read any of them (closed ones included). Everyone
+    else keeps the scoped_user_ids gate."""
+    if await is_effective_super_admin(admin):
+        return await assert_user_in_scope(admin, user_id, for_read=True)
+    uid = PydanticObjectId(user_id)
+    scope = await scoped_user_ids(admin)
+    if uid not in scope:
+        raise InsufficientPermissionsError("User not in your scope")
+    user = await User.get(uid)
+    if not user:
+        raise NotFoundError("User not found")
+    return user
 
 
-def _fmt_dt(dt: datetime | None) -> str:
-    if dt is None:
-        return ""
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+def _file(data: bytes, filename: str, media_type: str = "application/pdf") -> StreamingResponse:
+    return StreamingResponse(
+        iter([data]),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": attachment(filename),
+            "Content-Length": str(len(data)),
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
 
 
-def _fmt_dt_short(dt: datetime | None) -> str:
-    if dt is None:
-        return ""
-    return dt.strftime("%Y-%m-%d %H:%M")
+def _slug(v: str | None) -> str:
+    return (v or "").strip().replace(" ", "_")
+
+
+def _filename(prefix: str, user: User, ext: str, *extra: str) -> str:
+    code = getattr(user, "user_code", "") or "user"
+    return "_".join([prefix, _slug(user.full_name), code, *extra, now_ist().strftime("%Y%m%d")]) + ext
+
+
+async def _statement(
+    admin: User, user_id: str, from_date: str | None, to_date: str | None
+) -> tuple[User, str, dict[str, Any]]:
+    """The client's Billing statement under the admin's brand. Dates are
+    whole IST days (YYYY-MM-DD); none → lifetime."""
+    user = await _tradebook_user(admin, user_id)
+    lo, hi = tradebook_builder.window(from_date, to_date)
+    brand = admin.brand_name or getattr(admin, "full_name", "") or ""
+    return user, brand, await tradebook_builder.statement_payload(user, lo, hi, brand=brand)
+
+
+async def _fills(
+    admin: User, user_id: str, from_date: str | None, to_date: str | None
+) -> tuple[User, list[dict[str, Any]]]:
+    """The client's Trade Book: one row per fill, newest first — what was
+    executed, not the FIFO-paired statement. Same gate and dates as Billing."""
+    user = await _tradebook_user(admin, user_id)
+    lo, hi = tradebook_builder.window(from_date, to_date)
+    return user, await tradebook_builder.trade_rows(user.id, lo, hi)
 
 
 @router.get("/tradebook/pdf")
@@ -172,221 +232,55 @@ async def tradebook_pdf(
     user_id: str,
     admin: CurrentAdmin,
     _: None = Depends(require_perm("reports", "read")),
-    from_date: datetime | None = None,
-    to_date: datetime | None = None,
-):
-    uid = PydanticObjectId(user_id)
-    scope = await scoped_user_ids(admin)
-    if uid not in scope:
-        from app.core.exceptions import InsufficientPermissionsError
-        raise InsufficientPermissionsError("User not in your scope")
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> StreamingResponse:
+    """The client's Billing statement — the same statement the client
+    downloads, under the admin's brand."""
+    user, brand, payload = await _statement(admin, user_id, from_date, to_date)
+    pdf_bytes = await asyncio.to_thread(report_pdf_service.build_full_tradebook_pdf, user, payload)
+    return _file(pdf_bytes, _filename("billing", user, ".pdf", _slug(brand)))
 
-    user = await User.get(uid)
-    if not user:
-        from app.core.exceptions import NotFoundError
-        raise NotFoundError("User not found")
 
-    now = now_utc()
-    q_time: dict[str, Any] = {}
-    if from_date:
-        q_time["$gte"] = from_date
-    if to_date:
-        q_time["$lte"] = to_date
+@router.get("/tradebook/xlsx")
+async def tradebook_xlsx(
+    user_id: str,
+    admin: CurrentAdmin,
+    _: None = Depends(require_perm("reports", "read")),
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> StreamingResponse:
+    """The Billing statement as a workbook: the PDF's tables, cell for cell."""
+    user, _brand, payload = await _statement(admin, user_id, from_date, to_date)
+    data = await asyncio.to_thread(report_xlsx_service.render_billing_xlsx, user, payload)
+    return _file(data, _filename("billing", user, ".xlsx"), _XLSX)
 
-    # ── 1. Closed transactions (trades + money movements) ──────
-    trade_q: dict[str, Any] = {"user_id": uid}
-    if q_time:
-        trade_q["executed_at"] = q_time
-    trades = await Trade.find(trade_q).sort("+executed_at").to_list()
 
-    tx_q: dict[str, Any] = {
-        "user_id": uid,
-        "transaction_type": {"$in": [
-            TransactionType.DEPOSIT.value,
-            TransactionType.WITHDRAWAL.value,
-            TransactionType.ADJUSTMENT.value,
-            TransactionType.BONUS.value,
-        ]},
-    }
-    if q_time:
-        tx_q["created_at"] = q_time
-    money_txs = await WalletTransaction.find(tx_q).sort("+created_at").to_list()
+@router.get("/trade-book/pdf")
+async def trade_book_pdf(
+    user_id: str,
+    admin: CurrentAdmin,
+    _: None = Depends(require_perm("reports", "read")),
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> StreamingResponse:
+    user, rows = await _fills(admin, user_id, from_date, to_date)
+    pdf_bytes = await asyncio.to_thread(report_pdf_service.build_tradebook_pdf, user, rows)
+    return _file(pdf_bytes, _filename("tradebook_fills", user, ".pdf"))
 
-    # Closed rows come from the SAME FIFO reconstruction the user's app Closed
-    # tab renders (and the user's own Full Tradebook PDF), so the admin-side
-    # download matches the user's tradebook AND their Closed tab entry-by-entry.
-    from app.services.tradebook_builder import fifo_closed_rows
 
-    closed_rows, _fifo_net_pnl, sum_brokerage_from_trades = await fifo_closed_rows(
-        uid, from_date, to_date
-    )
-
-    for tx in money_txs:
-        amt = _d128(tx.amount)
-        tx_type_label = tx.transaction_type.value.title()
-        closed_rows.append({
-            "time": _fmt_dt(tx.created_at),
-            "type": "Money",
-            "ticket_id": str(tx.id)[-8:] if tx.id else "",
-            "script": "",
-            "amount": "",
-            "type_detail": tx_type_label,
-            "open_time": "",
-            "open_price": "",
-            "close_price": "",
-            "dp_wd_aj": f"{amt:,.2f}",
-            "brokerage": 0,
-            "commission": 0,
-            "open_com": 0,
-            "total_pnl": 0,
-            "comment": tx.narration[:20] if tx.narration else "",
-        })
-
-    closed_rows.sort(key=lambda r: r.get("time", ""))
-
-    # ── 2. Money totals ────────────────────────────────────────
-    all_tx_q: dict[str, Any] = {"user_id": uid}
-    if q_time:
-        all_tx_q["created_at"] = q_time
-    all_txs = await WalletTransaction.find(all_tx_q).to_list()
-
-    deposit_total = sum(_d128(t.amount) for t in all_txs if t.transaction_type == TransactionType.DEPOSIT)
-    withdraw_total = sum(_d128(t.amount) for t in all_txs if t.transaction_type == TransactionType.WITHDRAWAL)
-    adjustment_total = sum(_d128(t.amount) for t in all_txs if t.transaction_type == TransactionType.ADJUSTMENT)
-    bonus_total = sum(_d128(t.amount) for t in all_txs if t.transaction_type == TransactionType.BONUS)
-
-    money_totals = {
-        "credit_in": 0.0,
-        "credit_out": 0.0,
-        "deposit": deposit_total,
-        "withdraw": withdraw_total,
-        "adjustment": adjustment_total,
-        "bonus": bonus_total,
-    }
-
-    # ── 3. Opened deals (open positions) ───────────────────────
-    open_positions = await Position.find(
-        {"user_id": uid, "status": PositionStatus.OPEN.value}
-    ).to_list()
-
-    opened_deals: list[dict[str, Any]] = []
-    for p in open_positions:
-        qty = abs(p.quantity)
-        avg = _d128(p.avg_price)
-        ltp = _d128(p.ltp)
-        margin = _d128(p.margin_used)
-        unrealized = _d128(p.unrealized_pnl)
-        sl = _d128(p.stop_loss) if p.stop_loss else 0
-        tp = _d128(p.target) if p.target else 0
-        side = (p.opened_side.value if p.opened_side else ("Buy" if p.quantity > 0 else "Sell"))
-        lot_size = p.instrument.lot_size or 1
-        value = qty * ltp * lot_size
-
-        opened_deals.append({
-            "ticket_id": str(p.id)[-8:] if p.id else "",
-            "time": _fmt_dt(p.opened_at if hasattr(p, "opened_at") and p.opened_at else p.created_at),
-            "type_detail": side,
-            "amount": f"{qty:,.2f}",
-            "script": p.instrument.symbol,
-            "price": f"{avg:,.2f}",
-            "sl": f"{sl:,.2f}" if sl else "",
-            "tp": f"{tp:,.2f}" if tp else "",
-            "current_price": f"{ltp:,.2f}",
-            "commission": _d128(p.margin_used) * 0,
-            "total_pnl": unrealized,
-            "value": value,
-            "comment": "",
-        })
-
-    # ── 4. Pending orders ──────────────────────────────────────
-    pending_orders_db = await Order.find({
-        "user_id": uid,
-        "status": {"$in": [OrderStatus.PENDING.value, OrderStatus.OPEN.value]},
-    }).to_list()
-
-    pending_orders: list[dict[str, Any]] = []
-    for o in pending_orders_db:
-        sl = _d128(o.bracket_stop_loss) if o.bracket_stop_loss else 0
-        tp = _d128(o.bracket_target) if o.bracket_target else 0
-        pending_orders.append({
-            "order_id": o.order_number,
-            "type": "SLTP" if (o.order_type.value in ("SL", "SL_M")) else o.order_type.value,
-            "type_detail": "SL/TP" if (o.order_type.value in ("SL", "SL_M")) else o.action.value,
-            "amount": f"{o.quantity:,.2f}",
-            "script": o.instrument.symbol,
-            "price": f"{_d128(o.price):,.2f}" if o.price else "",
-            "sl": f"{sl:,.2f}" if sl else "",
-            "tp": f"{tp:,.2f}" if tp else "",
-            "time": _fmt_dt(o.created_at),
-            "comment": "",
-        })
-
-    # ── 5. Financial standings ─────────────────────────────────
-    wallet = await Wallet.find_one({"user_id": uid})
-    balance = _d128(wallet.available_balance) if wallet else 0
-    used_margin = _d128(wallet.used_margin) if wallet else 0
-    credit = _d128(wallet.credit_limit) if wallet else 0
-    realized = _d128(wallet.realized_pnl) if wallet else 0
-    unrealized_w = _d128(wallet.unrealized_pnl) if wallet else 0
-
-    open_pnl = sum(d.get("total_pnl", 0) for d in opened_deals)
-    equity = balance + used_margin + open_pnl
-    free_margin = equity - used_margin
-    margin_level = (equity / used_margin * 100) if used_margin > 0 else 0
-
-    financial = {
-        "balance": balance,
-        "credit": credit,
-        "equity": round(equity, 2),
-        "total_pnl": round(open_pnl, 2),
-        "used_margin": used_margin,
-        "holding_margin": used_margin,
-        "free_margin": round(free_margin, 2),
-        "margin_level": f"{margin_level:.2f}%",
-    }
-
-    # ── 6. Brokerage total + admin branding ──────────────────
-    total_brokerage = sum_brokerage_from_trades
-
-    admin_brand_name = ""
-    if admin.brand_name:
-        admin_brand_name = admin.brand_name
-    elif hasattr(admin, "full_name") and admin.full_name:
-        admin_brand_name = admin.full_name
-
-    # ── Assemble payload ───────────────────────────────────────
-    from_label = from_date.strftime("%Y-%m-%d") if from_date else "Beginning"
-    to_label = to_date.strftime("%Y-%m-%d") if to_date else "Now"
-
-    payload = {
-        "from_label": from_label,
-        "to_label": to_label,
-        "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "closed_transactions": closed_rows,
-        "money_totals": money_totals,
-        "opened_deals": opened_deals,
-        "pending_orders": pending_orders,
-        "financial": financial,
-        "total_brokerage": total_brokerage,
-        "admin_brand_name": admin_brand_name,
-    }
-
-    pdf_bytes = report_pdf_service.build_full_tradebook_pdf(user, payload)
-    stamp = now.strftime("%Y%m%d")
-    user_name = (getattr(user, "full_name", "") or "").strip().replace(" ", "_")
-    code = getattr(user, "user_code", "") or "user"
-    admin_name = (admin_brand_name or getattr(admin, "full_name", "") or "").strip().replace(" ", "_")
-    filename = f"tradebook_{user_name}_{code}_{admin_name}_{stamp}.pdf"
-
-    return StreamingResponse(
-        iter([pdf_bytes]),
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(pdf_bytes)),
-            "Access-Control-Expose-Headers": "Content-Disposition",
-        },
-    )
+@router.get("/trade-book/xlsx")
+async def trade_book_xlsx(
+    user_id: str,
+    admin: CurrentAdmin,
+    _: None = Depends(require_perm("reports", "read")),
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> StreamingResponse:
+    """The Trade Book as a workbook: the PDF's table, cell for cell."""
+    user, rows = await _fills(admin, user_id, from_date, to_date)
+    data = await asyncio.to_thread(report_xlsx_service.render_trade_book_xlsx, user, rows)
+    return _file(data, _filename("tradebook", user, ".xlsx"), _XLSX)
 
 
 @router.get("/top-movers")
@@ -399,13 +293,17 @@ async def top_movers(
         description="Options swing tens of percent daily and swamp the ranking; off by default",
     ),
     _: None = Depends(require_perm("reports", "read")),
+    from_date: str | None = None,
+    to_date: str | None = None,
 ) -> APIResponse[Any]:
-    """Two rankings: instruments by live % change, and clients by realised P&L.
+    """Two rankings: instruments by live % change, and clients by Net P&L.
 
     Symbols come from the feed leader's `mdlive` snapshots — that is exactly
     the set of instruments actually streaming, so nothing here invents a price
-    for a symbol nobody is watching. Clients are ranked on realised P&L only
-    (open trades are not marked here), which keeps one comparable rupee figure.
+    for a symbol nobody is watching. Clients are ranked on their Billing
+    statement Net P&L over the window (open trades are not marked here):
+    whole IST days `from_date`..`to_date` (YYYY-MM-DD) when given, else the
+    last `days` days.
     """
     from app.core.redis_client import get_redis
     from app.models.instrument import Instrument
@@ -480,34 +378,32 @@ async def top_movers(
     except Exception:
         logger.exception("top_movers_symbols_failed")
 
-    # ── Clients: realised P&L over the window ───────────────────────────
-    since = now_utc() - timedelta(days=days)
-    match: dict[str, Any] = {"executed_at": {"$gte": since}, "pnl_inr": {"$ne": None}}
-    scope = await scoped_user_ids(admin)
-    if scope is not None:
-        if not scope:
-            return APIResponse(
-                data={
-                    "symbols": {"gainers": gainers, "losers": losers},
-                    "clients": {"gainers": [], "losers": []},
-                    "days": days,
-                }
-            )
-        match["user_id"] = {"$in": scope}
-
-    ranked = await Trade.aggregate(
-        [
-            {"$match": match},
-            {
-                "$group": {
-                    "_id": "$user_id",
-                    "pnl": {"$sum": {"$toDouble": "$pnl_inr"}},
-                    "trades": {"$sum": 1},
-                }
-            },
-            {"$sort": {"pnl": -1}},
-        ]
-    ).to_list()
+    # ── Clients: Billing Net P&L over the window ────────────────────────
+    lo, hi = (
+        tradebook_builder.window(from_date, to_date)
+        if from_date or to_date
+        else (now_utc() - timedelta(days=days), None)
+    )
+    scope = await scoped_user_ids(admin, all_pools=True)
+    net = {uid: g - b for uid, (g, b) in (await tradebook_builder.booked(scope, lo, hi)).items()}
+    closes = {
+        r["_id"]: r["n"]
+        for r in await Trade.aggregate(
+            [
+                {
+                    "$match": {
+                        "user_id": {"$in": list(net)},
+                        "executed_at": {k: v for k, v in (("$gte", lo), ("$lte", hi)) if v},
+                        "pnl_inr": {"$ne": None},
+                        **LIVE_FILL,
+                    }
+                },
+                {"$group": {"_id": "$user_id", "n": {"$sum": 1}}},
+            ]
+        ).to_list()
+    }
+    ranked = [{"_id": uid, "pnl": float(v), "trades": closes.get(uid, 0)} for uid, v in net.items()]
+    ranked.sort(key=lambda r: r["pnl"], reverse=True)
 
     user_docs = await User.find(
         {"_id": {"$in": [r["_id"] for r in ranked[:limit] + ranked[-limit:]]}}
@@ -557,7 +453,7 @@ async def similar_activity(
     """
     since = now_utc() - timedelta(days=days)
     match: dict[str, Any] = {"executed_at": {"$gte": since}}
-    scope = await scoped_user_ids(admin)
+    scope = await scoped_user_ids(admin, all_pools=True)
     if scope is not None:
         if not scope:
             return APIResponse(data={"clusters": [], "window_sec": window_sec, "days": days})
@@ -654,7 +550,7 @@ async def slippage_report(
     as zero.
     """
     since = now_utc() - timedelta(days=days)
-    match = _execution_scope_match(since, await scoped_user_ids(admin))
+    match = _execution_scope_match(since, await scoped_user_ids(admin, all_pools=True))
     if match is None:
         return APIResponse(data={"rows": [], "totals": {}, "days": days, "group_by": group_by})
     match["expected_price"] = {"$ne": None}
@@ -749,7 +645,7 @@ async def latency_report(
     order and filling it.
     """
     since = now_utc() - timedelta(days=days)
-    match = _execution_scope_match(since, await scoped_user_ids(admin))
+    match = _execution_scope_match(since, await scoped_user_ids(admin, all_pools=True))
     if match is None:
         return APIResponse(data={"rows": [], "totals": {}, "days": days, "stale_ms": stale_ms})
     match["fill_latency_ms"] = {"$ne": None}
