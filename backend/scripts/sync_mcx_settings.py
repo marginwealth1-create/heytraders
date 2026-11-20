@@ -42,14 +42,11 @@ async def main():
 
     print("\n--- 3. Clearing netting cache in Redis ---")
     try:
-        from app.core.redis import redis_client
-        if redis_client:
-            keys = await redis_client.keys("netting_eff:*")
-            if keys:
-                await redis_client.delete(*keys)
-                print(f"Deleted {len(keys)} netting_eff cache keys from Redis.")
-            else:
-                print("No netting_eff cache keys found in Redis.")
+        from app.core.redis_client import init_redis, close_redis, cache_delete_pattern
+        await init_redis()
+        deleted = await cache_delete_pattern("netting_eff:*")
+        print(f"Deleted {deleted} netting_eff cache keys from Redis.")
+        await close_redis()
     except Exception as e:
         print(f"Redis cache clear notice: {e}")
 
